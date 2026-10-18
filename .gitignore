@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store
+
+# Partial downloads
+*.part
+
+# Design tool cache (the design sidecar .impeccable/design.json is kept)
+.impeccable/hook.cache.json

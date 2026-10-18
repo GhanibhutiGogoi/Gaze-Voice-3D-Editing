@@ -1,0 +1,15 @@
+schema_version = "1.0.0"
+
+id = "gazevoice_bridge"
+version = "0.1.0"
+name = "GazeVoice Bridge"
+tagline = "Lets the GazeVoice app see your selection and show its status"
+maintainer = "GazeVoice"
+type = "add-on"
+
+blender_version_min = "5.1.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+network = "Local socket on 127.0.0.1 for the GazeVoice app"

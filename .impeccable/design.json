@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-18T20:30:00Z",
+  "title": "Design System: GazeVoice Control Center",
+  "extensions": {
+    "colorMeta": {
+      "led-live": { "role": "state", "displayName": "LED live", "canonical": "#3ddc8c" },
+      "led-standby": { "role": "state", "displayName": "LED standby", "canonical": "#f0b43c" },
+      "led-fault": { "role": "state", "displayName": "LED fault", "canonical": "#ff5f55" },
+      "led-off": { "role": "state", "displayName": "LED off", "canonical": "#3b3d42" },
+      "led-busy": { "role": "state", "displayName": "LED busy", "canonical": "#5cb8ff" },
+      "key-amber": { "role": "primary", "displayName": "Amber key cap", "canonical": "#eaa338" },
+      "lens-light": { "role": "material", "displayName": "LED lens highlight", "canonical": "#ffffff" },
+      "lens-dark": { "role": "material", "displayName": "Edge darkening", "canonical": "#000000" }
+    },
+    "typographyMeta": {
+      "plate": { "displayName": "Name plate", "purpose": "The product name in the desk strip only." },
+      "heading": { "displayName": "Heading", "purpose": "Section headings and stage names." },
+      "ui": { "displayName": "UI", "purpose": "Body, summaries, tape labels, entry titles." },
+      "small": { "displayName": "Small", "purpose": "Secondary text, keys, notes, readout values." },
+      "data": { "displayName": "Data", "purpose": "Mono machine data: log lines, meter labels, times." },
+      "legend": { "displayName": "Legend", "purpose": "Uppercase readout keys (VERSION, PATH) only." }
+    },
+    "shadows": [
+      { "name": "shadow-plate", "value": "0 2px 4px rgb(0 0 0 / 0.3)", "purpose": "Faceplates sitting on the desk (dark)." },
+      { "name": "shadow-head", "value": "0 2px 8px rgb(0 0 0 / 0.25)", "purpose": "Sticky desk strip over the page (dark)." },
+      { "name": "shadow-key", "value": "0 2px 0 var(--seam), 0 3px 6px rgb(0 0 0 / 0.28)", "purpose": "A key at rest, showing its travel (dark)." },
+      { "name": "shadow-key-down", "value": "0 0 0 var(--seam), 0 1px 2px rgb(0 0 0 / 0.3)", "purpose": "A key pressed (dark)." },
+      { "name": "shadow-key-latched", "value": "0 1px 0 var(--seam), 0 1px 3px rgb(0 0 0 / 0.3)", "purpose": "A latched selector key (dark)." },
+      { "name": "shadow-tape", "value": "0 1px 1px rgb(0 0 0 / 0.35)", "purpose": "Scribble-strip tape lifting off the plate (dark)." },
+      { "name": "inset-window", "value": "inset 0 1px 3px rgb(0 0 0 / 0.6)", "purpose": "Recessed readout glass." },
+      { "name": "led-rim", "value": "inset 0 0 0 1px rgb(0 0 0 / 0.45), 0 1px 0 rgb(255 255 255 / 0.06)", "purpose": "LED bezel and its catch-light." },
+      { "name": "shadow-plate-light", "value": "0 1px 3px rgb(0 0 0 / 0.12)", "purpose": "Faceplates (light)." },
+      { "name": "shadow-head-light", "value": "0 2px 8px rgb(0 0 0 / 0.08)", "purpose": "Desk strip (light)." },
+      { "name": "shadow-key-light", "value": "0 2px 0 var(--seam), 0 3px 5px rgb(0 0 0 / 0.1)", "purpose": "Key at rest (light)." },
+      { "name": "shadow-key-down-light", "value": "0 0 0 var(--seam), 0 1px 2px rgb(0 0 0 / 0.1)", "purpose": "Key pressed (light)." },
+      { "name": "shadow-key-latched-light", "value": "0 1px 0 var(--seam), 0 1px 2px rgb(0 0 0 / 0.1)", "purpose": "Latched selector key (light)." },
+      { "name": "shadow-tape-light", "value": "0 1px 1px rgb(0 0 0 / 0.18)", "purpose": "Tape (light)." }
+    ],
+    "motion": [
+      { "name": "ease", "value": "cubic-bezier(0.16, 1, 0.3, 1)", "purpose": "All state transitions, 110–240 ms." },
+      { "name": "blink", "value": "1s steps(1, end) infinite", "purpose": "Busy LED only; off under reduced motion." }
+    ],
+    "breakpoints": [
+      { "name": "side-drops", "value": "1180px" },
+      { "name": "units-stack", "value": "980px" },
+      { "name": "phone", "value": "560px" }
+    ]
+  }
+}

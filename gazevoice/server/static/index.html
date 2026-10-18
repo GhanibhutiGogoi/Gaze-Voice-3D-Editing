@@ -1,0 +1,83 @@
+<!doctype html>
+<!--
+THESIS: GazeVoice is a signal chain (mic → speech-to-text → refiner → editor → Blender), so its control center is a studio desk, not a grid of status cards.
+OWN-WORLD: Anodized rack faceplates with scribble-strip tape labels, dark readout windows with mono data, lensed LEDs that only mean state, hardware keys with travel. The amber cap is the one key that moves the chain forward. Daylight variant: brushed aluminium.
+STORY: The artist sees which link is dead, presses that unit's key, watches its LED and the activity tape, and sees the path light up end to end.
+FIRST VIEWPORT: Desk strip (name plate, chain readout, Check everything), then the full-width signal path of five stage modules, then the rack (left) beside routing and the activity tape (right).
+FORM: Direction 3 of 7: console channel strip plus outboard rack.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>GazeVoice · Control center</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="desk-head">
+    <div class="nameplate">
+      <span class="brand">GazeVoice</span>
+      <span class="brand-sub">Control center</span>
+    </div>
+
+    <div class="chain-readout" id="chain-readout" role="status">
+      <span class="led" id="chain-led" data-led="off"></span>
+      <div class="chain-text">
+        <strong id="chain-title">Checking your setup…</strong>
+        <span id="chain-sub">Reading each component on this Mac</span>
+      </div>
+    </div>
+
+    <div class="head-actions">
+      <span class="link" id="link" title="Live updates from the control center">
+        <span class="led" id="link-led" data-led="off"></span><span id="link-word">Connecting</span>
+      </span>
+      <button class="key" id="refresh" type="button" data-focus-key="refresh">Refresh</button>
+      <button class="key key-primary" id="check-all" type="button" data-focus-key="check-all" hidden>
+        Check everything<span class="plan-ring" aria-hidden="true"></span>
+      </button>
+    </div>
+  </header>
+
+  <main>
+    <section class="signal" aria-labelledby="signal-h">
+      <div class="section-head">
+        <h2 id="signal-h">Signal path</h2>
+        <p class="section-note">Your voice travels left to right. Every stage has to be ready before you can talk to Blender.</p>
+      </div>
+      <ol class="chain" id="chain"></ol>
+    </section>
+
+    <div class="desk">
+      <section class="rack" aria-labelledby="rack-h">
+        <div class="section-head">
+          <h2 id="rack-h">Rack</h2>
+          <p class="section-note">Each unit is one piece of the setup. Nothing installs, records or uses your plan until you press its key.</p>
+        </div>
+        <div id="rack" class="shelves"></div>
+      </section>
+
+      <aside class="side">
+        <section class="unit routing" aria-labelledby="routing-h">
+          <div class="unit-id">
+            <h2 class="tape" id="routing-h">Routing</h2>
+            <span class="role">Which brain, engine and input the chain uses</span>
+          </div>
+          <div class="route-rows" id="routing"></div>
+        </section>
+
+        <section class="activity" aria-labelledby="log-h">
+          <div class="section-head">
+            <h2 id="log-h">Activity</h2>
+          </div>
+          <ol class="log-list" id="log"></ol>
+        </section>
+      </aside>
+    </div>
+  </main>
+
+  <div class="visually-hidden" aria-live="polite" id="announcer"></div>
+</body>
+</html>
