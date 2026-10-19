@@ -33,6 +33,15 @@ class FakeOpenAI:
                 except queue.Empty:
                     status, body, headers, delay = 500, {"error": {"message": "no scripted reply"}}, {}, 0
                 time.sleep(delay)
+                if isinstance(body, dict) and "__sse__" in body:
+                    data = b"".join(f"data: {json.dumps(chunk)}\n\n".encode() for chunk in body["__sse__"])
+                    data += b"data: [DONE]\n\n"
+                    self.send_response(status)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
                 data = json.dumps(body).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
@@ -51,6 +60,10 @@ class FakeOpenAI:
 
     def reply(self, body: dict, status: int = 200, headers: dict | None = None, delay: float = 0.0) -> None:
         self._replies.put((status, body, headers or {}, delay))
+
+    def stream(self, chunks: list[dict]) -> None:
+        """Script one streamed (server-sent events) chat reply."""
+        self.reply({"__sse__": chunks})
 
     def message(self, content: str = "", tool_calls: list | None = None, **extra) -> None:
         """Script one chat completion reply."""

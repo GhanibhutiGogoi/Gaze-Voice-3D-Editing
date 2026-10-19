@@ -137,17 +137,20 @@ class ApiSession:
             raise BrainError(str(exc)) from exc
         self._started = True
 
-    def _ask(self, body: dict, deadline: float) -> dict:
-        """One chat request, given up on at once if the turn is interrupted or runs out of time."""
+    def _wait(self, work: Callable[[], Any], deadline: float, what: str) -> Any:
+        """Run work in the background; give up at once if the turn is interrupted or runs out of time.
+
+        Whatever it returns late is dropped.
+        """
         box: queue.Queue = queue.Queue(maxsize=1)
 
-        def work() -> None:
+        def run() -> None:
             try:
-                box.put(("ok", self.client.chat(body, timeout=max(1.0, deadline - time.monotonic()))))
+                box.put(("ok", work()))
             except Exception as exc:  # noqa: BLE001 - handed to the waiting turn
                 box.put(("error", exc))
 
-        threading.Thread(target=work, daemon=True, name="provider-call").start()
+        threading.Thread(target=run, daemon=True, name="provider-call").start()
         while True:
             if self._interrupted:
                 raise _Interrupted
@@ -155,15 +158,24 @@ class ApiSession:
                 kind, value = box.get(timeout=0.1)
             except queue.Empty:
                 if time.monotonic() > deadline:
-                    raise BrainError("The provider took too long to answer.") from None
+                    raise BrainError(f"{what} took too long to answer.") from None
                 continue
             if kind == "error":
-                if isinstance(value, ProviderError):
-                    raise BrainError(str(value)) from value
-                raise BrainError(f"The provider call failed: {value}") from value
+                raise value
             return value
 
-    def _run_tool(self, call: dict, on_tool) -> dict:
+    def _ask(self, body: dict, deadline: float) -> dict:
+        try:
+            return self._wait(lambda: self.client.chat(body, timeout=max(1.0, deadline - time.monotonic())),
+                              deadline, "The provider")
+        except ProviderError as exc:
+            raise BrainError(str(exc)) from exc
+        except (BrainError, _Interrupted):
+            raise
+        except Exception as exc:  # noqa: BLE001 - anything else the HTTP layer raised
+            raise BrainError(f"The provider call failed: {exc}") from exc
+
+    def _run_tool(self, call: dict, on_tool, deadline: float) -> dict:
         function = call.get("function") or {}
         name = str(function.get("name") or "")
         try:
@@ -175,8 +187,11 @@ class ApiSession:
                     "content": f"Error: the arguments for {name} were not valid JSON. Call it again with a JSON object."}
         if on_tool:
             on_tool(name)
+        mcp = self._mcp
+        if mcp is None:
+            raise BrainError("The Blender MCP server isn't running.")
         try:
-            text = tool_text(self._mcp.call_tool(name, arguments))
+            text = tool_text(self._wait(lambda: mcp.call_tool(name, arguments), deadline, "Blender"))
         except (McpError, OSError) as exc:
             text = f"Error: {exc}"
         return {"role": "tool", "tool_call_id": call.get("id"), "content": text}
@@ -208,7 +223,8 @@ class ApiSession:
                     for call in calls:
                         if self._interrupted:
                             raise _Interrupted
-                        result = self._run_tool(call, lambda name: (tools.append(name), on_tool and on_tool(name)))
+                        result = self._run_tool(call, lambda name: (tools.append(name), on_tool and on_tool(name)),
+                                                deadline)
                         group.append(result)
                 return TurnResult(f"Stopped after {self.max_steps} steps without finishing.", True, tools,
                                   round(time.monotonic() - began, 2))
@@ -219,7 +235,8 @@ class ApiSession:
                 self.turns += 1
 
     def _remember(self, group: list[dict]) -> None:
-        self._history.append(group)
+        # Reasoning goes back only within its own turn; later turns don't need it (DeepSeek drops it too).
+        self._history.append([{k: v for k, v in m.items() if k != "reasoning_content"} for m in group])
         del self._history[:-self.keep_commands]
 
     def interrupt(self) -> None:

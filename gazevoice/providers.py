@@ -204,12 +204,18 @@ class ChatClient:
         return [m["id"] for m in items or [] if isinstance(m, dict) and isinstance(m.get("id"), str)]
 
     def chat(self, body: dict, timeout: float | None = None) -> dict:
-        return self._request("POST", "/chat/completions", body, timeout or self.timeout, model=body.get("model"))
+        # Alibaba only lets Qwen think in streamed calls, so Qwen chats always stream.
+        stream = self.config.kind == "qwen"
+        if stream:
+            body = {**body, "stream": True}
+        return self._request("POST", "/chat/completions", body, timeout or self.timeout, model=body.get("model"),
+                             stream=stream)
 
     def _scrub(self, text: str) -> str:
         return text.replace(self._key, "••••") if self._key else text
 
-    def _request(self, method: str, path: str, body: dict | None, timeout: float, model: str | None = None) -> dict:
+    def _request(self, method: str, path: str, body: dict | None, timeout: float, model: str | None = None,
+                 stream: bool = False) -> dict:
         data = json.dumps(body).encode() if body is not None else None
         headers = {"Authorization": f"Bearer {self._key}", "Accept": "application/json"}
         if data is not None:
@@ -218,6 +224,8 @@ class ChatClient:
             request = urllib.request.Request(self.base + path, data=data, method=method, headers=headers)
             try:
                 with urllib.request.urlopen(request, timeout=timeout) as response:
+                    if stream:
+                        return self._assemble(response, model)
                     return json.loads(response.read() or b"{}")
             except urllib.error.HTTPError as exc:
                 with exc:
@@ -234,6 +242,39 @@ class ChatClient:
             except ValueError:
                 raise ProviderError(f"{self.config.name} sent back something that isn't JSON.") from None
         raise ProviderError(f"{self.config.name} is rate-limiting requests. Wait a moment and try again.")
+
+    def _assemble(self, response, model: str | None) -> dict:
+        """A streamed (server-sent events) reply, put back together as one ordinary chat completion."""
+        message: dict = {"role": "assistant", "content": ""}
+        finish = None
+        for raw in response:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[len("data:"):].strip()
+            if data == "[DONE]":
+                break
+            chunk = json.loads(data)
+            if isinstance(chunk.get("error"), dict):
+                detail = str(chunk["error"].get("message") or "")
+                raise ProviderError(self._scrub(self._explain(400, detail, model, "/chat/completions")))
+            for choice in chunk.get("choices") or []:
+                delta = choice.get("delta") or {}
+                for key in ("content", "reasoning_content"):
+                    if delta.get(key):
+                        message[key] = message.get(key, "") + delta[key]
+                for part in delta.get("tool_calls") or []:
+                    calls = message.setdefault("tool_calls", [])
+                    index = part.get("index", len(calls))
+                    while len(calls) <= index:
+                        calls.append({"id": None, "type": "function", "function": {"name": "", "arguments": ""}})
+                    slot = calls[index]
+                    slot["id"] = part.get("id") or slot["id"]
+                    function = part.get("function") or {}
+                    slot["function"]["name"] += function.get("name") or ""
+                    slot["function"]["arguments"] += function.get("arguments") or ""
+                finish = choice.get("finish_reason") or finish
+        return {"choices": [{"index": 0, "message": message, "finish_reason": finish}]}
 
     @staticmethod
     def _detail(exc: urllib.error.HTTPError) -> str:

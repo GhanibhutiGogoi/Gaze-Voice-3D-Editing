@@ -135,6 +135,39 @@ class ChatClientTest(unittest.TestCase):
         self.assertEqual(sent["headers"]["authorization"], "Bearer sk-x")
         self.assertEqual(sent["body"]["model"], "m")
 
+    def test_qwen_answers_are_streamed_and_assembled(self):
+        # Alibaba only lets Qwen think in streamed calls, so every Qwen chat is streamed.
+        qwen = ProviderConfig("qwen", "qwen", "Qwen", base_url=self.fake.url, region="ap-southeast-1")
+        self.fake.stream([
+            {"choices": [{"index": 0, "delta": {"role": "assistant", "reasoning_content": "thi"}}]},
+            {"choices": [{"index": 0, "delta": {"reasoning_content": "nk", "content": ""}}]},
+            {"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                                                                 "function": {"name": "get_objects_summary", "arguments": ""}}]}}]},
+            {"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": '{"a": '}}]}}]},
+            {"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "1}"}}]},
+                          "finish_reason": "tool_calls"}]},
+        ])
+        reply = ChatClient(qwen, "sk-x").chat({"model": "qwen-max", "messages": [], "enable_thinking": True})
+        self.assertIs(self.fake.requests[0]["body"]["stream"], True)
+        choice = reply["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        self.assertEqual(choice["message"]["reasoning_content"], "think")
+        self.assertEqual(choice["message"]["tool_calls"], [{"id": "call_1", "type": "function", "function": {
+            "name": "get_objects_summary", "arguments": '{"a": 1}'}}])
+
+    def test_a_streamed_text_answer(self):
+        qwen = ProviderConfig("qwen", "qwen", "Qwen", base_url=self.fake.url, region="ap-southeast-1")
+        self.fake.stream([{"choices": [{"index": 0, "delta": {"content": "Made it "}}]},
+                          {"choices": [{"index": 0, "delta": {"content": "red."}, "finish_reason": "stop"}]}])
+        reply = ChatClient(qwen, "sk-x").chat({"model": "qwen-max", "messages": []})
+        self.assertEqual(reply["choices"][0]["message"]["content"], "Made it red.")
+
+    def test_deepseek_is_not_streamed(self):
+        deepseek = ProviderConfig("deepseek", "deepseek", "DeepSeek", base_url=self.fake.url)
+        self.fake.message("ok")
+        ChatClient(deepseek, "sk-x").chat({"model": "deepseek-flash", "messages": []})
+        self.assertNotIn("stream", self.fake.requests[0]["body"])
+
     def test_models_lists_ids(self):
         self.fake.reply({"object": "list", "data": [{"id": "a"}, {"id": "b"}, {"oops": 1}]})
         self.assertEqual(ChatClient(self.cfg, "sk-x").models(), ["a", "b"])

@@ -111,7 +111,8 @@ class ControlCenter:
         "Still checking…" the first time; a busy Mac is not a fault). When it
         finishes later, its result is stored and published as `component.updated`.
         """
-        futures = {cid: self._pool.submit(self._safe_check, comp) for cid, comp in self.components.items()}
+        components = dict(self.components)  # a provider added or removed meanwhile can't break this round
+        futures = {cid: self._pool.submit(self._safe_check, comp) for cid, comp in components.items()}
         deadline = time.monotonic() + self.check_timeout
         previous = dict(self._last)
         states: dict[str, ComponentState] = {}
@@ -119,7 +120,7 @@ class ControlCenter:
             try:
                 states[cid] = future.result(timeout=max(0.0, deadline - time.monotonic()))
             except FuturesTimeout:
-                states[cid] = previous.get(cid) or self.components[cid].state(Health.CHECKING, "Still checking…")
+                states[cid] = previous.get(cid) or components[cid].state(Health.CHECKING, "Still checking…")
                 future.add_done_callback(lambda f, cid=cid: self._late_result(cid, f))
         self._last = states
         return states

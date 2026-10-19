@@ -34,7 +34,7 @@ class Settings:
     refiner_model: str = "claude-haiku-5-5"  # the cleanup step should be quick
     refiner_effort: str = "default"
     refiner_api_model: str = ""
-    refiner_api_thinking: str = "default"
+    refiner_api_thinking: str = "off"  # on DeepSeek the default is long reasoning; cleanup should be quick
     providers: tuple = ()  # ProviderConfig.to_dict() per saved provider; keys live in the Keychain
 
     def to_dict(self) -> dict:

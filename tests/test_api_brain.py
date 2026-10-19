@@ -64,8 +64,8 @@ class FakeMcp:
 
 
 class ApiSessionTest(unittest.TestCase):
-    def editor(self, replies, **kwargs):
-        self.mcp = FakeMcp()
+    def editor(self, replies, mcp=None, **kwargs):
+        self.mcp = mcp or FakeMcp()
         self.client = FakeClient([msg("ok"), *replies], **kwargs.pop("client", {}))
         session = ApiSession(self.client, "deepseek-v4-pro", "You edit Blender.", kind="deepseek",
                              mcp_factory=lambda: self.mcp, **kwargs)
@@ -147,6 +147,47 @@ class ApiSessionTest(unittest.TestCase):
         self.assertTrue(turn.is_error)
         self.assertEqual(self.mcp.calls, [])
         self.assertTrue(session.alive)
+
+    def test_earlier_commands_go_back_without_their_reasoning(self):
+        session = self.editor([
+            msg(tool_calls=[call("get_objects_summary", {})], reasoning_content="think 1"),
+            msg("There are three.", reasoning_content="think 2"),
+            msg("Done."),
+        ])
+        session.send("Command: count")
+        session.send("Command: next")
+        within = self.client.bodies[2]["messages"]
+        self.assertIn("think 1", [m.get("reasoning_content") for m in within])  # still sent back inside its own turn
+        later = self.client.bodies[-1]["messages"]
+        self.assertFalse([m for m in later if "reasoning_content" in m])
+        self.assertIn("call_1", [c["id"] for m in later for c in m.get("tool_calls", [])])  # the tool history stays
+
+    def test_stop_during_a_slow_tool_ends_the_turn_quickly(self):
+        class SlowMcp(FakeMcp):
+            def call_tool(self, name, arguments):
+                time.sleep(5)
+                return super().call_tool(name, arguments)
+
+        session = self.editor([msg(tool_calls=[call("execute_blender_code", {"code": "x"})]), msg("never")], mcp=SlowMcp())
+        threading.Timer(0.3, session.interrupt).start()
+        began = time.monotonic()
+        turn = session.send("Command: slow tool")
+        self.assertLess(time.monotonic() - began, 1.5)
+        self.assertTrue(turn.interrupted)
+        self.assertEqual(turn.tools, ["execute_blender_code"])  # it may have changed the scene: VoiceService keeps that undoable
+
+    def test_a_tool_that_outlasts_the_turn_is_a_timeout(self):
+        class SlowMcp(FakeMcp):
+            def call_tool(self, name, arguments):
+                time.sleep(5)
+                return super().call_tool(name, arguments)
+
+        session = self.editor([msg(tool_calls=[call("execute_blender_code", {"code": "x"})])], mcp=SlowMcp())
+        began = time.monotonic()
+        with self.assertRaises(BrainError) as caught:
+            session.send("Command: slow tool", timeout=0.5)
+        self.assertLess(time.monotonic() - began, 1.5)
+        self.assertIn("too long", str(caught.exception))
 
     def test_provider_error_becomes_brain_error(self):
         session = self.editor([ProviderError("Your DeepSeek account is out of credit. Top it up, then try again.")])

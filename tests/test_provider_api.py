@@ -4,7 +4,7 @@ import socket
 import threading
 import unittest
 
-from gazevoice.components.base import Health
+from gazevoice.components.base import Component, Health
 from gazevoice.providers import KeyStore
 from gazevoice.server.app import ControlCenter, make_server
 
@@ -118,6 +118,24 @@ class ProviderApiTest(unittest.TestCase):
         self.assertEqual(self.call("GET", "/api/providers/custom_fake/models", write=False)[1]["models"],
                          ["m-small", "m-big"])
         self.assertEqual(len(fake.requests), 1)  # the list is remembered for a while
+
+    def test_a_unit_removed_mid_check_doesnt_break_the_snapshot(self):
+        gate = threading.Event()
+
+        class Slowpoke(Component):
+            id = "slowpoke"
+            name = "Slowpoke"
+            role = "fake"
+
+            def check(self):
+                gate.wait(3)
+                return self.state(Health.READY, "ok")
+
+        center = ControlCenter(self.t.ctx, [Slowpoke(self.t.ctx)], check_timeout=0.3, keys=self.keys)
+        self.addCleanup(gate.set)
+        threading.Timer(0.1, lambda: setattr(center, "components", {})).start()  # e.g. Remove rebuilt the rack
+        states = center.check_all()
+        self.assertEqual(states["slowpoke"].health, Health.CHECKING)
 
     def test_models_endpoint_reports_errors_plainly(self):
         self.keychain_accepts("custom_gone")

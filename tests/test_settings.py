@@ -23,6 +23,7 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual((s.editor_source, s.refiner_source, s.stt_engine, s.mic_device),
                          ("auto", "auto", "parakeet", ""))
         self.assertEqual((s.editor_api_model, s.editor_api_thinking, s.providers), ("", "default", ()))
+        self.assertEqual(s.refiner_api_thinking, "off")  # cleanup on an API provider should be quick
 
     def test_mic_device_accepts_auto_or_a_number(self):
         self.assertEqual(update_settings(Settings(), {"mic_device": "2"}).mic_device, "2")

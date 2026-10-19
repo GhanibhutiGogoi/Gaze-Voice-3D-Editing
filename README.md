@@ -116,7 +116,7 @@ Either step can run on a model you reach with your own API key instead of Claude
    - For any other service, press **Add provider** on Custom provider. Give it a name, its address and your key. The address must be an OpenAI-compatible endpoint: the part before `/chat/completions`, such as `https://…/v1`.
 2. **Pick it in Routing.** Set Editing, Cleanup or both to that provider.
    - Pick a model. The list comes from the provider; if it doesn't publish one, type the model name.
-   - DeepSeek and Qwen also get a thinking menu.
+   - DeepSeek and Qwen also get a thinking menu. Cleanup starts with thinking Off, so it stays quick.
    - Editing needs a model that can call tools; Cleanup doesn't.
 3. **Test** on the provider checks your key and the models you picked, for a fraction of a cent. Then press Start voice.
 
