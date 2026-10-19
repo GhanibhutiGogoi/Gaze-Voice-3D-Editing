@@ -31,8 +31,9 @@ Every unit shows its real state on this Mac. Nothing installs, records audio or 
 4. **GazeVoice Bridge:** *Install add-on* adds our small Blender add-on (v0.2.0). It gives Blender the hold-to-talk key and a GazeVoice tab in the sidebar, shares your selection, and shows a status line in the viewport. If you installed an older version, the unit says *Update add-on*. Restart Blender after installing or updating.
 5. **Speech-to-text:** *Install* sets up Parakeet (or Whisper, chosen in Routing) in its own Python environment and downloads the model. *Test* transcribes a clip spoken by macOS.
 6. **Microphone:** *Test* records 3 seconds. If it hears silence, allow the app you started GazeVoice from in System Settings › Privacy & Security › Microphone.
-7. **Claude Code / Codex:** detected automatically, using whatever login they already have. GazeVoice never asks for an API key. *Test* and *Connect to Blender* each spend a little of your plan.
-8. **Check everything** runs every test from left to right and lights up the signal path.
+7. **Claude Code / Codex:** detected automatically, using whatever login they already have. GazeVoice never asks for a key for these two. *Test* and *Connect to Blender* each spend a little of your plan.
+8. **DeepSeek, Qwen or a custom API** (optional): see [Use DeepSeek, Qwen or another API](#use-deepseek-qwen-or-another-api).
+9. **Check everything** runs every test from left to right and lights up the signal path.
 
 ## Talk to Blender
 
@@ -73,7 +74,12 @@ Every unit shows its real state on this Mac. Nothing installs, records audio or 
 **Settings:**
 
 - **New conversation** makes the editor forget earlier commands, so "it" starts fresh.
-- In Routing, pick a model for **Editing** and one for **Cleanup**:
+- In Routing, **Editing** and **Cleanup** each pick their own source:
+  - Auto (Claude Code when it's logged in, otherwise Codex);
+  - Claude Code;
+  - Codex;
+  - any API provider you've added.
+- For Claude Code, pick a model for each step:
   - the choices are Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5;
   - "Default" lets Claude Code choose (GazeVoice doesn't use your personal Claude Code settings);
   - they need a recent Claude Code, so run `claude update` if a choice fails to start.
@@ -101,6 +107,25 @@ On an M4 MacBook Air, measured outside Blender:
 
 Real edits take longer with bigger models.
 
+## Use DeepSeek, Qwen or another API
+
+Either step can run on a model you reach with your own API key instead of Claude Code.
+
+1. **Add the key.** In the rack, under Brain, press **Add API key** on DeepSeek or Qwen, paste your key and press Save.
+   - Qwen also asks for your account's region. Alibaba keys only work in their own region. If Model Studio gives you a Workspace ID, add it too; regions without a shared address need it.
+   - For any other service, press **Add provider** on Custom provider. Give it a name, its address and your key. The address must be an OpenAI-compatible endpoint: the part before `/chat/completions`, such as `https://…/v1`.
+2. **Pick it in Routing.** Set Editing, Cleanup or both to that provider.
+   - Pick a model. The list comes from the provider; if it doesn't publish one, type the model name.
+   - DeepSeek and Qwen also get a thinking menu.
+   - Editing needs a model that can call tools; Cleanup doesn't.
+3. **Test** on the provider checks your key and the models you picked, for a fraction of a cent. Then press Start voice.
+
+Good to know:
+
+- **The key goes to your Mac's Keychain** (service "GazeVoice"). The dashboard shows only its last four characters. **Remove** deletes it, and any step using that provider goes back to Auto.
+- **Your commands go to that provider:** with an API provider, what you say, what's selected and the scene's object names go to that company's servers. The Voice panel says which one.
+- **Errors say what to do:** a rejected key, an empty account, a model that can't call tools or a provider that can't be reached each get their own message.
+
 ## Where things live
 
 | What | Where |
@@ -110,6 +135,7 @@ Real edits take longer with bigger models.
 | Speech models | `~/.cache/huggingface/` (or `$HF_HOME` if you set it) |
 | Spoken commands (audio.wav + record.json each) | `…/GazeVoice/logs/commands/<time>-<n>/` |
 | Blender add-ons | Blender's `extensions/user_default/` (`mcp`, `gazevoice_bridge`) |
+| API keys for DeepSeek, Qwen and custom providers | macOS Keychain, service "GazeVoice" |
 
 ## Good to know
 

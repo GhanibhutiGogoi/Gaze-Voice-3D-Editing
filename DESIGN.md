@@ -205,6 +205,11 @@ The palette is restrained: neutral faceplates, plus color that only means someth
 - **Stage module:** LED, stage name, state word, and the parts it depends on. Clicking it highlights those units in the rack.
 - **Voice transport:** a large readout (LED plus state word: Voice is off, Starting…, Ready, Listening…, Transcribing…, Understanding…, Working in Blender…), then the keys: Start voice (amber, with the plan ring) while off; "Starting…" with a Cancel key while it starts; Hold to talk, Undo last and Stop voice while on. Hold to talk is a key you hold down: pressed, it turns red and reads "Listening… release to send". When voice can't start, a dashed list names each missing piece.
 - **Command row:** LED (busy while working, live when done, fault when it failed, unlit when you stopped it), what was understood, what was heard (mono, quoted, "Typed:" for typed commands), the result line (✓ reply, ✗ error or ■ stopped), and mono timings (heard, understood, edited, total).
+- **API provider unit:** a rack unit in the Brain shelf.
+  - Without a key, it offers "Add API key" ("Add provider" for Custom), which opens a key form inside the readout: legend-style labels, dark inputs and Save/Cancel keys.
+  - With a key, the readout says "Key saved ••••1234", which steps use it and the last test. The keys are Test (with the plan ring and "uses your API credit"), Change key and Remove (arm/confirm).
+  - The key is never shown again.
+- **Step routing row:** Editing and Cleanup each have a source menu, then that source's model and thinking menus side by side. Codex gets a note instead of menus.
 - **Activity entry:** LED, "Unit · Action", and the time. It expands to a readout of the live log, and failures show their error first.
 
 ## Do's and Don'ts
