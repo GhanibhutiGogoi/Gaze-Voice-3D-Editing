@@ -7,6 +7,7 @@ but the provider's own Authorization header.
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import time
@@ -36,7 +37,12 @@ THINKING: dict[str, tuple[str, ...]] = {
 KEYCHAIN_SERVICE = "GazeVoice"
 _ID = re.compile(r"^[a-z0-9_]{1,32}$")
 _WORKSPACE = re.compile(r"^[a-z0-9-]{1,64}$")
-_KEY = re.compile(r"^[!#-\[\]-~]+$")  # printable ASCII without spaces, quotes or backslashes
+_KEY = re.compile(r"^[!#-&(-\[\]-~]+$")  # printable ASCII without spaces, quotes or backslashes
+# How providers say a model can't use tools (not just any error that mentions tools).
+_NO_TOOLS = re.compile(
+    r"(?:do(?:es)?\s*n[o']t|not|no)\s+support\w*\s+(?:tool|function)|(?:tool|function)[\w\s]*\s(?:is|are)\s+not\s+supported",
+    re.IGNORECASE,
+)
 
 
 class ProviderError(Exception):
@@ -139,7 +145,7 @@ class ProviderConfig:
         if workspace and not _WORKSPACE.fullmatch(workspace):
             raise ValueError("A Workspace ID is letters, digits and dashes.")
         key_hint = str(data.get("key_hint") or "")
-        if not re.fullmatch(r"[!#-\[\]-~]{0,4}", key_hint):
+        if not re.fullmatch(r"[!#-&(-\[\]-~]{0,4}", key_hint):
             key_hint = ""
         return cls(pid, kind, name, base_url, region, workspace, key_hint)
 
@@ -238,7 +244,13 @@ class ChatClient:
                 raise ProviderError(f"{self.config.name} took too long to answer.") from None
             except (urllib.error.URLError, OSError) as exc:
                 reason = getattr(exc, "reason", exc)
-                raise ProviderError(self._scrub(f"Couldn't reach {self.config.name}: {reason}")) from None
+                message = f"Couldn't reach {self.config.name}: {reason}"
+                if "CERTIFICATE_VERIFY_FAILED" in str(reason):
+                    message += (" Python can't check the provider's certificate. If you installed Python from "
+                                "python.org, run “Install Certificates.command” in its Applications folder, then try again.")
+                raise ProviderError(self._scrub(message)) from None
+            except http.client.HTTPException:
+                raise ProviderError(f"Lost the connection to {self.config.name} mid-answer. Try again.") from None
             except ValueError:
                 raise ProviderError(f"{self.config.name} sent back something that isn't JSON.") from None
         raise ProviderError(f"{self.config.name} is rate-limiting requests. Wait a moment and try again.")
@@ -301,8 +313,7 @@ class ChatClient:
             return f"{name} doesn't have the model {model}. Pick another model."
         if status == 429:
             return f"{name} is rate-limiting requests. Wait a moment and try again."
-        lowered = detail.lower()
-        if status in (400, 422) and ("tool" in lowered or "function" in lowered):
+        if status in (400, 422) and _NO_TOOLS.search(detail):
             return f"{model or 'This model'} can't call tools, so it can't edit Blender. Pick another model for Editing."
         if status >= 500:
             return f"{name} had a server error ({status}). Try again in a moment."

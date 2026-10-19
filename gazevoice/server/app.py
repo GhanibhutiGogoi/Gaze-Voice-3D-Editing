@@ -145,7 +145,7 @@ class ControlCenter:
             "brain": sources["editor"],
             "sources": sources,
             "brain_pending": sources_pending(states, self.ctx.settings),
-            "workflow": workflow_stages(states, sources),
+            "workflow": workflow_stages(states, sources, self.ctx.settings),
             "running": self.jobs.running(),
             "settings": self.ctx.settings.to_dict(),
             "voice": self.voice_snapshot(states, sources),
@@ -281,6 +281,9 @@ class ControlCenter:
 
     def save_provider(self, provider_id: str, body: dict) -> dict:
         """Add or change a provider. A key in the body goes straight to the Keychain and is never returned."""
+        bad = [name for name, value in body.items() if value is not None and not isinstance(value, str)]
+        if bad:
+            raise ValueError(f"{', '.join(sorted(bad))} must be text.")
         with self._provider_lock:
             settings = self.ctx.settings
             saved = {p["id"]: p for p in settings.providers}

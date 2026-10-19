@@ -277,7 +277,12 @@ class VoiceServiceTest(VoiceTestBase):
         self.editor.effort = "max"
         self.build().start()
         record = self.speak()
-        self.assertEqual((record["model"], record["effort"]), ("claude-opus-5-5", "max"))
+        self.assertEqual((record["model"], record["effort"], record["provider"]), ("claude-opus-5-5", "max", None))
+
+    def test_the_record_names_the_api_provider(self):
+        self.editor.init = {"model": "deepseek-v4-pro", "provider": "DeepSeek"}
+        self.build().start()
+        self.assertEqual(self.speak()["provider"], "DeepSeek")
 
     def test_events_from_blender_drive_hold_to_talk(self):
         self.build().start()

@@ -1,6 +1,8 @@
 import unittest
 
 from gazevoice.components.base import ComponentState, Health
+from gazevoice.providers import preset
+from gazevoice.settings import Settings, update_settings
 from gazevoice.workflow import workflow_stages
 
 
@@ -45,6 +47,14 @@ class WorkflowStagesTest(unittest.TestCase):
         stages = {s["id"]: s for s in workflow_stages({}, {"refiner": "claude", "editor": "deepseek"})}
         self.assertEqual(stages["refine"]["parts"], ["claude"])
         self.assertEqual(stages["edit"]["parts"], ["deepseek", "mcp_server"])
+
+    def test_a_provider_step_without_a_model_isnt_ready(self):
+        states = {"deepseek": st("deepseek", Health.READY), "mcp_server": st("mcp_server", Health.READY)}
+        settings = update_settings(Settings(), {"providers": [preset("deepseek").to_dict()], "editor_source": "deepseek"})
+        sources = {"refiner": None, "editor": "deepseek"}
+        self.assertEqual({s["id"]: s for s in workflow_stages(states, sources, settings)}["edit"]["health"], "installed")
+        settings = update_settings(settings, {"editor_api_model": "deepseek-v4-pro"})
+        self.assertEqual({s["id"]: s for s in workflow_stages(states, sources, settings)}["edit"]["health"], "ready")
 
     def test_brain_part_is_named(self):
         stages = {s["id"]: s for s in workflow_stages({}, "codex")}

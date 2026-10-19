@@ -69,6 +69,7 @@ class BuildVoiceTest(unittest.TestCase):
         editor = voice.factories.editor()
         self.assertIsInstance(editor, ApiSession)
         self.assertEqual((editor.init["model"], editor.effort, editor.kind), ("deepseek-v4-pro", "max", "deepseek"))
+        self.assertEqual(editor.init["provider"], "DeepSeek")
         self.assertIsNotNone(editor.mcp_factory)
         self.assertNotIsInstance(voice.factories.refiner(), ApiSession)
 

@@ -120,7 +120,7 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
             ChatClient(config, key), getattr(settings, f"{step}_api_model"),
             (EDITOR_PROMPT if editing else REFINER_PROMPT).read_text(), kind=config.kind,
             thinking=getattr(settings, f"{step}_api_thinking"),
-            mcp_factory=blender_mcp(server_cmd) if editing else None,
+            mcp_factory=blender_mcp(server_cmd) if editing else None, provider=config.name,
         )
 
     def editor():

@@ -85,7 +85,9 @@ class ApiSessionTest(unittest.TestCase):
         self.assertEqual(body["messages"][-1], {"role": "user", "content": '{"heard": "make it red"}'})
         self.assertNotIn("tools", body)
         self.assertEqual(body["thinking"], {"type": "disabled"})
-        self.assertEqual((session.init, session.effort), ({"model": "deepseek-flash"}, "off"))
+        self.assertEqual((session.init["model"], session.effort), ("deepseek-flash", "off"))
+        named = ApiSession(client, "deepseek-flash", "You clean up.", kind="deepseek", provider="DeepSeek")
+        self.assertEqual(named.init, {"model": "deepseek-flash", "provider": "DeepSeek"})
 
     def test_editor_runs_the_tool_loop(self):
         session = self.editor([msg(tool_calls=[call("execute_blender_code", {"code": "x"})]), msg("Made it red.")])

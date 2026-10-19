@@ -94,6 +94,13 @@ class ProviderApiTest(unittest.TestCase):
         self.assertIn("API key", body["error"])
         self.assertEqual(self.call("POST", "/api/providers/nobody", {"key": "sk-1"})[0], 404)
 
+    def test_fields_that_arent_text_are_a_plain_400(self):
+        for body in ({"key": 123}, {"key": ["sk-1"]}, {"region": 5, "key": "sk-1"}):
+            status, reply = self.call("POST", "/api/providers/qwen", body)
+            self.assertEqual(status, 400, (body, reply))
+        status, _ = self.call("POST", "/api/providers/custom_new", {"name": "X", "base_url": ["https://a.test"], "key": "sk-1"})
+        self.assertEqual(status, 400)
+
     def test_remove_moves_steps_to_auto(self):
         self.keychain_accepts("deepseek")
         self.call("POST", "/api/providers/deepseek", {"key": "sk-1234"})

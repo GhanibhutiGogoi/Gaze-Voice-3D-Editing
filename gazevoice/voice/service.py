@@ -529,7 +529,8 @@ class VoiceService:
             "reply": "",
             "error": None,
             "undo_step": None,
-            "model": None,  # the model that did the edit, as Claude Code reports it
+            "model": None,  # the model that did the edit, as the brain reports it
+            "provider": None,  # the API provider it ran on, if any
             "effort": None,
             "audio": None,
             "refine_error": None,
@@ -907,7 +908,8 @@ class VoiceService:
             editor = self._session("_editor", self.factories.editor, run)
             record["effort"] = getattr(editor, "effort", None)
             turn = editor.send(editor_message(record["refined"], record["heard"], record["focus"]), on_tool=on_tool)
-            record["model"] = (getattr(editor, "init", None) or {}).get("model")
+            init = getattr(editor, "init", None) or {}
+            record["model"], record["provider"] = init.get("model"), init.get("provider")
         except BrainError as exc:
             record["timings"]["edit"] = round(time.monotonic() - began, 2)
             if editor is not None:

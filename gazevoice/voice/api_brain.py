@@ -88,6 +88,7 @@ class ApiSession:
         mcp_factory: Callable[[], Any] | None = None,
         max_steps: int = 12,
         keep_commands: int = 8,
+        provider: str = "",
     ):
         self.client = client
         self.model = model
@@ -97,7 +98,7 @@ class ApiSession:
         self.mcp_factory = mcp_factory
         self.max_steps = max_steps
         self.keep_commands = keep_commands
-        self.init = {"model": model}
+        self.init = {"model": model, **({"provider": provider} if provider else {})}
         self.effort = thinking if thinking and thinking != "default" else None
         self.turns = 0
         self._mcp = None

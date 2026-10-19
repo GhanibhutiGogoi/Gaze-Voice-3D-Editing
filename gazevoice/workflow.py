@@ -28,16 +28,27 @@ def as_sources(sources: Mapping[str, str | None] | str | None) -> dict[str, str 
     return {step: sources for step in SOURCE_STEPS}
 
 
-def workflow_stages(states: Mapping[str, ComponentState], sources: Mapping[str, str | None] | str | None) -> list[dict]:
-    """Each stage is as healthy as its least healthy part. A step with no brain counts as missing."""
+def workflow_stages(
+    states: Mapping[str, ComponentState], sources: Mapping[str, str | None] | str | None, settings=None
+) -> list[dict]:
+    """Each stage is as healthy as its least healthy part. A step with no brain counts as missing,
+    and (given the settings) a provider step with no model picked yet counts as installed, not ready."""
     sources = as_sources(sources)
-    marker = {REFINER: sources["refiner"], EDITOR: sources["editor"]}
+    marker = {REFINER: "refiner", EDITOR: "editor"}
     stages = []
     for stage_id, label, parts in STAGES:
-        resolved = [marker[part] if part in marker else part for part in parts]
-        healths = [states[cid].health if cid in states else Health.MISSING for cid in resolved if cid]
-        if None in resolved:
-            healths.append(Health.MISSING)
+        resolved = [sources[marker[part]] if part in marker else part for part in parts]
+        healths = []
+        for part, cid in zip(parts, resolved):
+            if cid is None:
+                healths.append(Health.MISSING)
+                continue
+            health = states[cid].health if cid in states else Health.MISSING
+            step = marker.get(part)
+            if (step and settings is not None and cid not in BRAIN_ORDER and health is Health.READY
+                    and not getattr(settings, f"{step}_api_model")):
+                health = Health.INSTALLED  # key saved, model not picked yet
+            healths.append(health)
         worst = max(healths, key=SEVERITY.__getitem__)
         stages.append(
             {

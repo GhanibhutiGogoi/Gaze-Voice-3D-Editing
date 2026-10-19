@@ -124,8 +124,9 @@ function modelLabel(id) {
 }
 
 function effortLabel(effort) {
+  if (!effort || effort === "default") return "";
   const known = EFFORTS.find(([value]) => value === effort);
-  return known && effort !== "default" ? known[1].toLowerCase() : "";
+  return (known ? known[1] : THINKING_WORDS[effort] || "").toLowerCase();
 }
 
 // ---------- small helpers ----------
@@ -823,6 +824,11 @@ function renderVoice() {
       box.append(h("p", { class: "voice-note", text: privacyNote(v) }));
     }
 
+    const sent = providerNames();
+    if (!on && sent.length) {
+      box.append(h("p", { class: "voice-note", text: `Once voice is on, your commands and scene details go to ${sent.join(" and ")}.` }));
+    }
+
     const recent = v.recent || [];
     box.append(recent.length
       ? h("ol", { class: "cmd-list", "aria-label": "Recent commands" }, recent.slice(0, 12).map(commandRow))
@@ -835,9 +841,14 @@ function renderVoice() {
   });
 }
 
+function providerNames() {
+  const sources = (S.state && S.state.sources) || {};
+  return [...new Set(Object.values(sources))].map(component).filter((c) => c && c.provider).map((c) => c.name);
+}
+
 function privacyNote(v) {
   const sources = (S.state && S.state.sources) || {};
-  const providers = [...new Set(Object.values(sources))].map(component).filter((c) => c && c.provider).map((c) => c.name);
+  const providers = providerNames();
   let note = "The mic is open while voice is on. Audio stays in memory; only the commands you speak are saved, in the app's logs folder.";
   if (Object.values(sources).includes("codex") || v.brain === "codex") note += " Codex keeps its own history of them.";
   if (providers.length) note += ` Your commands and scene details go to ${providers.join(" and ")}.`;
@@ -871,7 +882,7 @@ function commandRow(r) {
     t.total != null && `total ${t.total}s`,
     r.fallback && "used what was heard",
   ].filter(Boolean).join(" · ");
-  const editedBy = r.model ? [modelLabel(r.model), effortLabel(r.effort)].filter(Boolean).join(" · ") : "";
+  const editedBy = r.model ? [r.provider, modelLabel(r.model), effortLabel(r.effort)].filter(Boolean).join(" · ") : "";
   return h("li", { class: "cmd", "data-stage": r.stage },
     h("span", { class: "led", "data-led": led, "aria-hidden": "true" }),
     h("div", { class: "cmd-main" },
@@ -1057,7 +1068,7 @@ function providerMenus(step, provider, settings) {
     modelPicker = h("input", {
       class: "provider-input",
       value: current,
-      placeholder: listed ? "Model name" : "Loading models…",
+      placeholder: !provider.provider.has_key ? "Add a key in the rack first" : listed ? "Model name" : "Loading models…",
       "aria-label": `${role} model name`,
       "data-focus-key": `route-${modelKey}`,
       onchange: (e) => saveSetting(modelKey, e.target.value.trim()),

@@ -1,5 +1,9 @@
 import socket
+import ssl
+import threading
 import unittest
+import urllib.error
+from unittest import mock
 
 from gazevoice.providers import (
     THINKING,
@@ -54,6 +58,10 @@ class CatalogTest(unittest.TestCase):
                 clean_key(bad)
             if bad.strip():
                 self.assertNotIn(bad.strip(), str(caught.exception))
+
+    def test_a_quote_never_reaches_the_keychain_command(self):
+        with self.assertRaises(ValueError):
+            clean_key("sk'abc")
 
     def test_custom_id(self):
         self.assertEqual(custom_id("My Box!", set()), "custom_my_box")
@@ -190,6 +198,40 @@ class ChatClientTest(unittest.TestCase):
                       self.error_for(400, {"error": {"message": "This model does not support tools"}}))
         self.assertIn("Fake AI", self.error_for(500))
         self.assertNotIn("sk-x", self.error_for(400, {"error": {"message": "bad key sk-x given"}}))
+
+    def test_only_real_tool_support_errors_say_cant_call_tools(self):
+        history = {"error": {"message": "Messages with role 'tool' must be a response to a preceding message with 'tool_calls'"}}
+        message = self.error_for(400, history)
+        self.assertNotIn("can't call tools", message)
+        self.assertIn("refused the request", message)
+        for text in ("Function calling is not supported for this model", "tools are not supported by deepseek-x",
+                     "This model doesn't support tool use"):
+            self.assertIn("can't call tools", self.error_for(400, {"error": {"message": text}}))
+
+    def test_a_cut_off_answer_is_a_plain_error(self):
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        self.addCleanup(server.close)
+
+        def answer_half():
+            conn, _ = server.accept()
+            conn.recv(65536)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"cho")
+            conn.close()
+
+        threading.Thread(target=answer_half, daemon=True).start()
+        cfg = ProviderConfig("custom_half", "custom", "Half AI", base_url=f"http://127.0.0.1:{server.getsockname()[1]}/v1")
+        with self.assertRaises(ProviderError) as caught:
+            ChatClient(cfg, "sk-x").chat({"model": "m", "messages": []})
+        self.assertIn("Lost the connection to Half AI", str(caught.exception))
+
+    def test_a_certificate_problem_says_what_to_do(self):
+        problem = urllib.error.URLError(ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed"))
+        with mock.patch("gazevoice.providers.urllib.request.urlopen", side_effect=problem):
+            with self.assertRaises(ProviderError) as caught:
+                ChatClient(self.cfg, "sk-x").models()
+        self.assertIn("Install Certificates", str(caught.exception))
 
     def test_rate_limits_are_retried_once(self):
         self.fake.reply({"error": {"message": "slow down"}}, status=429, headers={"Retry-After": "0"})
