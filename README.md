@@ -54,7 +54,8 @@ Every unit shows its real state on this Mac. Nothing installs, records audio or 
    - what it was cleaned up to;
    - what changed;
    - how long each step took.
-5. Every command that changes the scene becomes **one undo step**, named "GazeVoice: …", so Ctrl+Z works as usual. Commands that only look something up don't add one.
+5. **What you say gets written up properly.** Ask for something new, like "make a bird model", and the cleanup step writes the editor a detailed brief: real proportions and size, separate named parts, enough geometry and smooth shading, materials, and a tidy group. That way you get a finished-looking model instead of a few basic shapes. Exact edits like "make it red" or "play the animation" go through exactly as you said them. Open **Prompt sent to the editor** under a command to read the brief. A detailed build can take a minute or two; "stop" still ends it at once.
+6. Every command that changes the scene becomes **one undo step**, named "GazeVoice: …", so Ctrl+Z works as usual. Commands that only look something up don't add one.
 
 **Saying "stop", "undo" or "redo"** skips the AI:
 

@@ -158,6 +158,7 @@ class FakeSession:
         self.tools_first = list(tools_first)
         self.die_on_interrupt = die_on_interrupt
         self.sent = []
+        self.timeouts = []
         self.interrupted = False
         self.closed = False
         self._alive = True
@@ -171,6 +172,7 @@ class FakeSession:
 
     def send(self, text, on_tool=None, timeout=180):
         self.sent.append(text)
+        self.timeouts.append(timeout)
         if self.block is not None:
             for tool in self.tools_first:
                 if on_tool:
@@ -283,6 +285,27 @@ class VoiceServiceTest(VoiceTestBase):
         self.editor.init = {"model": "deepseek-v4-pro", "provider": "DeepSeek"}
         self.build().start()
         self.assertEqual(self.speak()["provider"], "DeepSeek")
+
+    def test_a_build_request_sends_the_detailed_prompt(self):
+        brief = "Model a bird with realistic proportions, layered wing feathers, a fanned tail and smooth shading."
+        self.refiner = FakeSession([TurnResult(json.dumps({"kind": "command", "title": "Make a bird model.", "text": brief}), False)])
+        self.build().start()
+        record = self.speak()
+        self.assertEqual((record["refined"], record["prompt"]), ("Make a bird model.", brief))
+        self.assertIn(f"Command: {brief}", self.editor.sent[0])
+        self.assertEqual(self.bridge.pushed, ["GazeVoice: Make a bird model."])
+        self.assertIn(("Working: Make a bird model.", "working"), self.bridge.statuses)
+
+    def test_typed_commands_go_as_typed(self):
+        self.build().start()
+        record = self.service.say("add a cube")
+        wait_for(lambda: self.record(record)["stage"] == "done")
+        self.assertEqual(self.record(record)["prompt"], "add a cube")
+
+    def test_an_edit_gets_ten_minutes(self):
+        self.build().start()
+        self.speak()
+        self.assertEqual(self.editor.timeouts, [600])
 
     def test_events_from_blender_drive_hold_to_talk(self):
         self.build().start()

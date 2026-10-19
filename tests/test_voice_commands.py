@@ -51,6 +51,19 @@ class RefinerTest(unittest.TestCase):
         refined = parse_refined('{"kind": "command", "text": "Make this twice as tall."}', "heard")
         self.assertEqual((refined.kind, refined.text, refined.fallback), ("command", "Make this twice as tall.", False))
 
+    def test_a_build_request_comes_back_as_a_title_and_a_detailed_prompt(self):
+        brief = ("Model a bird with realistic proportions: a teardrop body, a round head, a short pointed beak, "
+                 "two eyes, wings with layered feathers, a fanned tail and thin legs. Use smooth shading.")
+        refined = parse_refined(json.dumps({"kind": "command", "title": "Make a bird model.", "text": brief}), "make a bird")
+        self.assertEqual((refined.kind, refined.title, refined.text, refined.fallback),
+                         ("command", "Make a bird model.", brief, False))
+
+    def test_without_a_title_the_instruction_is_its_own_title(self):
+        refined = parse_refined('{"kind": "command", "text": "Play the animation."}', "play the animation please")
+        self.assertEqual((refined.title, refined.text), ("Play the animation.", "Play the animation."))
+        long = parse_refined(json.dumps({"kind": "command", "text": "Add a chair. " + "Give it detail. " * 20}), "x")
+        self.assertEqual(long.title, "Add a chair.")
+
     def test_parse_json_in_a_fence_or_after_text(self):
         for reply in ('```json\n{"kind":"undo","text":""}\n```', 'Sure! {"kind": "undo", "text": ""}'):
             self.assertEqual(parse_refined(reply, "undo that").kind, "undo")
@@ -58,6 +71,7 @@ class RefinerTest(unittest.TestCase):
     def test_unparseable_falls_back_to_what_was_heard(self):
         refined = parse_refined("I think you want it taller", "make it taller")
         self.assertEqual((refined.kind, refined.text, refined.fallback), ("command", "make it taller", True))
+        self.assertEqual(refined.title, "make it taller")
 
     def test_empty_command_text_falls_back(self):
         refined = parse_refined('{"kind": "command", "text": ""}', "bevel the edges")
@@ -89,8 +103,12 @@ class PromptsTest(unittest.TestCase):
         refiner = REFINER_PROMPT.read_text()
         self.assertIn("execute_blender_code", editor)
         self.assertIn("Never ask", editor)
-        self.assertIn("Never add anything", refiner)
         self.assertIn('"kind"', refiner)
+        self.assertIn('"title"', refiner)
+        self.assertIn("exactly as asked", refiner)  # short, exact edits stay as they were said
+        self.assertIn("detailed", refiner)  # build requests become detailed briefs
+        self.assertNotIn("short, direct", editor)
+        self.assertIn("low-poly", editor)
 
     def test_vocabulary_prompt_is_bounded(self):
         names = [f"Object_{i}" for i in range(500)]

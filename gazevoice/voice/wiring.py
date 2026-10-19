@@ -29,6 +29,7 @@ _NEEDED = (
 
 
 STEP_LABELS = (("refiner", "Cleanup"), ("editor", "Editing"))
+EDITOR_STEPS = 30  # model and tool turns per editing command; detailed builds take many
 
 
 def _step_missing(states, step: str, label: str, source: str | None, settings: Settings) -> str | None:
@@ -121,6 +122,7 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
             (EDITOR_PROMPT if editing else REFINER_PROMPT).read_text(), kind=config.kind,
             thinking=getattr(settings, f"{step}_api_thinking"),
             mcp_factory=blender_mcp(server_cmd) if editing else None, provider=config.name,
+            max_steps=EDITOR_STEPS if editing else 1,
         )
 
     def editor():
@@ -128,7 +130,7 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
         if source == "codex":
             return CodexSession(paths.work, EDITOR_PROMPT.read_text(), mcp_cmd=server_cmd)
         if source == "claude":
-            return claude(EDITOR_PROMPT, settings.editor_model, settings.editor_effort, mcp_config, 12,
+            return claude(EDITOR_PROMPT, settings.editor_model, settings.editor_effort, mcp_config, EDITOR_STEPS,
                           warmup=EDITOR_WARMUP, require_mcp="blender", timeout=150)
         return provider("editor", source)
 

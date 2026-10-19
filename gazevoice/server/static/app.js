@@ -888,6 +888,9 @@ function commandRow(r) {
     h("div", { class: "cmd-main" },
       h("p", { class: "cmd-understood", text: understood }),
       heard ? h("p", { class: "cmd-heard", text: heard }) : null,
+      r.prompt && r.prompt !== r.refined
+        ? h("details", { class: "cmd-prompt" }, h("summary", { text: "Prompt sent to the editor" }), h("p", { text: r.prompt }))
+        : null,
       result ? h("p", { class: "cmd-result", "data-tone": tone, text: result }) : null),
     h("div", { class: "cmd-meta" },
       h("span", { text: meta }),

@@ -55,8 +55,15 @@ def meta_command(text: str) -> str | None:
 @dataclass(frozen=True)
 class Refined:
     kind: str
-    text: str
+    text: str  # what the editor follows: one sentence for an exact edit, a detailed brief for a build
     fallback: bool = False  # True when the refiner's reply couldn't be used
+    title: str = ""  # a short name for the dashboard, the status line and the undo step
+
+
+def first_sentence(text: str, limit: int = 100) -> str:
+    match = re.match(r"(.+?[.!?])(?:\s|$)", text.strip(), re.DOTALL)
+    sentence = (match.group(1) if match else text.strip())
+    return sentence if len(sentence) <= limit else sentence[: limit - 1].rstrip() + "…"
 
 
 def refiner_message(heard: str, focus: dict | None, names: Sequence[str], previous: Sequence[str]) -> str:
@@ -87,9 +94,11 @@ def parse_refined(reply: str, heard: str) -> Refined:
     if data is not None:
         kind = data.get("kind")
         text = data.get("text") if isinstance(data.get("text"), str) else ""
+        title = data.get("title") if isinstance(data.get("title"), str) else ""
         if kind in KINDS and (kind != "command" or text.strip()):
-            return Refined(kind, text.strip())
-    return Refined("command", heard.strip(), fallback=True)
+            text = text.strip()
+            return Refined(kind, text, title=title.strip() or first_sentence(text))
+    return Refined("command", heard.strip(), fallback=True, title=heard.strip())
 
 
 def describe_focus(focus: dict | None) -> str:

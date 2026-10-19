@@ -71,7 +71,13 @@ class BuildVoiceTest(unittest.TestCase):
         self.assertEqual((editor.init["model"], editor.effort, editor.kind), ("deepseek-v4-pro", "max", "deepseek"))
         self.assertEqual(editor.init["provider"], "DeepSeek")
         self.assertIsNotNone(editor.mcp_factory)
+        self.assertEqual(editor.max_steps, 30)  # detailed builds take many steps
         self.assertNotIsInstance(voice.factories.refiner(), ApiSession)
+
+    def test_claude_edits_get_thirty_turns(self):
+        voice = build_voice(self.t.ctx, EventBus(), {"refiner": "claude", "editor": "claude"})
+        argv = voice.factories.editor().argv
+        self.assertEqual(argv[argv.index("--max-turns") + 1], "30")
 
     def test_a_provider_without_a_key_fails_with_a_plain_message(self):
         self.t.ctx.settings = update_settings(self.t.ctx.settings, {

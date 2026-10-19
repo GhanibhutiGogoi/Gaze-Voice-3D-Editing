@@ -47,6 +47,8 @@ JOIN_SECONDS = 10.0  # how long stop() waits for each loop (and for an interrupt
 BUSY_WAIT = 10.0  # how long an undo operation waits for Blender to finish a transform
 DEFAULT_KEY = "⌥ Space"
 UNDO_NAME_BYTES = 63  # Blender keeps 64 bytes of an undo step's name, the closing NUL included
+EDIT_SECONDS = 600.0  # a detailed build can take minutes; "stop" still ends it at once
+REFINE_SECONDS = 90.0
 REFINER_WARMUP = '{"heard": "hello", "focus": {}, "scene_objects": [], "previous_commands": []}'
 EDITOR_WARMUP = "Warm-up, not a command: don't use any tools and don't change anything. Reply with exactly: ready"
 READ_ONLY_TOOLS = ("get_", "search_", "render_viewport_to_path")  # Blender MCP tools that never change the scene
@@ -520,7 +522,8 @@ class VoiceService:
             "stage": "queued",
             "heard": "",
             "words": [],
-            "refined": "",
+            "refined": "",  # the short title shown everywhere
+            "prompt": "",  # what the editor was asked: a detailed brief for builds
             "kind": "",
             "fallback": False,
             "focus": None,
@@ -854,7 +857,8 @@ class VoiceService:
         refiner = None
         try:
             refiner = self._session("_refiner", self.factories.refiner, run)
-            turn = refiner.send(refiner_message(record["heard"], record["focus"], record["names"], previous), timeout=60)
+            turn = refiner.send(refiner_message(record["heard"], record["focus"], record["names"], previous),
+                                timeout=REFINE_SECONDS)
             reply = "" if turn.is_error else turn.text
             if turn.interrupted:
                 record["_stop"] = True
@@ -877,7 +881,8 @@ class VoiceService:
             self._stage("refining", record)
             self._status("Understanding…", "working")
             refined = self._refine(record, run)
-            record["refined"], record["kind"], record["fallback"] = refined.text, refined.kind, refined.fallback
+            record["refined"], record["prompt"] = refined.title or refined.text, refined.text
+            record["kind"], record["fallback"] = refined.kind, refined.fallback
             if record["_stop"] or run.stop.is_set():
                 self._stopped(record, "Stopped.", run)
                 return
@@ -889,7 +894,8 @@ class VoiceService:
                 self._done(record, record["reply"])
                 return
         else:
-            record["refined"], record["kind"] = record["heard"], "command"
+            record["refined"] = record["prompt"] = record["heard"]
+            record["kind"] = "command"
         if record["_stop"] or run.stop.is_set():
             self._stopped(record, "Stopped.", run)
             return
@@ -907,7 +913,8 @@ class VoiceService:
         try:
             editor = self._session("_editor", self.factories.editor, run)
             record["effort"] = getattr(editor, "effort", None)
-            turn = editor.send(editor_message(record["refined"], record["heard"], record["focus"]), on_tool=on_tool)
+            turn = editor.send(editor_message(record["prompt"] or record["refined"], record["heard"], record["focus"]),
+                               on_tool=on_tool, timeout=EDIT_SECONDS)
             init = getattr(editor, "init", None) or {}
             record["model"], record["provider"] = init.get("model"), init.get("provider")
         except BrainError as exc:

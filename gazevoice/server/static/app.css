@@ -680,6 +680,10 @@ main {
 .cmd-understood { font-size: var(--fs-ui); font-weight: 600; overflow-wrap: anywhere; }
 .cmd-heard { font: var(--fs-data)/1.5 var(--font-mono); color: var(--readout-key); overflow-wrap: anywhere; }
 .cmd-result { font-size: var(--fs-small); overflow-wrap: anywhere; }
+.cmd-prompt { font-size: var(--fs-small); color: var(--readout-key); }
+.cmd-prompt summary { cursor: pointer; width: fit-content; }
+.cmd-prompt summary:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.cmd-prompt p { margin-top: 4px; color: var(--readout-ink); line-height: 1.5; overflow-wrap: anywhere; }
 .cmd-result[data-tone="ok"] { color: color-mix(in srgb, var(--led-live) 75%, var(--readout-ink)); }
 .cmd-result[data-tone="bad"] { color: var(--led-fault); }
 .cmd-meta {
