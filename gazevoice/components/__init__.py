@@ -9,8 +9,9 @@ __all__ = ["ActionSpec", "Component", "ComponentState", "Context", "Health", "bu
 
 def build_components(ctx: Context) -> list[Component]:
     from ..workflow import WorkflowCheck
+    from .providers import provider_units
 
-    components = [cls(ctx) for cls in _component_classes()]
+    components = [cls(ctx) for cls in _component_classes()] + provider_units(ctx)
     return [*components, WorkflowCheck(ctx, {c.id: c for c in components})]
 
 

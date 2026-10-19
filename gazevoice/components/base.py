@@ -42,6 +42,7 @@ class ComponentState:
     summary: str
     details: tuple[tuple[str, str], ...] = ()
     actions: tuple[ActionSpec, ...] = ()
+    provider: dict | None = None  # API provider units: what the dashboard's key form needs (never the key)
 
     def offers(self, action_id: str) -> bool:
         return any(a.id == action_id for a in self.actions)
@@ -58,6 +59,7 @@ class ComponentState:
             "summary": self.summary,
             "details": [[k, v] for k, v in self.details],
             "actions": [a.to_dict() for a in self.actions],
+            **({"provider": self.provider} if self.provider is not None else {}),
         }
 
 
@@ -107,6 +109,7 @@ class Component(ABC):
         summary: str,
         details: Iterable[tuple[str, object]] = (),
         actions: Iterable[ActionSpec] = (),
+        provider: dict | None = None,
     ) -> ComponentState:
         return ComponentState(
             id=self.id,
@@ -116,6 +119,7 @@ class Component(ABC):
             summary=summary,
             details=tuple((str(k), str(v)) for k, v in details),
             actions=tuple(actions),
+            provider=provider,
         )
 
     def run_action(self, action: str, job: Job) -> dict | None:
