@@ -1,6 +1,10 @@
 import dataclasses
 import unittest
 
+from gazevoice.providers import KeyStore, preset
+from gazevoice.settings import update_settings
+from gazevoice.voice.api_brain import ApiSession
+
 from gazevoice.components.microphone import LIST_DEVICES
 from gazevoice.events import EventBus
 from gazevoice.voice.audio import MicError
@@ -30,7 +34,7 @@ class BuildVoiceTest(unittest.TestCase):
         return mic.argv[mic.argv.index("-i") + 1]
 
     def test_the_mic_is_picked_again_each_time_voice_starts(self):
-        voice = build_voice(self.t.ctx, EventBus(), "claude")
+        voice = build_voice(self.t.ctx, EventBus(), {"refiner": "claude", "editor": "claude"})
         self.assertEqual(self.device(voice.factories.mic()), ":1")
         # A USB interface plugged in since: the built-in mic's number moved.
         self.t.runner.add(LIST_DEVICES, stderr=listing("Aggregate Device", "USB Audio", "MacBook Air Microphone"))
@@ -39,7 +43,7 @@ class BuildVoiceTest(unittest.TestCase):
 
     def test_a_missing_mic_is_reported_when_voice_starts(self):
         self.t.ctx.settings = dataclasses.replace(self.t.ctx.settings, mic_device="7")
-        voice = build_voice(self.t.ctx, EventBus(), "claude")
+        voice = build_voice(self.t.ctx, EventBus(), {"refiner": "claude", "editor": "claude"})
         with self.assertRaises(MicError):
             voice.factories.mic()
 
@@ -47,7 +51,7 @@ class BuildVoiceTest(unittest.TestCase):
         self.t.ctx.settings = dataclasses.replace(
             self.t.ctx.settings, editor_model="claude-opus-5-5", editor_effort="max",
             refiner_model="claude-haiku-5-5", refiner_effort="default")
-        voice = build_voice(self.t.ctx, EventBus(), "claude")
+        voice = build_voice(self.t.ctx, EventBus(), {"refiner": "claude", "editor": "claude"})
         editor, refiner = voice.factories.editor(), voice.factories.refiner()
         self.assertEqual(editor.argv[editor.argv.index("--model") + 1], "claude-opus-5-5")
         self.assertEqual(editor.argv[editor.argv.index("--effort") + 1], "max")
@@ -55,8 +59,28 @@ class BuildVoiceTest(unittest.TestCase):
         self.assertEqual(refiner.argv[refiner.argv.index("--model") + 1], "claude-haiku-5-5")
         self.assertNotIn("--effort", refiner.argv)
 
+    def test_build_voice_uses_api_sessions_for_providers(self):
+        self.t.ctx.settings = update_settings(self.t.ctx.settings, {
+            "providers": [preset("deepseek").to_dict()], "editor_source": "deepseek",
+            "editor_api_model": "deepseek-v4-pro", "editor_api_thinking": "max"})
+        self.t.runner.add(["security", "find-generic-password", "-s", "GazeVoice", "-a", "deepseek", "-w"],
+                          stdout="sk-1234\n")
+        voice = build_voice(self.t.ctx, EventBus(), {"refiner": "claude", "editor": "deepseek"}, KeyStore(self.t.runner))
+        editor = voice.factories.editor()
+        self.assertIsInstance(editor, ApiSession)
+        self.assertEqual((editor.init["model"], editor.effort, editor.kind), ("deepseek-v4-pro", "max", "deepseek"))
+        self.assertIsNotNone(editor.mcp_factory)
+        self.assertNotIsInstance(voice.factories.refiner(), ApiSession)
+
+    def test_a_provider_without_a_key_fails_with_a_plain_message(self):
+        self.t.ctx.settings = update_settings(self.t.ctx.settings, {
+            "providers": [preset("deepseek").to_dict()], "refiner_source": "deepseek", "refiner_api_model": "m"})
+        voice = build_voice(self.t.ctx, EventBus(), {"refiner": "deepseek", "editor": "claude"}, KeyStore(self.t.runner))
+        with self.assertRaisesRegex(Exception, "DeepSeek has no API key"):
+            voice.factories.refiner()
+
     def test_speech_never_reaches_for_the_network(self):
-        voice = build_voice(self.t.ctx, EventBus(), "claude")
+        voice = build_voice(self.t.ctx, EventBus(), {"refiner": "claude", "editor": "claude"})
         self.assertEqual(voice.factories.stt().env.get("HF_HUB_OFFLINE"), "1")
 
 

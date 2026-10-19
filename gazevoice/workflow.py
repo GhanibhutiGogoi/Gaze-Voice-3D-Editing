@@ -5,27 +5,36 @@ from __future__ import annotations
 from typing import Mapping
 
 from .components.base import ActionSpec, Component, ComponentState, Health
-from .components.brains import BRAIN_ORDER, pick_brain
+from .components.brains import BRAIN_ORDER, STEPS as SOURCE_STEPS, resolve_sources
 from .jobs import Job, JobError
 from .probes import ProbeTimedOut
 
 SEVERITY = {Health.READY: 0, Health.CHECKING: 1, Health.INSTALLED: 2, Health.MISSING: 3, Health.ERROR: 4}
-BRAIN = "@brain"
+REFINER, EDITOR = "@refiner", "@editor"  # whatever brain or provider each step uses
 
 STAGES = (
     ("listen", "Microphone", ("microphone",)),
     ("transcribe", "Speech-to-text", ("speech",)),
-    ("refine", "Refiner", (BRAIN,)),
-    ("edit", "Editor", (BRAIN, "mcp_server")),
+    ("refine", "Refiner", (REFINER,)),
+    ("edit", "Editor", (EDITOR, "mcp_server")),
     ("blender", "Blender", ("blender", "mcp_addon", "bridge")),
 )
 
 
-def workflow_stages(states: Mapping[str, ComponentState], brain: str | None) -> list[dict]:
-    """Each stage is as healthy as its least healthy part. No ready brain counts as missing."""
+def as_sources(sources: Mapping[str, str | None] | str | None) -> dict[str, str | None]:
+    """Per-step sources; a single brain name (or None) means both steps."""
+    if isinstance(sources, Mapping):
+        return {step: sources.get(step) for step in SOURCE_STEPS}
+    return {step: sources for step in SOURCE_STEPS}
+
+
+def workflow_stages(states: Mapping[str, ComponentState], sources: Mapping[str, str | None] | str | None) -> list[dict]:
+    """Each stage is as healthy as its least healthy part. A step with no brain counts as missing."""
+    sources = as_sources(sources)
+    marker = {REFINER: sources["refiner"], EDITOR: sources["editor"]}
     stages = []
     for stage_id, label, parts in STAGES:
-        resolved = [brain if part == BRAIN else part for part in parts]
+        resolved = [marker[part] if part in marker else part for part in parts]
         healths = [states[cid].health if cid in states else Health.MISSING for cid in resolved if cid]
         if None in resolved:
             healths.append(Health.MISSING)
@@ -48,11 +57,10 @@ STEPS = (
     ("speech", "test"),
     ("mcp_server", "test"),
     ("bridge", "test"),
-    (BRAIN, "connect_blender"),
 )
 CHECK_CONFIRM = (
     "Run every connection test now? This records 3 seconds from your microphone and asks "
-    "your brain (Claude Code or Codex) one small question."
+    "your brain (Claude Code, Codex or your API provider) one small question."
 )
 
 
@@ -84,18 +92,30 @@ class WorkflowCheck(Component):
         except ProbeTimedOut:
             return component.state(Health.CHECKING, "Still checking…")
 
-    def _brain(self) -> str | None:
+    def _brain_steps(self) -> list[tuple[str, str]]:
+        """The last steps: Claude Code or Codex reaching Blender through MCP, and each API provider's test."""
         states = {cid: self._state_of(self.components[cid]) for cid in BRAIN_ORDER if cid in self.components}
-        return pick_brain(states, self.settings.brain)
+        sources = resolve_sources(states, self.settings)
+        if None in sources.values():
+            raise JobError("No brain is logged in. Log into Claude Code or Codex, or pick an API provider in Routing.")
+        steps = []
+        for step in ("refiner", "editor"):
+            source = sources[step]
+            if source in BRAIN_ORDER:
+                if step == "editor":
+                    steps.append((source, "connect_blender"))
+            elif (source, "test") not in steps:
+                steps.append((source, "test"))
+        return steps
 
     def action_check(self, job: Job) -> dict:
         passed = 0
-        for component_id, action in STEPS:
-            if component_id == BRAIN:
-                component_id = self._brain()
-                if component_id is None:
-                    job.log(f"✗ brain.{action}: no brain logged in")
-                    raise JobError("No brain is logged in. Log into Claude Code or Codex first.")
+        try:
+            brain_steps = self._brain_steps()
+        except JobError as exc:
+            job.log(f"✗ brain: {exc}")
+            raise
+        for component_id, action in (*STEPS, *brain_steps):
             component = self.components.get(component_id)
             if component is None:
                 raise JobError(f"{component_id} isn't part of this setup.")

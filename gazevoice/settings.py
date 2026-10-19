@@ -37,11 +37,6 @@ class Settings:
     refiner_api_thinking: str = "default"
     providers: tuple = ()  # ProviderConfig.to_dict() per saved provider; keys live in the Keychain
 
-    @property
-    def brain(self) -> str:
-        """The editing step's built-in brain preference (until every caller reads the sources)."""
-        return self.editor_source if self.editor_source in BUILTIN_SOURCES else "auto"
-
     def to_dict(self) -> dict:
         return asdict(self)
 

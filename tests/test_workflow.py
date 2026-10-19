@@ -41,6 +41,11 @@ class WorkflowStagesTest(unittest.TestCase):
         stages = {s["id"]: s for s in workflow_stages(states, None)}
         self.assertEqual(stages["blender"]["health"], "installed")
 
+    def test_stages_follow_each_step(self):
+        stages = {s["id"]: s for s in workflow_stages({}, {"refiner": "claude", "editor": "deepseek"})}
+        self.assertEqual(stages["refine"]["parts"], ["claude"])
+        self.assertEqual(stages["edit"]["parts"], ["deepseek", "mcp_server"])
+
     def test_brain_part_is_named(self):
         stages = {s["id"]: s for s in workflow_stages({}, "codex")}
         self.assertEqual(stages["edit"]["parts"], ["codex", "mcp_server"])

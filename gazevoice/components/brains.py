@@ -125,6 +125,27 @@ def brain_pending(states: Mapping[str, ComponentState], preference: str) -> bool
     return False
 
 
+STEPS = ("refiner", "editor")
+
+
+def resolve_sources(states: Mapping[str, ComponentState], settings) -> dict[str, str | None]:
+    """Each step's brain: "claude" or "codex", a provider id, or None when no built-in brain is ready.
+
+    A provider id is returned whether or not it has a key; readiness says what's missing.
+    """
+    resolved: dict[str, str | None] = {}
+    for step in STEPS:
+        source = getattr(settings, f"{step}_source")
+        resolved[step] = pick_brain(states, source) if source in ("auto", *BRAIN_ORDER) else source
+    return resolved
+
+
+def sources_pending(states: Mapping[str, ComponentState], settings) -> bool:
+    """True when a step has no brain only because a preferred one hasn't answered yet."""
+    sources = {getattr(settings, f"{step}_source") for step in STEPS}
+    return any(brain_pending(states, source) for source in sources if source in ("auto", *BRAIN_ORDER))
+
+
 def _tail(text: str, limit: int = 300) -> str:
     text = " ".join(text.split())
     return text[-limit:] if text else "no output"

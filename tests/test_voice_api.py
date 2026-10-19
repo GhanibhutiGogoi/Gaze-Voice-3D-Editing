@@ -4,6 +4,7 @@ import threading
 import unittest
 
 from gazevoice.components.base import Component, ComponentState, Health
+from gazevoice.providers import preset
 from gazevoice.server.app import WORKFLOW_ID, ControlCenter, make_server
 from gazevoice.settings import Settings, update_settings
 from gazevoice.voice.service import VoiceError
@@ -75,10 +76,26 @@ class ReadinessTest(unittest.TestCase):
 
     def test_lists_what_is_missing(self):
         missing = voice_readiness(states(speech=Health.MISSING, bridge=Health.INSTALLED), None)
-        self.assertEqual(len(missing), 3)
+        self.assertEqual(len(missing), 4)
         self.assertTrue(any("Speech" in m for m in missing))
-        self.assertTrue(any("brain" in m.lower() for m in missing))
+        self.assertTrue(any(m.startswith("Cleanup:") and "brain" in m.lower() for m in missing))
+        self.assertTrue(any(m.startswith("Editing:") for m in missing))
         self.assertTrue(any("Bridge" in m for m in missing))
+
+    def test_readiness_names_the_step(self):
+        deepseek = dict(states(), deepseek=ComponentState("deepseek", "DeepSeek", "", Health.MISSING, "no key"))
+        settings = update_settings(Settings(), {"providers": [preset("deepseek").to_dict()], "editor_source": "deepseek"})
+        missing = voice_readiness(deepseek, {"refiner": "claude", "editor": "deepseek"}, settings)
+        self.assertEqual(len(missing), 1)
+        self.assertTrue(missing[0].startswith("Editing: DeepSeek"))
+        keyed = dict(deepseek, deepseek=ComponentState("deepseek", "DeepSeek", "", Health.READY, "key"))
+        missing = voice_readiness(keyed, {"refiner": "claude", "editor": "deepseek"}, settings)
+        self.assertIn("model", missing[0])
+        both = update_settings(settings, {"refiner_source": "deepseek", "editor_api_model": "deepseek-v4-pro",
+                                          "refiner_api_model": "deepseek-flash"})
+        no_cli = dict(keyed, claude=ComponentState("claude", "Claude", "", Health.MISSING, "x"),
+                      codex=ComponentState("codex", "Codex", "", Health.MISSING, "x"))
+        self.assertEqual(voice_readiness(no_cli, {"refiner": "deepseek", "editor": "deepseek"}, both), [])
 
     def test_still_checking_units_are_named(self):
         missing = voice_readiness(states(mcp_addon=Health.CHECKING), "claude")
@@ -185,6 +202,20 @@ class VoiceApiTest(unittest.TestCase):
         self.assertFalse(self.get("/api/state")[1]["voice"]["needs_restart"])
         self.center.update_settings({"editor_effort": "max"})
         self.assertTrue(self.get("/api/state")[1]["voice"]["needs_restart"])
+
+    def test_changing_a_source_asks_for_a_restart(self):
+        self.start_server()
+        _, body = self.post("/api/voice/start")
+        self.center.jobs.wait(body["job"]["id"], 5)
+        self.assertFalse(self.get("/api/state")[1]["voice"]["needs_restart"])
+        self.center.update_settings({"refiner_source": "codex"})
+        self.assertTrue(self.get("/api/state")[1]["voice"]["needs_restart"])
+
+    def test_state_names_each_steps_brain(self):
+        self.start_server()
+        _, body = self.get("/api/state")
+        self.assertEqual(body["sources"], {"refiner": "claude", "editor": "claude"})
+        self.assertEqual(body["brain"], "claude")
 
     def test_say_while_off_is_409(self):
         self.start_server()

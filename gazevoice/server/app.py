@@ -22,10 +22,19 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from .. import __version__
 from ..components.base import Component, ComponentState, Context, Health
-from ..components.brains import brain_pending, pick_brain
+from ..components.brains import resolve_sources, sources_pending
 from ..events import EventBus
 from ..jobs import Job, JobAlreadyRunning, JobError, JobManager
 from ..probes import ProbeTimedOut
+from ..providers import (
+    ChatClient,
+    KeyStore,
+    ProviderConfig,
+    ProviderError,
+    clean_key,
+    custom_id,
+    preset,
+)
 from ..settings import save_settings, update_settings
 from ..voice.service import VoiceError
 from ..voice.wiring import build_voice, voice_readiness
@@ -50,6 +59,8 @@ STATIC_TYPES = {
 }
 _STATIC_NAME = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*")
 _ACTION_PATH = re.compile(r"/api/components/([a-z0-9_]+)/actions/([a-z0-9_]+)")
+_PROVIDER_PATH = re.compile(r"/api/providers/([a-z0-9_]+)(/remove|/models)?")
+MODEL_LIST_SECONDS = 600
 _MAX_BODY = 64 * 1024
 _CSP = "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'"
 
@@ -66,6 +77,7 @@ class ControlCenter:
         check_timeout: float = 8.0,
         sse_ping: float = 15.0,
         voice_factory=None,
+        keys: KeyStore | None = None,
     ):
         self.ctx = ctx
         self.components = {c.id: c for c in components}
@@ -77,7 +89,10 @@ class ControlCenter:
         self._pool = ThreadPoolExecutor(max_workers=16, thread_name_prefix="check")
         self._last: dict[str, ComponentState] = {}
         self._start_lock = threading.Lock()
-        self._voice_factory = voice_factory or (lambda brain: build_voice(self.ctx, self.bus, brain))
+        self.keys = keys or KeyStore(ctx.runner)
+        self._voice_factory = voice_factory or (lambda sources: build_voice(self.ctx, self.bus, sources, self.keys))
+        self._models: dict[str, tuple[float, list[str]]] = {}  # provider id → (when, model ids)
+        self._provider_lock = threading.Lock()
         self.voice = None
         self._voice_config: tuple | None = None
 
@@ -114,46 +129,53 @@ class ControlCenter:
         self._last = {**self._last, cid: state}
         self.bus.publish("component.updated", state.to_dict())
 
-    def brain(self, states: dict[str, ComponentState]) -> str | None:
-        return pick_brain(states, self.ctx.settings.brain)
+    def sources(self, states: dict[str, ComponentState]) -> dict[str, str | None]:
+        """Each step's brain: Claude Code, Codex or a provider id (None when none is ready)."""
+        return resolve_sources(states, self.ctx.settings)
 
     def snapshot(self, fresh: bool = False) -> dict:
         if fresh:
             self.ctx.probes.clear()
         states = self.check_all()
-        brain = self.brain(states)
+        sources = self.sources(states)
         return {
             "version": __version__,
-            "components": [states[cid].to_dict() for cid in self.order],
-            "brain": brain,
-            "brain_pending": brain_pending(states, self.ctx.settings.brain),
-            "workflow": workflow_stages(states, brain),
+            "components": [states[cid].to_dict() for cid in self.order if cid in states],
+            "brain": sources["editor"],
+            "sources": sources,
+            "brain_pending": sources_pending(states, self.ctx.settings),
+            "workflow": workflow_stages(states, sources),
             "running": self.jobs.running(),
             "settings": self.ctx.settings.to_dict(),
-            "voice": self.voice_snapshot(states, brain),
+            "voice": self.voice_snapshot(states, sources),
         }
 
     # --- voice ---------------------------------------------------------------------------
-    def _voice_config_now(self, brain: str | None) -> tuple:
+    def _voice_config_now(self, sources: dict[str, str | None]) -> tuple:
         s = self.ctx.settings
-        return (brain, s.stt_engine, s.mic_device, s.editor_model, s.editor_effort, s.refiner_model, s.refiner_effort)
+        return (sources["refiner"], sources["editor"], s.stt_engine, s.mic_device,
+                s.editor_model, s.editor_effort, s.editor_api_model, s.editor_api_thinking,
+                s.refiner_model, s.refiner_effort, s.refiner_api_model, s.refiner_api_thinking,
+                json.dumps(s.providers, sort_keys=True))
 
-    def voice_snapshot(self, states: dict[str, ComponentState] | None = None, brain: str | None = None) -> dict:
+    def voice_snapshot(self, states: dict[str, ComponentState] | None = None,
+                       sources: dict[str, str | None] | None = None) -> dict:
         voice = self.voice
         snap = voice.snapshot() if voice is not None else {"state": "off", "reason": "", "recent": []}
         on = snap.get("state") not in ("off", "error")
         if states is not None:
-            snap["missing"] = [] if on else voice_readiness(states, brain)
-            snap["needs_restart"] = on and self._voice_config != self._voice_config_now(brain)
+            sources = sources or self.sources(states)
+            snap["missing"] = [] if on else voice_readiness(states, sources, self.ctx.settings)
+            snap["needs_restart"] = on and self._voice_config != self._voice_config_now(sources)
         return snap
 
     def voice_start(self) -> Job:
         states = self.check_all()
-        brain = self.brain(states)
-        missing = voice_readiness(states, brain)
+        sources = self.sources(states)
+        missing = voice_readiness(states, sources, self.ctx.settings)
         if missing:
             raise VoiceNotReady(missing)
-        config = self._voice_config_now(brain)
+        config = self._voice_config_now(sources)
 
         def work(job: Job) -> dict:
             with self._start_lock:
@@ -164,7 +186,7 @@ class ControlCenter:
                         self.voice.stop()
                     job.log("Getting the microphone, speech engine and brain ready…")
                     try:
-                        self.voice = self._voice_factory(brain)
+                        self.voice = self._voice_factory(sources)
                     except VoiceError as exc:
                         raise JobError(str(exc)) from exc
                     self._voice_config = config
@@ -230,6 +252,105 @@ class ControlCenter:
 
     def settings_dict(self) -> dict:
         return self.ctx.settings.to_dict()
+
+    # --- API providers ---------------------------------------------------------------------
+    def _save_settings(self, updated) -> None:
+        save_settings(self.ctx.paths.settings_file, updated)
+        self.ctx.settings = updated
+        self.bus.publish("settings.updated", updated.to_dict())
+
+    def reload_components(self) -> None:
+        """Rebuild the provider units after one is added, changed or removed; other units stay as they are."""
+        from ..components.providers import ApiProviderUnit, CustomProviderSetup, provider_units
+
+        kept = [c for c in self.components.values() if not isinstance(c, (ApiProviderUnit, CustomProviderSetup))]
+        workflow = [c for c in kept if c.id == WORKFLOW_ID]
+        ordered = [c for c in kept if c.id != WORKFLOW_ID] + provider_units(self.ctx, self.keys) + workflow
+        for check in workflow:
+            check.components = {c.id: c for c in ordered if c.id != WORKFLOW_ID}
+        self.components = {c.id: c for c in ordered}
+        self.order = [c.id for c in ordered]
+        self._last = {cid: state for cid, state in self._last.items() if cid in self.components}
+        self.ctx.probes.clear()
+
+    def _public_provider(self, provider_id: str) -> dict:
+        component = self.components.get(provider_id)
+        state = self._safe_check(component) if component is not None else None
+        return (state.provider if state is not None else None) or {"id": provider_id}
+
+    def save_provider(self, provider_id: str, body: dict) -> dict:
+        """Add or change a provider. A key in the body goes straight to the Keychain and is never returned."""
+        with self._provider_lock:
+            settings = self.ctx.settings
+            saved = {p["id"]: p for p in settings.providers}
+            if provider_id == "custom_new":
+                provider_id = custom_id(str(body.get("name") or ""), set(saved) | {"deepseek", "qwen", "custom_new"})
+                fields = {"id": provider_id, "kind": "custom"}
+            elif provider_id in ("deepseek", "qwen"):
+                fields = dict(saved.get(provider_id) or preset(provider_id).to_dict())
+            elif saved.get(provider_id, {}).get("kind") == "custom":
+                fields = dict(saved[provider_id])
+            else:
+                raise KeyError(provider_id)
+            editable = ("name", "base_url") if fields["kind"] == "custom" else ("region", "workspace") if fields["kind"] == "qwen" else ()
+            for name in editable:
+                if name in body:
+                    fields[name] = body[name]
+            key = clean_key(body["key"]) if body.get("key") else None
+            if key:
+                fields["key_hint"] = key[-4:]
+            config = ProviderConfig.from_dict(fields)
+            config.endpoint()  # e.g. a Qwen region that needs a Workspace ID
+            if key:
+                try:
+                    self.keys.set(provider_id, key)
+                except ProviderError as exc:
+                    raise ValueError(str(exc)) from None
+            elif not self.keys.has(provider_id):
+                raise ValueError("Paste your API key first.")
+            providers = [config.to_dict() if p["id"] == provider_id else p for p in settings.providers]
+            if provider_id not in saved:
+                providers.append(config.to_dict())
+            updated = update_settings(settings, {"providers": providers})
+            self._save_settings(updated)
+            self._models.pop(provider_id, None)
+            self.reload_components()
+        return {"provider": self._public_provider(provider_id), "settings": updated.to_dict()}
+
+    def remove_provider(self, provider_id: str) -> dict:
+        """Forget a provider and delete its key. Steps that used it go back to Auto."""
+        with self._provider_lock:
+            settings = self.ctx.settings
+            if provider_id not in {p["id"] for p in settings.providers} and provider_id not in ("deepseek", "qwen"):
+                raise KeyError(provider_id)
+            moved = [step for step in ("refiner", "editor") if getattr(settings, f"{step}_source") == provider_id]
+            changes = {f"{step}_source": "auto" for step in moved}
+            changes["providers"] = [p for p in settings.providers if p["id"] != provider_id]
+            updated = update_settings(settings, changes)
+            self.keys.delete(provider_id)
+            self._save_settings(updated)
+            self._models.pop(provider_id, None)
+            self.reload_components()
+        return {"settings": updated.to_dict(), "moved_to_auto": moved}
+
+    def provider_models(self, provider_id: str) -> dict:
+        from ..components.providers import config_for
+
+        config = config_for(self.ctx.settings, provider_id)
+        if config is None:
+            raise KeyError(provider_id)
+        cached = self._models.get(provider_id)
+        if cached and time.monotonic() - cached[0] < MODEL_LIST_SECONDS:
+            return {"models": cached[1]}
+        key = self.keys.get(provider_id)
+        if not key:
+            return {"models": [], "error": f"Add your {config.name} API key first."}
+        try:
+            models = ChatClient(config, key, timeout=20).models()
+        except (ProviderError, ValueError) as exc:
+            return {"models": [], "error": str(exc)}
+        self._models[provider_id] = (time.monotonic(), models)
+        return {"models": models}
 
     def update_settings(self, changes: dict) -> dict:
         updated = update_settings(self.ctx.settings, changes)
@@ -360,6 +481,12 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(200, job.to_dict()) if job else self._error(404, "No such job")
         if path == "/api/events":
             return self._events()
+        match = _PROVIDER_PATH.fullmatch(path)
+        if match and match.group(2) == "/models":
+            try:
+                return self._json(200, self.center.provider_models(match.group(1)))
+            except KeyError:
+                return self._error(404, "Unknown provider")
         if path == "/api/voice":
             return self._json(200, self.center.voice_snapshot())
         return self._error(404, "Not found")
@@ -411,6 +538,19 @@ class _Handler(BaseHTTPRequestHandler):
             if body is None:
                 return self._error(400, "Send a JSON object")
             return self._voice_post(path, body)
+        provider = _PROVIDER_PATH.fullmatch(path)
+        if provider and provider.group(2) != "/models":
+            body = self._parse_json(raw) if raw.strip() else {}
+            if body is None:
+                return self._error(400, "Send a JSON object")
+            try:
+                if provider.group(2) == "/remove":
+                    return self._json(200, self.center.remove_provider(provider.group(1)))
+                return self._json(200, self.center.save_provider(provider.group(1), body))
+            except KeyError:
+                return self._error(404, "Unknown provider")
+            except ValueError as exc:
+                return self._error(400, str(exc))
         match = _ACTION_PATH.fullmatch(path)
         if not match:
             return self._error(404, "Not found")

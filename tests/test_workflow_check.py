@@ -5,6 +5,9 @@ from gazevoice.jobs import JobError
 from gazevoice.probes import ProbeTimedOut
 from gazevoice.workflow import STEPS, WorkflowCheck
 
+from gazevoice.providers import preset
+from gazevoice.settings import update_settings
+
 from .helpers import TempCtx, make_job
 
 
@@ -39,8 +42,8 @@ class WorkflowCheckTest(unittest.TestCase):
     def tearDown(self):
         self.t.cleanup()
 
-    def build(self, **overrides):
-        ids = ["microphone", "speech", "claude", "codex", "mcp_server", "bridge"]
+    def build(self, extra=(), **overrides):
+        ids = ["microphone", "speech", "claude", "codex", "mcp_server", "bridge", *extra]
         components = {}
         for cid in ids:
             kwargs = {"calls": self.calls, **overrides.get(cid, {})}
@@ -95,7 +98,22 @@ class WorkflowCheckTest(unittest.TestCase):
         self.assertEqual(self.calls[-1], ("codex", "connect_blender"))
 
     def test_steps_constant(self):
-        self.assertEqual([s[0] for s in STEPS], ["microphone", "speech", "mcp_server", "bridge", "@brain"])
+        # The brain's step is added per run: it depends on which brain or provider each step uses.
+        self.assertEqual([s[0] for s in STEPS], ["microphone", "speech", "mcp_server", "bridge"])
+
+    def test_an_api_provider_runs_its_own_test(self):
+        self.t.ctx.settings = update_settings(self.t.ctx.settings, {
+            "providers": [preset("deepseek").to_dict()], "editor_source": "deepseek", "refiner_source": "deepseek"})
+        result = self.build(extra=["deepseek"]).run_action("check", make_job("workflow", "check"))
+        self.assertEqual(self.calls[-1], ("deepseek", "test"))
+        self.assertNotIn(("claude", "connect_blender"), self.calls)
+        self.assertEqual(result["passed"], 5)  # one test, though both steps use DeepSeek
+
+    def test_no_brain_at_all_stops_with_a_plain_message(self):
+        workflow = self.build(claude={"health": Health.MISSING}, codex={"health": Health.MISSING})
+        with self.assertRaises(JobError) as caught:
+            workflow.run_action("check", make_job("workflow", "check"))
+        self.assertIn("API provider", str(caught.exception))
 
 
 if __name__ == "__main__":
