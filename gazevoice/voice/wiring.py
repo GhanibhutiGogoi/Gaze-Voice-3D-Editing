@@ -29,7 +29,7 @@ _NEEDED = (
 
 
 STEP_LABELS = (("refiner", "Cleanup"), ("editor", "Editing"))
-EDITOR_STEPS = 30  # model and tool turns per editing command; detailed builds take many
+EDITOR_STEPS = 150  # model and tool turns per editing command; detailed builds take many
 
 
 def _step_missing(states, step: str, label: str, source: str | None, settings: Settings) -> str | None:
