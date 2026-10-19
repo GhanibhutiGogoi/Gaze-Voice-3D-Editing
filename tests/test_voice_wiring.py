@@ -43,6 +43,18 @@ class BuildVoiceTest(unittest.TestCase):
         with self.assertRaises(MicError):
             voice.factories.mic()
 
+    def test_brain_sessions_use_the_chosen_models_and_thinking(self):
+        self.t.ctx.settings = dataclasses.replace(
+            self.t.ctx.settings, editor_model="claude-opus-5-5", editor_effort="max",
+            refiner_model="claude-haiku-5-5", refiner_effort="default")
+        voice = build_voice(self.t.ctx, EventBus(), "claude")
+        editor, refiner = voice.factories.editor(), voice.factories.refiner()
+        self.assertEqual(editor.argv[editor.argv.index("--model") + 1], "claude-opus-5-5")
+        self.assertEqual(editor.argv[editor.argv.index("--effort") + 1], "max")
+        self.assertEqual(editor.effort, "max")
+        self.assertEqual(refiner.argv[refiner.argv.index("--model") + 1], "claude-haiku-5-5")
+        self.assertNotIn("--effort", refiner.argv)
+
     def test_speech_never_reaches_for_the_network(self):
         voice = build_voice(self.t.ctx, EventBus(), "claude")
         self.assertEqual(voice.factories.stt().env.get("HF_HUB_OFFLINE"), "1")

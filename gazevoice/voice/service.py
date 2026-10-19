@@ -529,6 +529,8 @@ class VoiceService:
             "reply": "",
             "error": None,
             "undo_step": None,
+            "model": None,  # the model that did the edit, as Claude Code reports it
+            "effort": None,
             "audio": None,
             "refine_error": None,
             "refiner_reply": None,
@@ -903,7 +905,9 @@ class VoiceService:
         editor = None
         try:
             editor = self._session("_editor", self.factories.editor, run)
+            record["effort"] = getattr(editor, "effort", None)
             turn = editor.send(editor_message(record["refined"], record["heard"], record["focus"]), on_tool=on_tool)
+            record["model"] = (getattr(editor, "init", None) or {}).get("model")
         except BrainError as exc:
             record["timings"]["edit"] = round(time.monotonic() - began, 2)
             if editor is not None:

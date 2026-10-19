@@ -11,8 +11,10 @@ from typing import Any, Mapping
 
 BRAINS = ("auto", "claude", "codex")
 STT_ENGINES = ("parakeet", "whisper")
-EDITOR_MODELS = ("default", "opus", "sonnet", "haiku")  # Claude Code aliases; "default" = its own default
-REFINER_MODELS = ("haiku", "sonnet", "default")
+# Claude Code models by full name; "default" leaves the choice to Claude Code.
+CLAUDE_MODELS = ("default", "claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5")
+EFFORTS = ("default", "low", "medium", "high", "xhigh", "max")  # how much Claude thinks (`claude --effort`)
+_RENAMED_MODELS = {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5", "haiku": "claude-haiku-5-5"}
 
 
 @dataclass(frozen=True)
@@ -21,7 +23,9 @@ class Settings:
     stt_engine: str = "parakeet"
     mic_device: str = ""  # "" = auto (prefer the built-in mic); otherwise an AVFoundation index
     editor_model: str = "default"
-    refiner_model: str = "haiku"  # the cleanup step should be quick
+    editor_effort: str = "default"
+    refiner_model: str = "claude-haiku-5-5"  # the cleanup step should be quick
+    refiner_effort: str = "default"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -34,10 +38,10 @@ def _check(key: str, value: Any) -> None:
         raise ValueError(f"stt_engine must be one of {', '.join(STT_ENGINES)}")
     if key == "mic_device" and not (isinstance(value, str) and (value == "" or value.isdigit())):
         raise ValueError('mic_device must be "" (auto) or a device number such as "2"')
-    if key == "editor_model" and value not in EDITOR_MODELS:
-        raise ValueError(f"editor_model must be one of {', '.join(EDITOR_MODELS)}")
-    if key == "refiner_model" and value not in REFINER_MODELS:
-        raise ValueError(f"refiner_model must be one of {', '.join(REFINER_MODELS)}")
+    if key in ("editor_model", "refiner_model") and value not in CLAUDE_MODELS:
+        raise ValueError(f"{key} must be one of {', '.join(CLAUDE_MODELS)}")
+    if key in ("editor_effort", "refiner_effort") and value not in EFFORTS:
+        raise ValueError(f"{key} must be one of {', '.join(EFFORTS)}")
 
 
 def update_settings(settings: Settings, changes: Mapping[str, Any]) -> Settings:
@@ -60,8 +64,11 @@ def load_settings(path: Path) -> Settings:
     settings = Settings()
     for f in fields(Settings):
         if f.name in raw:
+            value = raw[f.name]
+            if f.name in ("editor_model", "refiner_model") and value in _RENAMED_MODELS:
+                value = _RENAMED_MODELS[value]  # saved before models were chosen by full name
             try:
-                settings = update_settings(settings, {f.name: raw[f.name]})
+                settings = update_settings(settings, {f.name: value})
             except ValueError:
                 continue
     return settings

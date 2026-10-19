@@ -484,6 +484,7 @@ main {
   font: var(--fs-small) var(--font-mono);
 }
 .select:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.route-pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; }
 .route-note { color: var(--ink-2); font-size: var(--fs-small); }
 .route-note[data-tone="bad"] { color: var(--fault-ink); }
 
@@ -660,7 +661,15 @@ main {
 .cmd-result { font-size: var(--fs-small); overflow-wrap: anywhere; }
 .cmd-result[data-tone="ok"] { color: color-mix(in srgb, var(--led-live) 75%, var(--readout-ink)); }
 .cmd-result[data-tone="bad"] { color: var(--led-fault); }
-.cmd-meta { font: var(--fs-data)/1.5 var(--font-mono); color: var(--readout-key); text-align: right; white-space: nowrap; }
+.cmd-meta {
+  display: grid;
+  justify-items: end;
+  font: var(--fs-data)/1.5 var(--font-mono);
+  color: var(--readout-key);
+  text-align: right;
+  white-space: nowrap;
+}
+.cmd-model { color: var(--readout-ink); }
 .cmd-empty {
   padding: 12px 14px;
   border: 1px dashed color-mix(in srgb, var(--ink-3) 45%, transparent);
@@ -690,7 +699,7 @@ main {
   .transport-top, .transport-mid { grid-template-columns: minmax(0, 1fr); }
   .voice-keys, .voice-aside { justify-content: flex-start; }
   .cmd { grid-template-columns: auto minmax(0, 1fr); }
-  .cmd-meta { grid-column: 2; text-align: left; white-space: normal; }
+  .cmd-meta { grid-column: 2; justify-items: start; text-align: left; white-space: normal; }
 }
 
 @media (max-width: 560px) {

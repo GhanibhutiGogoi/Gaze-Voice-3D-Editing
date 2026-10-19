@@ -73,7 +73,12 @@ Every unit shows its real state on this Mac. Nothing installs, records audio or 
 **Settings:**
 
 - **New conversation** makes the editor forget earlier commands, so "it" starts fresh.
-- Routing picks the **Editing model** (Default is your Claude Code default) and the **Cleanup model** (Haiku is quickest). Stop and start voice to apply changes.
+- In Routing, pick a model for **Editing** and one for **Cleanup**:
+  - the choices are Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5;
+  - "Default" lets Claude Code choose (GazeVoice doesn't use your personal Claude Code settings);
+  - they need a recent Claude Code, so run `claude update` if a choice fails to start.
+- Next to each model, pick how much it **thinks**: Low, Medium, High, Extra high or Max. More thinking can make big builds better, but each command takes longer. Haiku 5.5 keeps Cleanup quick.
+- Each command on the dashboard shows which model did the edit. Stop and start voice to apply changes.
 - **Codex** works as the brain too, but it's experimental and slower, about 10 seconds or more per command.
 
 **Privacy:**

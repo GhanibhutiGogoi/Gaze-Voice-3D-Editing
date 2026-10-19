@@ -41,6 +41,12 @@ class SettingsTest(unittest.TestCase):
         s = load_settings(self.path)
         self.assertEqual((s.brain, s.stt_engine), ("auto", "whisper"))
 
+    def test_model_names_saved_before_full_names_carry_over(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({"editor_model": "opus", "refiner_model": "haiku"}))
+        s = load_settings(self.path)
+        self.assertEqual((s.editor_model, s.refiner_model), ("claude-opus-5-5", "claude-haiku-5-5"))
+
     def test_update_rejects_bad_brain(self):
         with self.assertRaises(ValueError):
             update_settings(Settings(), {"brain": "gpt"})

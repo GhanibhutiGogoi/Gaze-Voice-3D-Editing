@@ -63,7 +63,8 @@ def short_tool(name: str) -> str:
 
 
 def claude_session_argv(
-    system_prompt_file: Path, model: str | None, mcp_config: Path | None, max_turns: int = 12
+    system_prompt_file: Path, model: str | None, mcp_config: Path | None, max_turns: int = 12,
+    effort: str | None = None,
 ) -> list[str]:
     argv = [
         "claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
@@ -75,6 +76,8 @@ def claude_session_argv(
     ]
     if model and model != "default":
         argv += ["--model", model]
+    if effort and effort != "default":
+        argv += ["--effort", effort]
     if mcp_config is not None:
         argv += ["--mcp-config", str(mcp_config), "--allowedTools", "mcp__blender"]
     return argv

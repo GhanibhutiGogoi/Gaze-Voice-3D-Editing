@@ -83,6 +83,32 @@ const STAGE_WORDS = {
   editing: "Working in Blender…",
 };
 const KIND_WORDS = { undo: "Undo", redo: "Redo", stop: "Stop", ignore: "Not a Blender command" };
+// Claude Code models by full name, and how much they think (`claude --effort`); the server checks the same lists.
+const CLAUDE_MODELS = [
+  ["default", "Default (Claude Code picks)"],
+  ["claude-fable-5-1", "Fable 5.1"],
+  ["claude-opus-5-5", "Opus 5.5"],
+  ["claude-sonnet-5-5", "Sonnet 5.5"],
+  ["claude-haiku-5-5", "Haiku 5.5"],
+];
+const EFFORTS = [
+  ["default", "Default thinking"],
+  ["low", "Low thinking"],
+  ["medium", "Medium thinking"],
+  ["high", "High thinking"],
+  ["xhigh", "Extra high thinking"],
+  ["max", "Max thinking"],
+];
+
+function modelLabel(id) {
+  const known = CLAUDE_MODELS.find(([value]) => value !== "default" && id.startsWith(value));
+  return known ? known[1] : id;
+}
+
+function effortLabel(effort) {
+  const known = EFFORTS.find(([value]) => value === effort);
+  return known && effort !== "default" ? known[1].toLowerCase() : "";
+}
 
 // ---------- small helpers ----------
 
@@ -699,13 +725,16 @@ function commandRow(r) {
     t.total != null && `total ${t.total}s`,
     r.fallback && "used what was heard",
   ].filter(Boolean).join(" · ");
+  const editedBy = r.model ? [modelLabel(r.model), effortLabel(r.effort)].filter(Boolean).join(" · ") : "";
   return h("li", { class: "cmd", "data-stage": r.stage },
     h("span", { class: "led", "data-led": led, "aria-hidden": "true" }),
     h("div", { class: "cmd-main" },
       h("p", { class: "cmd-understood", text: understood }),
       heard ? h("p", { class: "cmd-heard", text: heard }) : null,
       result ? h("p", { class: "cmd-result", "data-tone": tone, text: result }) : null),
-    h("div", { class: "cmd-meta", text: meta }));
+    h("div", { class: "cmd-meta" },
+      h("span", { text: meta }),
+      editedBy ? h("span", { class: "cmd-model", text: editedBy }) : null));
 }
 
 function talkKey() {
@@ -827,11 +856,36 @@ function renderRouting() {
     routeRow("Brain", "brain", settings.brain, [["auto", "Auto"], ["claude", "Claude Code"], ["codex", "Codex"]]),
     routeRow("Speech engine", "stt_engine", settings.stt_engine, [["parakeet", "Parakeet"], ["whisper", "Whisper"]]),
     inputRow(settings.mic_device),
-    routeRow("Editing model · Claude Code", "editor_model", settings.editor_model,
-      [["default", "Default"], ["opus", "Opus"], ["sonnet", "Sonnet"], ["haiku", "Haiku"]]),
-    routeRow("Cleanup model · Claude Code", "refiner_model", settings.refiner_model,
-      [["haiku", "Haiku"], ["sonnet", "Sonnet"], ["default", "Default"]]),
+    ...brainRows(settings),
     h("p", { class: "route-note", id: "route-note", text: brainNote || "" }));
+}
+
+function brainRows(settings) {
+  if (S.state && S.state.brain === "codex") {
+    return [h("div", { class: "route-row" },
+      h("span", { class: "route-label", text: "Editing and cleanup · Codex" }),
+      h("p", { class: "route-note", text: "Codex uses the model and reasoning level set in its own config." }))];
+  }
+  return [
+    modelRow("Editing", "editor_model", "editor_effort", settings),
+    modelRow("Cleanup", "refiner_model", "refiner_effort", settings),
+    h("p", { class: "route-note", text: "More thinking can make big builds better, but each command takes longer." }),
+  ];
+}
+
+function modelRow(role, modelKey, effortKey, settings) {
+  const id = `route-${modelKey}`;
+  const menu = (key, options, what) => h("select", {
+    class: "select",
+    "aria-label": `${role} ${what}`,
+    "data-focus-key": `route-${key}`,
+    onchange: (e) => saveSetting(key, e.target.value),
+  }, options.map(([value, label]) => h("option", { value, selected: value === settings[key] || null, text: label })));
+  return h("div", { class: "route-row" },
+    h("span", { class: "route-label", id, text: `${role} · Claude Code` }),
+    h("div", { class: "route-pair", role: "group", "aria-labelledby": id },
+      menu(modelKey, CLAUDE_MODELS, "model"),
+      menu(effortKey, EFFORTS, "thinking")));
 }
 
 function routeRow(label, key, value, options) {

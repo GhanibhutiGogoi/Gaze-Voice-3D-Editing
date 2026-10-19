@@ -27,6 +27,12 @@ class ArgvTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--system-prompt-file") + 1], "/p/editor.md")
         self.assertNotIn("--bare", argv)
 
+    def test_thinking_effort(self):
+        argv = claude_session_argv(Path("/p/editor.md"), "claude-opus-5-5", None, effort="max")
+        self.assertEqual(argv[argv.index("--effort") + 1], "max")
+        self.assertNotIn("--effort", claude_session_argv(Path("/p/editor.md"), "claude-opus-5-5", None, effort="default"))
+        self.assertNotIn("--effort", claude_session_argv(Path("/p/editor.md"), "claude-opus-5-5", None))
+
     def test_refiner_argv_has_no_tools_and_default_model_is_omitted(self):
         argv = claude_session_argv(Path("/p/refiner.md"), "default", None, max_turns=1)
         self.assertNotIn("--model", argv)

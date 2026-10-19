@@ -136,7 +136,7 @@ class ControlCenter:
     # --- voice ---------------------------------------------------------------------------
     def _voice_config_now(self, brain: str | None) -> tuple:
         s = self.ctx.settings
-        return (brain, s.stt_engine, s.mic_device, s.editor_model, s.refiner_model)
+        return (brain, s.stt_engine, s.mic_device, s.editor_model, s.editor_effort, s.refiner_model, s.refiner_effort)
 
     def voice_snapshot(self, states: dict[str, ComponentState] | None = None, brain: str | None = None) -> dict:
         voice = self.voice

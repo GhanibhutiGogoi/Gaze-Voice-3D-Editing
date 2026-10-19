@@ -64,9 +64,11 @@ def build_voice(ctx: Context, bus: EventBus, brain: str) -> VoiceService:
     mcp_config = write_mcp_config(paths, server_cmd)
     paths.work.mkdir(parents=True, exist_ok=True)
 
-    def claude(prompt, model, mcp, max_turns, **start_kwargs) -> ClaudeSession:
-        session = ClaudeSession(claude_session_argv(prompt, model, mcp, max_turns=max_turns), cwd=paths.work)
+    def claude(prompt, model, effort, mcp, max_turns, **start_kwargs) -> ClaudeSession:
+        argv = claude_session_argv(prompt, model, mcp, max_turns=max_turns, effort=effort)
+        session = ClaudeSession(argv, cwd=paths.work)
         session.start_kwargs = start_kwargs
+        session.effort = effort  # shown with each command, next to the model that answered
         return session
 
     if brain == "codex":
@@ -77,11 +79,12 @@ def build_voice(ctx: Context, bus: EventBus, brain: str) -> VoiceService:
             return CodexSession(paths.work, REFINER_PROMPT.read_text())
     else:
         def editor():
-            return claude(EDITOR_PROMPT, settings.editor_model, mcp_config, 12,
+            return claude(EDITOR_PROMPT, settings.editor_model, settings.editor_effort, mcp_config, 12,
                           warmup=EDITOR_WARMUP, require_mcp="blender", timeout=150)
 
         def refiner():
-            return claude(REFINER_PROMPT, settings.refiner_model, None, 1, warmup=REFINER_WARMUP, timeout=90)
+            return claude(REFINER_PROMPT, settings.refiner_model, settings.refiner_effort, None, 1,
+                          warmup=REFINER_WARMUP, timeout=90)
 
     factories = Factories(
         bridge=BridgeClient,

@@ -229,6 +229,10 @@ class VoiceTestBase(unittest.TestCase):
             bridge=lambda: self.bridge, mic=lambda: self.mic, stt=lambda: self.stt,
             refiner=lambda: self.refiner, editor=self.make_editor,
         )
+        # The fake mic's audio is stamped 1000.1–1010 and speak() presses at 1002, so the service's
+        # clock starts there too; on the real clock every hold would look decades long.
+        began = time.monotonic()
+        kwargs.setdefault("clock", lambda: 1001.0 + (time.monotonic() - began))
         self.service = VoiceService(Path(self.tmp.name), EventBus(), factories, engine=self.engine, **kwargs)
         return self.service
 
@@ -267,6 +271,13 @@ class VoiceServiceTest(VoiceTestBase):
         texts = [text for text, _ in self.bridge.statuses]
         self.assertIn("Listening… release the key to send", texts)
         self.assertIn("✓ Made Chair twice as tall.", texts)
+
+    def test_the_record_says_which_model_and_thinking_did_the_edit(self):
+        self.editor.init = {"model": "claude-opus-5-5"}
+        self.editor.effort = "max"
+        self.build().start()
+        record = self.speak()
+        self.assertEqual((record["model"], record["effort"]), ("claude-opus-5-5", "max"))
 
     def test_events_from_blender_drive_hold_to_talk(self):
         self.build().start()

@@ -86,12 +86,22 @@ class ReadinessTest(unittest.TestCase):
 
 
 class SettingsTest(unittest.TestCase):
-    def test_model_settings(self):
-        s = update_settings(Settings(), {"editor_model": "sonnet", "refiner_model": "default"})
-        self.assertEqual((s.editor_model, s.refiner_model), ("sonnet", "default"))
-        self.assertEqual((Settings().editor_model, Settings().refiner_model), ("default", "haiku"))
-        with self.assertRaises(ValueError):
-            update_settings(Settings(), {"editor_model": "gpt"})
+    def test_model_and_thinking_settings(self):
+        s = update_settings(Settings(), {"editor_model": "claude-opus-5-5", "editor_effort": "max",
+                                         "refiner_model": "claude-fable-5-1", "refiner_effort": "low"})
+        self.assertEqual((s.editor_model, s.editor_effort, s.refiner_model, s.refiner_effort),
+                         ("claude-opus-5-5", "max", "claude-fable-5-1", "low"))
+        d = Settings()
+        self.assertEqual((d.editor_model, d.editor_effort, d.refiner_model, d.refiner_effort),
+                         ("default", "default", "claude-haiku-5-5", "default"))
+        for model in ("default", "claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"):
+            self.assertEqual(update_settings(Settings(), {"refiner_model": model}).refiner_model, model)
+        for effort in ("default", "low", "medium", "high", "xhigh", "max"):
+            self.assertEqual(update_settings(Settings(), {"editor_effort": effort}).editor_effort, effort)
+        for bad in ({"editor_model": "gpt"}, {"editor_model": "opus"}, {"editor_effort": "ludicrous"},
+                    {"refiner_effort": ""}):
+            with self.assertRaises(ValueError):
+                update_settings(Settings(), bad)
 
 
 class VoiceApiTest(unittest.TestCase):
@@ -167,6 +177,14 @@ class VoiceApiTest(unittest.TestCase):
             self.assertEqual(self.voice.calls, [])
         finally:
             gate.set()
+
+    def test_changing_thinking_while_voice_is_on_asks_for_a_restart(self):
+        self.start_server()
+        _, body = self.post("/api/voice/start")
+        self.center.jobs.wait(body["job"]["id"], 5)
+        self.assertFalse(self.get("/api/state")[1]["voice"]["needs_restart"])
+        self.center.update_settings({"editor_effort": "max"})
+        self.assertTrue(self.get("/api/state")[1]["voice"]["needs_restart"])
 
     def test_say_while_off_is_409(self):
         self.start_server()
