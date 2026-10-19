@@ -187,7 +187,9 @@ class FakeRunner(CommandRunner):
         args = tuple(str(a) for a in argv)
         with self._lock:
             self.calls.append(args)
-            self.call_kwargs.append({"env": dict(env) if env else None, "cwd": cwd, "timeout": timeout})
+            self.call_kwargs.append(
+                {"env": dict(env) if env else None, "cwd": cwd, "timeout": timeout, "input_text": input_text}
+            )
         found = self._responses.get(args)
         if found is None:
             return CommandResult(args, NOT_FOUND, "", f"{args[0]}: not faked")
