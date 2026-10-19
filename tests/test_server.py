@@ -244,11 +244,11 @@ class ServerTest(unittest.TestCase):
         self.assertIn(b"<html", body.lower() if isinstance(body, bytes) else b"")
 
     def test_settings_round_trip_and_validation(self):
-        status, body = self.request("PUT", "/api/settings", body={"brain": "codex"})
-        self.assertEqual((status, body["brain"]), (200, "codex"))
-        self.assertEqual(self.request("GET", "/api/settings")[1]["brain"], "codex")
-        self.assertEqual(self.request("PUT", "/api/settings", body={"brain": "gpt"})[0], 400)
-        self.assertEqual(self.request("PUT", "/api/settings", body={"brain": "auto"}, write=False)[0], 403)
+        status, body = self.request("PUT", "/api/settings", body={"editor_source": "codex"})
+        self.assertEqual((status, body["editor_source"]), (200, "codex"))
+        self.assertEqual(self.request("GET", "/api/settings")[1]["editor_source"], "codex")
+        self.assertEqual(self.request("PUT", "/api/settings", body={"editor_source": "gpt"})[0], 400)
+        self.assertEqual(self.request("PUT", "/api/settings", body={"editor_source": "auto"}, write=False)[0], 403)
 
     def test_events_stream_delivers_job_started(self):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
