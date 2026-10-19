@@ -1,9 +1,9 @@
 schema_version = "1.0.0"
 
 id = "gazevoice_bridge"
-version = "0.1.0"
+version = "0.2.0"
 name = "GazeVoice Bridge"
-tagline = "Lets the GazeVoice app see your selection and show its status"
+tagline = "Talk to Blender: hold-to-talk, selection and status for GazeVoice"
 maintainer = "GazeVoice"
 type = "add-on"
 

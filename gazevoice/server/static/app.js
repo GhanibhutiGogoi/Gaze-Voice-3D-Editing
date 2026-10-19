@@ -59,7 +59,30 @@ const S = {
   stageTests: new Map(), // stage id -> testing | passed | failed
   workflowStep: null, // component id "Check everything" is testing right now
   spotlight: null,
+  voice: null, // the latest voice snapshot (from /api/state, then live events)
+  voiceError: null,
+  typed: "", // the unsent "type a command" draft survives re-renders
+  talkHeld: false,
+  talkListeners: null, // ends the listeners a dashboard hold-to-talk added
 };
+
+const VOICE_WORDS = {
+  off: ["off", "Voice is off"],
+  starting: ["busy", "Starting…"],
+  ready: ["live", "Ready"],
+  listening: ["rec", "Listening…"],
+  transcribing: ["busy", "Transcribing…"],
+  refining: ["busy", "Understanding…"],
+  editing: ["busy", "Working in Blender…"],
+  error: ["fault", "Voice stopped"],
+};
+const STAGE_WORDS = {
+  queued: "Waiting its turn…",
+  transcribing: "Transcribing…",
+  refining: "Understanding…",
+  editing: "Working in Blender…",
+};
+const KIND_WORDS = { undo: "Undo", redo: "Redo", stop: "Stop", ignore: "Not a Blender command" };
 
 // ---------- small helpers ----------
 
@@ -536,6 +559,254 @@ async function runAction(cid, aid) {
   renderAll();
 }
 
+// ---------- voice ----------
+
+function voice() {
+  return S.voice || (S.state && S.state.voice) || { state: "off", reason: "", recent: [], missing: [] };
+}
+
+function voiceOn(v = voice()) {
+  return !["off", "error", "starting"].includes(v.state);
+}
+
+function renderVoice() {
+  const box = $("voice");
+  if (!box) return;
+  preservingFocus(() => {
+    box.replaceChildren();
+    const v = voice();
+    const on = voiceOn(v);
+    const startingJob = jobRunning("voice");
+    const [led, word] = VOICE_WORDS[v.state] || VOICE_WORDS.off;
+    const key = v.key || "⌥ Space";
+    $("voice-note").textContent = `In Blender, hold ${key}, say what you want, and let go. Your selection is what “this” means.`;
+    let reason = v.reason;
+    if (!reason && v.state === "ready") reason = `Hold ${key} in Blender, speak, and let go.`;
+    if (!reason && v.state === "off") reason = "Turn voice on to start talking to Blender.";
+    if (v.state === "ready" && v.blender_connected === false) reason = "Blender isn't connected. Voice picks up again when it's back.";
+
+    const keys = h("div", { class: "voice-keys" });
+    if (!on) {
+      const missing = v.missing || [];
+      const starting = startingJob || v.state === "starting";
+      keys.append(h("button", {
+        class: "key key-primary",
+        type: "button",
+        "data-focus-key": "voice-start",
+        disabled: starting || missing.length > 0 || null,
+        title: missing.length ? "Fix the items listed below first" : "Uses a little of your plan to warm up the brain",
+        onclick: () => voicePost("start"),
+      }, starting ? "Starting…" : "Start voice", h("span", { class: "plan-ring", "aria-hidden": "true" })));
+      if (v.state === "starting") {
+        keys.append(h("button", {
+          class: "key", type: "button", "data-focus-key": "voice-cancel", onclick: () => voicePost("stop"),
+        }, "Cancel"));
+      }
+    } else {
+      keys.append(
+        talkKey(),
+        h("button", { class: "key", type: "button", "data-focus-key": "voice-undo", onclick: () => voicePost("undo") }, "Undo last"),
+        h("button", { class: "key", type: "button", "data-focus-key": "voice-stop", onclick: () => voicePost("stop") }, "Stop voice"));
+    }
+    box.append(h("div", { class: "transport-top" },
+      h("div", { class: "voice-readout", role: "status" },
+        h("span", { class: "led", "data-led": led, "aria-hidden": "true" }),
+        h("div", { class: "voice-text" },
+          h("span", { class: "voice-word", text: word }),
+          reason ? h("span", { class: "voice-reason", text: reason }) : null)),
+      keys));
+
+    const missing = v.missing || [];
+    if (!on && missing.length) {
+      box.append(h("ul", { class: "voice-missing", "aria-label": "Before voice can start" },
+        h("li", {}, h("strong", { text: "Before voice can start:" })),
+        missing.map((m) => h("li", { text: `○ ${m}` }))));
+    }
+    if (S.voiceError) box.append(h("p", { class: "voice-note", "data-tone": "warn", text: S.voiceError }));
+    if (v.needs_restart) {
+      box.append(h("p", { class: "voice-note", "data-tone": "warn", text: "Settings changed. Stop and start voice to use them." }));
+    }
+
+    if (on) {
+      const input = h("input", {
+        type: "text",
+        value: S.typed,
+        placeholder: "Or type a command: make the selected object twice as tall",
+        "aria-label": "Type a command",
+        "data-focus-key": "voice-type",
+        oninput: (e) => { S.typed = e.target.value; },
+      });
+      const form = h("form", {
+        class: "voice-type",
+        onsubmit: (e) => {
+          e.preventDefault();
+          sendTyped();
+        },
+      }, input, h("button", { class: "key", type: "submit", "data-focus-key": "voice-send" }, "Send"));
+      box.append(h("div", { class: "transport-mid" }, form,
+        h("div", { class: "voice-aside" },
+          h("button", {
+            class: "key key-quiet",
+            type: "button",
+            "data-focus-key": "voice-reset",
+            title: "Forget earlier commands, so “it” starts fresh",
+            onclick: () => voicePost("reset"),
+          }, "New conversation"))));
+      box.append(h("p", {
+        class: "voice-note",
+        text: v.brain === "codex"
+          ? "The mic is open while voice is on. Audio stays in memory; the commands you speak are saved in the app's logs folder, and Codex keeps its own history of them."
+          : "The mic is open while voice is on. Audio stays in memory; only the commands you speak are saved, in the app's logs folder.",
+      }));
+    }
+
+    const recent = v.recent || [];
+    box.append(recent.length
+      ? h("ol", { class: "cmd-list", "aria-label": "Recent commands" }, recent.slice(0, 12).map(commandRow))
+      : h("p", {
+        class: "cmd-empty",
+        text: on
+          ? `Nothing yet. Hold ${key} in Blender and say something like “make this twice as tall”.`
+          : "Commands you speak show up here: what was heard, what was understood, and what changed.",
+      }));
+  });
+}
+
+function commandRow(r) {
+  const led = { done: "live", failed: "fault", stopped: "off" }[r.stage] || "busy";
+  let understood = KIND_WORDS[r.kind] || r.refined || r.heard || STAGE_WORDS[r.stage] || "…";
+  if (r.kind === "command" && r.refined) understood = r.refined;
+  const heard = r.heard ? `${r.source === "typed" ? "Typed" : "Heard"}: “${r.heard}”` : "";
+  let tone = null;
+  let result = STAGE_WORDS[r.stage] || "";
+  if (r.stage === "failed") {
+    tone = "bad";
+    result = `✗ ${r.error}`;
+  } else if (r.stage === "stopped") {
+    result = `■ ${r.reply || "Stopped."}`;
+  } else if (r.stage === "done") {
+    tone = "ok";
+    result = r.reply ? `✓ ${r.reply}` : "✓ Done";
+  } else if (r.tools && r.tools.length) {
+    result += ` · ${r.tools[r.tools.length - 1].replaceAll("_", " ")}`;
+  }
+  const t = r.timings || {};
+  const meta = [
+    clock(r.created),
+    t.stt != null && `heard ${t.stt}s`,
+    t.refine != null && `understood ${t.refine}s`,
+    t.edit != null && `edited ${t.edit}s`,
+    t.total != null && `total ${t.total}s`,
+    r.fallback && "used what was heard",
+  ].filter(Boolean).join(" · ");
+  return h("li", { class: "cmd", "data-stage": r.stage },
+    h("span", { class: "led", "data-led": led, "aria-hidden": "true" }),
+    h("div", { class: "cmd-main" },
+      h("p", { class: "cmd-understood", text: understood }),
+      heard ? h("p", { class: "cmd-heard", text: heard }) : null,
+      result ? h("p", { class: "cmd-result", "data-tone": tone, text: result }) : null),
+    h("div", { class: "cmd-meta", text: meta }));
+}
+
+function talkKey() {
+  return h("button", {
+    class: "key key-talk",
+    type: "button",
+    "data-focus-key": "voice-talk",
+    "data-held": S.talkHeld || null,
+    "aria-pressed": String(S.talkHeld),
+    title: "Press and hold while you speak (or hold Space on this key)",
+    onpointerdown: (e) => {
+      e.preventDefault();
+      pressTalk();
+    },
+    onkeydown: (e) => {
+      if ((e.key === " " || e.key === "Enter") && !e.repeat) {
+        e.preventDefault();
+        pressTalk();
+      }
+    },
+  }, h("span", { class: "led", "data-led": S.talkHeld ? "rec" : "off", "aria-hidden": "true" }),
+  S.talkHeld ? "Listening… release to send" : "Hold to talk");
+}
+
+function pressTalk() {
+  if (S.talkHeld) return;
+  S.talkHeld = true;
+  voicePost("ptt", { state: "down" });
+  // Releasing sends; anything that ends the hold some other way (the window losing focus,
+  // the browser taking the pointer) cancels, so a stuck hold never sends room audio.
+  const listening = new AbortController();
+  S.talkListeners = listening;
+  window.addEventListener("pointerup", releaseTalk, { signal: listening.signal });
+  window.addEventListener("pointercancel", cancelTalk, { signal: listening.signal });
+  window.addEventListener("blur", cancelTalk, { signal: listening.signal });
+  renderVoice();
+}
+
+function endTalk(state) {
+  if (!S.talkHeld) return;
+  S.talkHeld = false;
+  if (S.talkListeners) S.talkListeners.abort();
+  S.talkListeners = null;
+  voicePost("ptt", { state });
+  renderVoice();
+}
+
+function releaseTalk() {
+  endTalk("up");
+}
+
+function cancelTalk() {
+  endTalk("cancel");
+}
+
+async function sendTyped() {
+  const text = S.typed.trim();
+  if (!text) return;
+  S.typed = "";
+  const response = await voicePost("say", { text });
+  if (!response.ok) {
+    S.typed = text;
+    renderVoice();
+  }
+}
+
+async function voicePost(name, body) {
+  S.voiceError = null;
+  let response;
+  try {
+    response = await send("POST", `/api/voice/${name}`, body || {});
+  } catch {
+    S.voiceError = "Couldn't reach the control center.";
+    renderVoice();
+    return { ok: false };
+  }
+  if (response.status === 409 && response.data && response.data.missing) {
+    S.voice = { ...voice(), missing: response.data.missing };
+  } else if (!response.ok) {
+    S.voiceError = (response.data && response.data.error) || `That didn't work (HTTP ${response.status}).`;
+  } else if (name === "stop" && response.data) {
+    S.voice = { ...response.data, missing: [] };
+    refresh();
+  } else if (name === "start" && response.data && response.data.job) {
+    const job = response.data.job;
+    S.jobs.set(job.id, job);
+    S.open.add(job.id);
+    renderLog();
+  }
+  renderVoice();
+  return response;
+}
+
+function upsertCommand(record) {
+  const v = voice();
+  const recent = (v.recent || []).filter((r) => r.id !== record.id);
+  recent.unshift(record);
+  recent.sort((a, b) => b.created - a.created);
+  S.voice = { ...v, recent: recent.slice(0, 20) };
+}
+
 // ---------- routing (settings) ----------
 
 function renderRouting() {
@@ -556,6 +827,10 @@ function renderRouting() {
     routeRow("Brain", "brain", settings.brain, [["auto", "Auto"], ["claude", "Claude Code"], ["codex", "Codex"]]),
     routeRow("Speech engine", "stt_engine", settings.stt_engine, [["parakeet", "Parakeet"], ["whisper", "Whisper"]]),
     inputRow(settings.mic_device),
+    routeRow("Editing model · Claude Code", "editor_model", settings.editor_model,
+      [["default", "Default"], ["opus", "Opus"], ["sonnet", "Sonnet"], ["haiku", "Haiku"]]),
+    routeRow("Cleanup model · Claude Code", "refiner_model", settings.refiner_model,
+      [["haiku", "Haiku"], ["sonnet", "Sonnet"], ["default", "Default"]]),
     h("p", { class: "route-note", id: "route-note", text: brainNote || "" }));
 }
 
@@ -725,6 +1000,17 @@ function connectEvents() {
     renderAll();
     refresh();
   });
+  source.addEventListener("voice.state", (event) => {
+    const data = JSON.parse(event.data);
+    const wasOn = voiceOn();
+    S.voice = { ...voice(), ...data };
+    if (voiceOn() !== wasOn) S.voice.missing = [];
+    renderVoice();
+  });
+  source.addEventListener("voice.command", (event) => {
+    upsertCommand(JSON.parse(event.data));
+    renderVoice();
+  });
   source.addEventListener("component.updated", (event) => {
     // A slow check finished after the page got its snapshot.
     const late = JSON.parse(event.data);
@@ -761,6 +1047,7 @@ function refresh(fresh = false) {
   inFlight = (async () => {
     try {
       S.state = await getJSON(fresh ? "/api/state?fresh=1" : "/api/state");
+      S.voice = S.state.voice || null;
       S.offline = false;
     } catch {
       S.offline = true;
@@ -787,6 +1074,7 @@ function renderAll() {
   preservingFocus(() => {
     renderHeader();
     renderChain();
+    renderVoice();
     renderRack();
     renderRouting();
     renderLog();
@@ -810,10 +1098,15 @@ function start() {
     runAction("workflow", "check");
   });
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && S.armed) {
+    if (event.key === "Escape" && S.talkHeld) {
+      cancelTalk();
+    } else if (event.key === "Escape" && S.armed) {
       disarm();
       renderHeader();
     }
+  });
+  document.addEventListener("keyup", (event) => {
+    if (S.talkHeld && (event.key === " " || event.key === "Enter")) releaseTalk();
   });
 
   renderAll();

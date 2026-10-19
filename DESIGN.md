@@ -136,6 +136,7 @@ The palette is restrained: neutral faceplates, plus color that only means someth
   - off (unlit grey) means Not installed
   - fault (red) means Problem
   - busy (blue, blinking) means a job is running, or a check that hasn't answered yet ("Checking…")
+  - rec (red, steady) means the mic is capturing a command right now ("Listening…")
 
   LEDs are never decoration.
 - **Amber key cap:** reserved for the key that moves the chain forward, such as Install or Check everything. Other keys are plain caps.
@@ -173,13 +174,14 @@ The palette is restrained: neutral faceplates, plus color that only means someth
 
 - **Header strip** (sticky): the name plate, a chain readout ("Workflow ready" or "N stages need attention"), a live-link LED, Refresh, and Check everything.
 - **Signal path:** five stage modules in one row, joined by patch wires. A wire lights when the stage upstream of it is ready.
+- **Voice transport** (full width, under the signal path): the voice readout and transport keys, a typed-command line, and the recent-commands list.
 - **Below that:**
   - The rack, with three shelves: Input, Brain and Blender.
   - A side column, sticky below the header, with the Routing unit (settings) above the Activity tape.
 - **Breakpoints:**
   - From 1180px down, the side column drops below the rack.
   - From 980px down, a unit's columns stack: label and status, then the readout, then the keys.
-  - From 560px down, the margins tighten and the live-link LED hides.
+  - From 560px down, the margins tighten and the live-link LED hides. In the voice transport, Hold to talk takes a full row and the command list stops scrolling on its own.
 
 ## Elevation & Depth
 
@@ -201,6 +203,8 @@ The palette is restrained: neutral faceplates, plus color that only means someth
 - **Plan tag:** keys that spend Claude or Codex usage carry a small red ring and the text "uses your plan".
 - **Busy unit:** the unit's LED blinks blue and its keys are disabled, showing "Working…".
 - **Stage module:** LED, stage name, state word, and the parts it depends on. Clicking it highlights those units in the rack.
+- **Voice transport:** a large readout (LED plus state word: Voice is off, Starting…, Ready, Listening…, Transcribing…, Understanding…, Working in Blender…), then the keys: Start voice (amber, with the plan ring) while off; "Starting…" with a Cancel key while it starts; Hold to talk, Undo last and Stop voice while on. Hold to talk is a key you hold down: pressed, it turns red and reads "Listening… release to send". When voice can't start, a dashed list names each missing piece.
+- **Command row:** LED (busy while working, live when done, fault when it failed, unlit when you stopped it), what was understood, what was heard (mono, quoted, "Typed:" for typed commands), the result line (✓ reply, ✗ error or ■ stopped), and mono timings (heard, understood, edited, total).
 - **Activity entry:** LED, "Unit · Action", and the time. It expands to a readout of the live log, and failures show their error first.
 
 ## Do's and Don'ts

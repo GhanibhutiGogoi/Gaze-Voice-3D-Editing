@@ -98,13 +98,17 @@ class Speech(Component):
             raise JobError("uv isn't installed. Install it from astral.sh/uv, then try again.")
         steps = []
         if not self.python.exists():
-            steps.append(("Creating a Python 3.12 environment…", ["uv", "venv", "--python", VENV_PYTHON, str(self.venv)]))
-        steps.append((f"Installing {engine.package}…", ["uv", "pip", "install", "--python", str(self.python), engine.package]))
+            steps.append(("Creating a Python 3.12 environment…",
+                          ["uv", "venv", "--python", VENV_PYTHON, str(self.venv)], 3600))
+        steps.append((f"Installing {engine.package}…",
+                      ["uv", "pip", "install", "--python", str(self.python), engine.package], 3600))
+        # The worker resumes a stalled download itself and prints progress; on a slow line a few GB takes hours.
         steps.append((f"Downloading {engine.model}…",
-                      [str(self.python), str(WORKER), "--engine", engine.key, "--model", engine.model, "--download-only"]))
-        for message, argv in steps:
+                      [str(self.python), str(WORKER), "--engine", engine.key, "--model", engine.model, "--download-only"],
+                      6 * 3600))
+        for message, argv, timeout in steps:
             job.log(message)
-            code = self.runner.stream(argv, job.log, timeout=3600)
+            code = self.runner.stream(argv, job.log, timeout=timeout)
             if code != 0:
                 raise JobError(f"{message.rstrip('…')} failed (exit {code}). See the log above.")
         return {"installed": True}

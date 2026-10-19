@@ -85,6 +85,17 @@ def _toml(value) -> str:
     return json.dumps(value)
 
 
+def codex_mcp_args(cmd: dict) -> list[str]:
+    """`-c` overrides that give one `codex exec` run the Blender MCP server."""
+    args = [
+        "-c", f"mcp_servers.blender.command={_toml(cmd['command'])}",
+        "-c", f"mcp_servers.blender.args={_toml(cmd['args'])}",
+    ]
+    if cmd.get("env"):
+        args += ["-c", f"mcp_servers.blender.env={_toml(cmd['env'])}"]
+    return args
+
+
 def pick_brain(states: Mapping[str, ComponentState], preference: str) -> str | None:
     """The first ready brain in preference order. A preferred brain that's still being
     checked blocks the fallback, so a slow Claude Code never flips the choice to Codex."""
@@ -235,12 +246,6 @@ class Codex(_Brain):
         return self._ask(job, TEST_PROMPT)
 
     def action_connect_blender(self, job: Job) -> dict:
-        cmd = self.server_cmd()
-        extra = [
-            "-c", f"mcp_servers.blender.command={_toml(cmd['command'])}",
-            "-c", f"mcp_servers.blender.args={_toml(cmd['args'])}",
-        ]
-        if cmd["env"]:
-            extra += ["-c", f"mcp_servers.blender.env={_toml(cmd['env'])}"]
+        extra = codex_mcp_args(self.server_cmd())
         job.log("Asking Codex to count the scene's objects through the Blender tools (experimental)…")
         return self._ask(job, CONNECT_PROMPT, extra, timeout=240)

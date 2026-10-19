@@ -6,13 +6,12 @@ import zipfile
 from pathlib import Path
 from typing import Sequence
 
-from ..blender_socket import BRIDGE_PORT, bridge_request, port_open
+from ..blender_socket import BRIDGE_PORT, BRIDGE_VERSION, bridge_request, port_open
 from ..jobs import Job, JobError
 from .base import ActionSpec, Component, ComponentState, Health
 from .blender import MIN_BLENDER, blender_version, extensions_dir, find_blender, install_extension, is_running
 
 BRIDGE_ID = "gazevoice_bridge"
-BRIDGE_VERSION = "0.1.0"
 BRIDGE_SRC = Path(__file__).resolve().parents[2] / "blender_addon" / BRIDGE_ID
 
 
@@ -38,6 +37,7 @@ class Bridge(Component):
         self.candidates: Sequence[Path] | None = None
         self.home: Path | None = None
         self.port = BRIDGE_PORT
+        self.expected_version = BRIDGE_VERSION
 
     def _blender(self):
         binary = find_blender(self.runner, self.candidates, self.ctx.probes)
@@ -69,9 +69,19 @@ class Bridge(Component):
             ping = {}
         if not ping.get("ok"):
             return self.state(Health.ERROR, f"Something else is using port {self.port}.", details)
+        running_version = ping.get("bridge") or "unknown"
+        details.append(("Add-on", running_version))
+        if running_version != self.expected_version:
+            return self.state(
+                Health.INSTALLED,
+                f"Update needed ({running_version} → {self.expected_version}). Install the update, then restart Blender.",
+                details,
+                [ActionSpec("install", "Update add-on")],
+            )
         return self.state(
             Health.READY,
-            f"Connected to Blender {ping.get('blender', '')}".strip(),
+            f"Connected to Blender {ping.get('blender', '')}. Turn voice on, then hold {ping.get('key') or '⌥ Space'} "
+            "in Blender to talk.",
             details,
             [ActionSpec("test", "Test")],
         )
@@ -89,11 +99,13 @@ class Bridge(Component):
     def action_test(self, job: Job) -> dict:
         try:
             job.log("Showing “GazeVoice connected” in the Blender viewport…")
-            bridge_request({"cmd": "status", "text": "GazeVoice connected"}, port=self.port)
+            bridge_request({"cmd": "status", "text": "GazeVoice connected", "state": "done"}, port=self.port)
             selection = bridge_request({"cmd": "selection"}, port=self.port)
+            names = bridge_request({"cmd": "scene_names"}, port=self.port).get("names") or []
             ping = bridge_request({"cmd": "ping"}, port=self.port)
         except (OSError, ValueError) as exc:
             raise JobError(f"The bridge didn't answer: {exc}") from exc
         selected = selection.get("selected") or []
         job.log(f"Selected: {', '.join(selected) if selected else 'nothing'} (mode {selection.get('mode')})")
-        return {"selection": selection, "blender": ping.get("blender")}
+        job.log(f"The scene has {len(names)} objects.")
+        return {"selection": selection, "objects": len(names), "blender": ping.get("blender")}

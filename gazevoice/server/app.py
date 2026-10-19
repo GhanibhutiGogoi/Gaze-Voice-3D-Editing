@@ -24,12 +24,21 @@ from .. import __version__
 from ..components.base import Component, ComponentState, Context, Health
 from ..components.brains import brain_pending, pick_brain
 from ..events import EventBus
-from ..jobs import Job, JobAlreadyRunning, JobManager
+from ..jobs import Job, JobAlreadyRunning, JobError, JobManager
 from ..probes import ProbeTimedOut
 from ..settings import save_settings, update_settings
+from ..voice.service import VoiceError
+from ..voice.wiring import build_voice, voice_readiness
 from ..workflow import WorkflowCheck, workflow_stages
 
 WORKFLOW_ID = WorkflowCheck.id
+PTT_STATES = ("down", "up", "cancel")
+
+
+class VoiceNotReady(Exception):
+    def __init__(self, missing: list[str]):
+        super().__init__("Voice can't start yet")
+        self.missing = missing
 
 STATIC_DIR = Path(__file__).parent / "static"
 STATIC_TYPES = {
@@ -56,6 +65,7 @@ class ControlCenter:
         bus: EventBus | None = None,
         check_timeout: float = 8.0,
         sse_ping: float = 15.0,
+        voice_factory=None,
     ):
         self.ctx = ctx
         self.components = {c.id: c for c in components}
@@ -67,6 +77,9 @@ class ControlCenter:
         self._pool = ThreadPoolExecutor(max_workers=16, thread_name_prefix="check")
         self._last: dict[str, ComponentState] = {}
         self._start_lock = threading.Lock()
+        self._voice_factory = voice_factory or (lambda brain: build_voice(self.ctx, self.bus, brain))
+        self.voice = None
+        self._voice_config: tuple | None = None
 
     def _safe_check(self, component: Component) -> ComponentState:
         try:
@@ -117,7 +130,75 @@ class ControlCenter:
             "workflow": workflow_stages(states, brain),
             "running": self.jobs.running(),
             "settings": self.ctx.settings.to_dict(),
+            "voice": self.voice_snapshot(states, brain),
         }
+
+    # --- voice ---------------------------------------------------------------------------
+    def _voice_config_now(self, brain: str | None) -> tuple:
+        s = self.ctx.settings
+        return (brain, s.stt_engine, s.mic_device, s.editor_model, s.refiner_model)
+
+    def voice_snapshot(self, states: dict[str, ComponentState] | None = None, brain: str | None = None) -> dict:
+        voice = self.voice
+        snap = voice.snapshot() if voice is not None else {"state": "off", "reason": "", "recent": []}
+        on = snap.get("state") not in ("off", "error")
+        if states is not None:
+            snap["missing"] = [] if on else voice_readiness(states, brain)
+            snap["needs_restart"] = on and self._voice_config != self._voice_config_now(brain)
+        return snap
+
+    def voice_start(self) -> Job:
+        states = self.check_all()
+        brain = self.brain(states)
+        missing = voice_readiness(states, brain)
+        if missing:
+            raise VoiceNotReady(missing)
+        config = self._voice_config_now(brain)
+
+        def work(job: Job) -> dict:
+            with self._start_lock:
+                if self.voice is not None and self.voice.state not in ("off", "error"):
+                    raise JobError("Voice is already on.")
+                if self.voice is None or self._voice_config != config:
+                    if self.voice is not None:
+                        self.voice.stop()
+                    job.log("Getting the microphone, speech engine and brain ready…")
+                    try:
+                        self.voice = self._voice_factory(brain)
+                    except VoiceError as exc:
+                        raise JobError(str(exc)) from exc
+                    self._voice_config = config
+                voice = self.voice
+            job.log("Starting voice: opening the mic, loading speech-to-text, warming up the brain…")
+            try:
+                voice.start()
+            except VoiceError as exc:
+                raise JobError(str(exc)) from exc
+            job.log(f"Voice is on. In Blender, hold {voice.key}, speak, and let go.")
+            return {"voice": "on"}
+
+        with self._start_lock:
+            # Like a unit's job, voice waits for "Check everything": both record from the mic and use the plan.
+            running = self.jobs.running()
+            if WORKFLOW_ID in running:
+                raise JobAlreadyRunning(WORKFLOW_ID, running[WORKFLOW_ID])
+            return self.jobs.start("voice", "start", work)
+
+    def voice_stop(self) -> dict:
+        if self.voice is not None:
+            self.voice.stop()
+        return self.voice_snapshot()
+
+    def voice_call(self, method: str, *args):
+        if self.voice is None:
+            raise VoiceError("Turn voice on first.")
+        return getattr(self.voice, method)(*args)
+
+    def shutdown(self) -> None:
+        """Stop everything this process started (ffmpeg, the speech worker, brain sessions)."""
+        if self.voice is not None:
+            self.voice.stop()
+        self._pool.shutdown(wait=False, cancel_futures=True)
 
     def run_action(self, component_id: str, action: str) -> Job:
         component = self.components.get(component_id)
@@ -279,15 +360,58 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(200, job.to_dict()) if job else self._error(404, "No such job")
         if path == "/api/events":
             return self._events()
+        if path == "/api/voice":
+            return self._json(200, self.center.voice_snapshot())
+        return self._error(404, "Not found")
+
+    def _voice_post(self, path: str, body: dict) -> None:
+        center = self.center
+        try:
+            if path == "/api/voice/start":
+                try:
+                    job = center.voice_start()
+                except VoiceNotReady as exc:
+                    return self._error(409, "Voice can't start yet", missing=exc.missing)
+                return self._json(202, {"job": job.to_dict()})
+            if path == "/api/voice/stop":
+                return self._json(200, center.voice_stop())
+            if path == "/api/voice/say":
+                text = body.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    return self._error(400, "Send {\"text\": \"…\"}")
+                return self._json(202, {"record": center.voice_call("say", text)})
+            if path == "/api/voice/ptt":
+                state = body.get("state")
+                if state not in PTT_STATES:
+                    return self._error(400, f"state must be one of {', '.join(PTT_STATES)}")
+                center.voice_call("ptt", state)
+                return self._json(202, {"ok": True})
+            if path == "/api/voice/undo":
+                center.voice_call("undo")
+                return self._json(202, {"ok": True})
+            if path == "/api/voice/reset":
+                center.voice_call("reset_conversation")
+                return self._json(202, {"ok": True})
+        except VoiceError as exc:
+            return self._error(409, str(exc))
+        except JobAlreadyRunning as exc:
+            return self._error(409, "Already running", job_id=exc.job_id)
         return self._error(404, "Not found")
 
     def do_POST(self) -> None:  # noqa: N802
         if not self._host_ok() or not self._write_ok():
             self.close_connection = True
             return self._error(403, "Forbidden")
-        if self._read_body() is None:  # drain any body so the connection stays usable
+        raw = self._read_body()
+        if raw is None:  # answered already (bad or oversized body)
             return None
-        match = _ACTION_PATH.fullmatch(urlsplit(self.path).path)
+        path = urlsplit(self.path).path
+        if path.startswith("/api/voice/"):
+            body = self._parse_json(raw)
+            if body is None:
+                return self._error(400, "Send a JSON object")
+            return self._voice_post(path, body)
+        match = _ACTION_PATH.fullmatch(path)
         if not match:
             return self._error(404, "Not found")
         try:

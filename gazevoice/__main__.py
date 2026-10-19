@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
 import threading
 import webbrowser
@@ -40,11 +41,19 @@ def main(argv: list[str] | None = None) -> int:
     print(f"GazeVoice control center → {url}   (Ctrl+C to stop)", flush=True)
     if not args.no_browser:
         threading.Timer(0.4, webbrowser.open, args=(url,)).start()
+
+    def _terminate(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _terminate)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nStopping…")
+        print("\nStopping…", flush=True)
     finally:
+        # The mic, speech worker and brain sessions run in their own process groups,
+        # so Ctrl+C in this terminal doesn't reach them; stop them explicitly.
+        center.shutdown()
         server.server_close()
     return 0
 

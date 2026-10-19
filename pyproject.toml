@@ -17,4 +17,4 @@ build-backend = "setuptools.build_meta"
 include = ["gazevoice*"]
 
 [tool.setuptools.package-data]
-gazevoice = ["server/static/*"]
+gazevoice = ["server/static/*", "voice/prompts/*.md"]

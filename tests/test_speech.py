@@ -1,7 +1,10 @@
 import contextlib
 import io
 import json
+import os
+import tempfile
 import unittest
+from pathlib import Path
 
 from gazevoice import speech_worker
 from gazevoice.components.base import Health
@@ -100,6 +103,8 @@ class SpeechTest(unittest.TestCase):
         for argv in steps:
             self.t.runner.add(argv, stdout="ok\n")
         self.speech.run_action("install", make_job("speech", "install"))
+        timeouts = {call: kw["timeout"] for call, kw in zip(self.t.runner.calls, self.t.runner.call_kwargs)}
+        self.assertGreaterEqual(timeouts[tuple(steps[2])], 4 * 3600)  # a slow but moving download isn't cut off
         streamed = [c for c in self.t.runner.calls if c in {tuple(s) for s in steps}]
         self.assertEqual(streamed, [tuple(s) for s in steps])
 
@@ -140,6 +145,55 @@ class WorkerArgsTest(unittest.TestCase):
     def test_audio_required_otherwise(self):
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             speech_worker.parse_args(["--engine", "whisper", "--model", "m"])
+
+
+
+class WorkerDownloadTest(unittest.TestCase):
+    """The model download, as Install runs it: plain HTTPS, resumed after a stall, with progress lines."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.folder = Path(self.tmp.name) / "models--org--m"
+        (self.folder / "blobs").mkdir(parents=True)
+        self.env = {k: os.environ.get(k) for k in ("HF_HUB_DISABLE_XET", "HF_HUB_DISABLE_PROGRESS_BARS",
+                                                   "HF_HUB_DOWNLOAD_TIMEOUT", "HF_HUB_VERBOSITY")}
+
+    def tearDown(self):
+        for key, value in self.env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.tmp.cleanup()
+
+    def test_a_broken_download_is_resumed_and_reports_progress(self):
+        calls = []
+
+        def fetch(model):
+            calls.append(model)
+            (self.folder / "blobs" / f"part{len(calls)}").write_bytes(b"x" * 1_000_000)
+            if len(calls) < 3:
+                raise ConnectionError("read timed out")
+            return "/cache/snapshot"
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            path = speech_worker.download("org/m", fetch=fetch, folder=self.folder, total=3_000_000, pause=0)
+        self.assertEqual((path, len(calls)), ("/cache/snapshot", 3))
+        lines = out.getvalue().splitlines()
+        self.assertEqual(lines[0], "Downloading org/m (3 MB)…")
+        self.assertTrue(any(line.startswith("The download was interrupted") for line in lines))
+        self.assertEqual(lines[-1], "Downloaded 3 MB of 3 MB")
+        self.assertEqual(os.environ["HF_HUB_DISABLE_XET"], "1")  # Xet transfers have hung with no timeout
+        # The Hub's "set a token for higher rate limits" notice would read like GazeVoice asking for a key.
+        self.assertEqual(os.environ["HF_HUB_VERBOSITY"], "error")
+
+    def test_it_gives_up_after_the_last_attempt(self):
+        def fetch(model):
+            raise ConnectionError("no network")
+
+        with self.assertRaises(ConnectionError), contextlib.redirect_stdout(io.StringIO()):
+            speech_worker.download("org/m", fetch=fetch, folder=self.folder, total=None, attempts=2, pause=0)
 
 
 if __name__ == "__main__":

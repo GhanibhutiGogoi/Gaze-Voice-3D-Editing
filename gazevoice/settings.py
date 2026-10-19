@@ -11,6 +11,8 @@ from typing import Any, Mapping
 
 BRAINS = ("auto", "claude", "codex")
 STT_ENGINES = ("parakeet", "whisper")
+EDITOR_MODELS = ("default", "opus", "sonnet", "haiku")  # Claude Code aliases; "default" = its own default
+REFINER_MODELS = ("haiku", "sonnet", "default")
 
 
 @dataclass(frozen=True)
@@ -18,6 +20,8 @@ class Settings:
     brain: str = "auto"
     stt_engine: str = "parakeet"
     mic_device: str = ""  # "" = auto (prefer the built-in mic); otherwise an AVFoundation index
+    editor_model: str = "default"
+    refiner_model: str = "haiku"  # the cleanup step should be quick
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -30,6 +34,10 @@ def _check(key: str, value: Any) -> None:
         raise ValueError(f"stt_engine must be one of {', '.join(STT_ENGINES)}")
     if key == "mic_device" and not (isinstance(value, str) and (value == "" or value.isdigit())):
         raise ValueError('mic_device must be "" (auto) or a device number such as "2"')
+    if key == "editor_model" and value not in EDITOR_MODELS:
+        raise ValueError(f"editor_model must be one of {', '.join(EDITOR_MODELS)}")
+    if key == "refiner_model" and value not in REFINER_MODELS:
+        raise ValueError(f"refiner_model must be one of {', '.join(REFINER_MODELS)}")
 
 
 def update_settings(settings: Settings, changes: Mapping[str, Any]) -> Settings:
