@@ -485,6 +485,27 @@ main {
 }
 .select:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 .route-pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; }
+.route-note[data-tone="bad"] { color: var(--fault-ink); }
+
+/* ---------- API provider key form (inside a unit's readout) ---------- */
+.provider-form { display: grid; gap: 8px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--seam); }
+.provider-field { display: grid; gap: 4px; }
+.provider-field > span { font: var(--fs-legend)/1.2 var(--font-ui); letter-spacing: 0.06em; text-transform: uppercase; color: var(--readout-key); }
+.provider-input {
+  width: 100%;
+  min-width: 0;
+  min-height: 34px;
+  padding: 6px 10px;
+  border: 1px solid var(--seam);
+  border-radius: var(--r-key);
+  background: var(--readout);
+  color: var(--readout-ink);
+  font: var(--fs-small) var(--font-mono);
+}
+.provider-input::placeholder { color: var(--readout-key); }
+.provider-input:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.provider-keys { display: flex; flex-wrap: wrap; gap: 8px; }
+.provider-note { font-size: var(--fs-small); color: var(--readout-key); }
 .route-note { color: var(--ink-2); font-size: var(--fs-small); }
 .route-note[data-tone="bad"] { color: var(--fault-ink); }
 

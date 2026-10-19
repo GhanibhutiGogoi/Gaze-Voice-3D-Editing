@@ -18,7 +18,7 @@ const NAMES = {
 
 const GROUPS = [
   { label: "Input", hint: "Hears you and writes down what you said", ids: ["microphone", "speech"] },
-  { label: "Brain", hint: "Cleans up what you said, then edits the scene", ids: ["claude", "codex"] },
+  { label: "Brain", hint: "Cleans up what you said, then edits the scene", ids: ["claude", "codex"], providers: true },
   { label: "Blender", hint: "Where the edits land", ids: ["blender", "mcp_addon", "mcp_server", "bridge"] },
 ];
 
@@ -38,6 +38,21 @@ const STEP_STAGES = {
   codex: ["refine", "edit"],
   mcp_server: ["edit"],
   bridge: ["blender"],
+};
+
+// A brain or provider proves the stages of the steps that use it.
+function stepStages(cid) {
+  const comp = component(cid);
+  const sources = S.state && S.state.sources;
+  if (sources && (cid === "claude" || cid === "codex" || (comp && comp.provider))) {
+    return [sources.refiner === cid && "refine", sources.editor === cid && "edit"].filter(Boolean);
+  }
+  return STEP_STAGES[cid] || [];
+}
+
+const STEP_WORDS = { refiner: "Cleanup", editor: "Editing" };
+const THINKING_WORDS = {
+  default: "Default thinking", off: "No thinking", on: "Thinking on", low: "Low thinking", high: "High thinking", max: "Max thinking",
 };
 
 const ARM_MS = 8000;
@@ -64,6 +79,9 @@ const S = {
   typed: "", // the unsent "type a command" draft survives re-renders
   talkHeld: false,
   talkListeners: null, // ends the listeners a dashboard hold-to-talk added
+  forms: new Map(), // provider id -> unsaved key-form fields (the key is never sent back by the server)
+  editing: new Set(), // provider ids whose saved key is being changed
+  models: new Map(), // provider id -> {models, error} from GET /api/providers/<id>/models
 };
 
 const VOICE_WORDS = {
@@ -421,7 +439,8 @@ function renderRack() {
   }
   const placed = new Set();
   for (const group of GROUPS) {
-    const units = group.ids.map(component).filter(Boolean);
+    const ids = group.providers ? [...group.ids, ...components().filter((c) => c.provider).map((c) => c.id)] : group.ids;
+    const units = ids.map(component).filter(Boolean);
     if (!units.length) continue;
     units.forEach((c) => placed.add(c.id));
     rack.append(shelf(group.label, group.hint, units));
@@ -444,6 +463,7 @@ function unit(comp) {
   const flash = S.flash.get(comp.id);
 
   const specs = comp.details.filter(([k]) => !HIDDEN_DETAILS.has(k));
+  const form = comp.provider && S.editing.has(comp.id) && !armed ? providerForm(comp) : null;
   const readout = h("div", { class: "readout" },
     armed
       ? h("p", { class: "confirm-text", text: confirmText(comp, armed.aid) })
@@ -451,7 +471,8 @@ function unit(comp) {
     specs.length
       ? h("dl", { class: "specs" }, specs.map(([k, v]) => h("div", {}, h("dt", { text: k }), h("dd", { text: v, title: v }))))
       : null,
-    flash ? h("p", { class: "last", "data-tone": flash.tone, text: flash.text }) : lastLine(comp.id));
+    flash ? h("p", { class: "last", "data-tone": flash.tone, text: flash.text }) : lastLine(comp.id),
+    form);
 
   return h("article", {
     class: "unit",
@@ -477,6 +498,9 @@ function runningLabel(cid) {
 }
 
 function confirmText(comp, aid) {
+  if (aid === "remove") {
+    return `Remove ${comp.name} and delete its key from your Keychain? Steps that use it go back to Auto.`;
+  }
   const spec = comp.actions.find((a) => a.id === aid);
   return spec && spec.confirm ? spec.confirm : `Run “${aid}”?`;
 }
@@ -501,7 +525,7 @@ function keys(comp, busy, armed) {
         type: "button",
         "data-armed": "",
         "data-focus-key": `${comp.id}-confirm`,
-        onclick: () => runAction(comp.id, armed.aid),
+        onclick: () => (armed.aid === "remove" ? removeProvider(comp.id) : runAction(comp.id, armed.aid)),
       }, `Confirm ${actionLabel(comp.id, armed.aid).toLowerCase()}`),
       h("button", {
         class: "key key-quiet",
@@ -526,10 +550,128 @@ function keys(comp, busy, armed) {
     }, running && running.action === action.id ? "Working…" : action.label,
       action.uses_plan ? h("span", { class: "plan-ring", "aria-hidden": "true" }) : null));
   }
+  if (comp.provider && !comp.provider.has_key && !S.editing.has(comp.id)) {
+    wrap.append(h("button", { class: "key key-primary", type: "button", "data-focus-key": `${comp.id}-add`,
+      onclick: () => openProviderForm(comp.id) }, comp.provider.new ? "Add provider" : "Add API key"));
+  }
+  if (comp.provider && comp.provider.has_key && !S.editing.has(comp.id)) {
+    wrap.append(
+      h("button", { class: "key", type: "button", disabled: busy || null, "data-focus-key": `${comp.id}-change`,
+        onclick: () => openProviderForm(comp.id) }, "Change key"),
+      h("button", { class: "key key-quiet", type: "button", disabled: busy || null, "data-focus-key": `${comp.id}-remove`,
+        onclick: () => pressKey(comp, { id: "remove", confirm: "remove" }) }, "Remove"));
+  }
   if (usesPlan) {
-    wrap.append(h("span", { class: "plan-note", id: `${comp.id}-plan`, text: "uses your plan" }));
+    wrap.append(h("span", { class: "plan-note", id: `${comp.id}-plan`,
+      text: comp.provider ? "uses your API credit" : "uses your plan" }));
   }
   return wrap;
+}
+
+function openProviderForm(cid) {
+  S.editing.add(cid);
+  renderRack();
+  const first = document.querySelector(`.unit[data-cid="${CSS.escape(cid)}"] .provider-form input, .unit[data-cid="${CSS.escape(cid)}"] .provider-form select`);
+  if (first) first.focus();
+}
+
+function providerField(comp, name, label, attrs = {}) {
+  const draft = S.forms.get(comp.id) || {};
+  const value = draft[name] !== undefined ? draft[name] : (name === "key" ? "" : comp.provider[name] || "");
+  return h("label", { class: "provider-field" },
+    h("span", { text: label }),
+    h("input", {
+      class: "provider-input",
+      value,
+      autocomplete: "off",
+      spellcheck: "false",
+      "data-focus-key": `${comp.id}-${name}`,
+      oninput: (e) => S.forms.set(comp.id, { ...(S.forms.get(comp.id) || {}), [name]: e.target.value }),
+      ...attrs,
+    }));
+}
+
+function providerForm(comp) {
+  const p = comp.provider;
+  const draft = S.forms.get(comp.id) || {};
+  const fields = [];
+  if (p.new) {
+    fields.push(providerField(comp, "name", "Name", { placeholder: "e.g. My server" }),
+      providerField(comp, "base_url", "Address", { placeholder: "https://…/v1", type: "url" }));
+  }
+  if (p.kind === "qwen") {
+    const region = draft.region || p.region;
+    fields.push(h("label", { class: "provider-field" }, h("span", { text: "Region" }),
+      h("select", {
+        class: "select",
+        "data-focus-key": `${comp.id}-region`,
+        onchange: (e) => S.forms.set(comp.id, { ...(S.forms.get(comp.id) || {}), region: e.target.value }),
+      }, (p.regions || []).map(([value, label]) => h("option", { value, selected: value === region || null, text: label })))),
+    providerField(comp, "workspace", "Workspace ID (optional)", { placeholder: "From Model Studio › Workspace Details" }));
+  }
+  fields.push(providerField(comp, "key", p.has_key ? "New API key" : "API key", { type: "password", placeholder: "Paste your key" }));
+  return h("form", {
+    class: "provider-form",
+    onsubmit: (e) => {
+      e.preventDefault();
+      saveProvider(comp);
+    },
+  }, ...fields,
+  h("div", { class: "provider-keys" },
+    h("button", { class: "key key-primary", type: "submit", "data-focus-key": `${comp.id}-save` }, "Save"),
+    h("button", { class: "key", type: "button", "data-focus-key": `${comp.id}-cancel-edit`,
+      onclick: () => { S.editing.delete(comp.id); S.forms.delete(comp.id); preservingFocus(renderRack); } }, "Cancel")),
+  h("p", { class: "provider-note", text: "The key goes to your Mac's Keychain and is never shown again." }));
+}
+
+async function saveProvider(comp) {
+  const draft = S.forms.get(comp.id) || {};
+  const body = { kind: comp.provider.kind };
+  for (const name of ["name", "base_url", "region", "workspace", "key"]) {
+    if (draft[name] !== undefined) body[name] = draft[name];
+  }
+  let response;
+  try {
+    response = await send("POST", `/api/providers/${encodeURIComponent(comp.id)}`, body);
+  } catch {
+    setFlash(comp.id, "Couldn't reach the control center.", "bad");
+    preservingFocus(renderRack);
+    return;
+  }
+  if (!response.ok) {
+    setFlash(comp.id, (response.data && response.data.error) || `Didn't save (HTTP ${response.status}).`, "bad");
+    preservingFocus(renderRack);
+    return;
+  }
+  S.forms.delete(comp.id);
+  S.editing.delete(comp.id);
+  const saved = response.data.provider || {};
+  S.models.delete(saved.id || comp.id);
+  if (S.state) S.state.settings = response.data.settings;
+  setFlash(saved.id || comp.id, "Key saved. Pick it for Editing or Cleanup in Routing.", "ok");
+  await refresh();
+}
+
+async function removeProvider(cid) {
+  S.armed = null;
+  let response;
+  try {
+    response = await send("POST", `/api/providers/${encodeURIComponent(cid)}/remove`, {});
+  } catch {
+    setFlash(cid, "Couldn't reach the control center.", "bad");
+    preservingFocus(renderRack);
+    return;
+  }
+  if (!response.ok) {
+    setFlash(cid, (response.data && response.data.error) || `Didn't remove (HTTP ${response.status}).`, "bad");
+  } else {
+    S.models.delete(cid);
+    const moved = response.data.moved_to_auto || [];
+    if (moved.length) {
+      setFlash(cid, `Removed. ${moved.map((s) => STEP_WORDS[s]).join(" and ")} went back to Auto.`, "ok");
+    }
+  }
+  await refresh();
 }
 
 function pressKey(comp, action) {
@@ -678,12 +820,7 @@ function renderVoice() {
             title: "Forget earlier commands, so “it” starts fresh",
             onclick: () => voicePost("reset"),
           }, "New conversation"))));
-      box.append(h("p", {
-        class: "voice-note",
-        text: v.brain === "codex"
-          ? "The mic is open while voice is on. Audio stays in memory; the commands you speak are saved in the app's logs folder, and Codex keeps its own history of them."
-          : "The mic is open while voice is on. Audio stays in memory; only the commands you speak are saved, in the app's logs folder.",
-      }));
+      box.append(h("p", { class: "voice-note", text: privacyNote(v) }));
     }
 
     const recent = v.recent || [];
@@ -696,6 +833,15 @@ function renderVoice() {
           : "Commands you speak show up here: what was heard, what was understood, and what changed.",
       }));
   });
+}
+
+function privacyNote(v) {
+  const sources = (S.state && S.state.sources) || {};
+  const providers = [...new Set(Object.values(sources))].map(component).filter((c) => c && c.provider).map((c) => c.name);
+  let note = "The mic is open while voice is on. Audio stays in memory; only the commands you speak are saved, in the app's logs folder.";
+  if (Object.values(sources).includes("codex") || v.brain === "codex") note += " Codex keeps its own history of them.";
+  if (providers.length) note += ` Your commands and scene details go to ${providers.join(" and ")}.`;
+  return note;
 }
 
 function commandRow(r) {
@@ -846,46 +992,99 @@ function renderRouting() {
     box.append(h("p", { class: "route-note", text: "Loading settings…" }));
     return;
   }
-  const brainNote = {
-    auto: "Auto uses Claude Code when it's logged in, otherwise Codex.",
-    claude: "Always use Claude Code.",
-    codex: "Always use Codex.",
-  }[settings.brain];
-
   box.append(
-    routeRow("Brain", "brain", settings.brain, [["auto", "Auto"], ["claude", "Claude Code"], ["codex", "Codex"]]),
     routeRow("Speech engine", "stt_engine", settings.stt_engine, [["parakeet", "Parakeet"], ["whisper", "Whisper"]]),
     inputRow(settings.mic_device),
-    ...brainRows(settings),
-    h("p", { class: "route-note", id: "route-note", text: brainNote || "" }));
+    stepRow("editor", settings),
+    stepRow("refiner", settings),
+    h("p", { class: "route-note", text: "Auto uses Claude Code when it's logged in, otherwise Codex. More thinking can make big builds better, but each command takes longer." }),
+    h("p", { class: "route-note", id: "route-note" }));
 }
 
-function brainRows(settings) {
-  if (S.state && S.state.brain === "codex") {
-    return [h("div", { class: "route-row" },
-      h("span", { class: "route-label", text: "Editing and cleanup · Codex" }),
-      h("p", { class: "route-note", text: "Codex uses the model and reasoning level set in its own config." }))];
-  }
-  return [
-    modelRow("Editing", "editor_model", "editor_effort", settings),
-    modelRow("Cleanup", "refiner_model", "refiner_effort", settings),
-    h("p", { class: "route-note", text: "More thinking can make big builds better, but each command takes longer." }),
-  ];
-}
-
-function modelRow(role, modelKey, effortKey, settings) {
-  const id = `route-${modelKey}`;
-  const menu = (key, options, what) => h("select", {
+function menu(key, options, label, value, onchange) {
+  return h("select", {
     class: "select",
-    "aria-label": `${role} ${what}`,
+    "aria-label": label,
     "data-focus-key": `route-${key}`,
-    onchange: (e) => saveSetting(key, e.target.value),
-  }, options.map(([value, label]) => h("option", { value, selected: value === settings[key] || null, text: label })));
+    onchange: onchange || ((e) => saveSetting(key, e.target.value)),
+  }, options.map(([optionValue, optionLabel]) => h("option", {
+    value: optionValue, selected: optionValue === value || null, text: optionLabel,
+  })));
+}
+
+function stepRow(step, settings) {
+  const role = STEP_WORDS[step];
+  const id = `route-${step}`;
+  const source = settings[`${step}_source`];
+  const saved = new Set((settings.providers || []).map((p) => p.id));
+  const providers = components().filter((c) => c.provider && saved.has(c.id));
+  const sources = [["auto", "Auto"], ["claude", "Claude Code"], ["codex", "Codex"],
+    ...providers.map((c) => [c.id, c.provider.has_key ? c.name : `${c.name} · add a key in the rack`])];
+  const resolved = S.state && S.state.sources ? S.state.sources[step] : null;
+  const provider = providers.find((c) => c.id === source);
+  let menus;
+  if (provider) {
+    menus = providerMenus(step, provider, settings);
+  } else if (resolved === "codex") {
+    menus = [h("p", { class: "route-note", text: "Codex uses the model and reasoning level set in its own config." })];
+  } else {
+    menus = [h("div", { class: "route-pair" },
+      menu(`${step}_model`, CLAUDE_MODELS, `${role} model`, settings[`${step}_model`]),
+      menu(`${step}_effort`, EFFORTS, `${role} thinking`, settings[`${step}_effort`]))];
+  }
+  if (!providers.length && step === "editor") {
+    menus.push(h("p", { class: "route-note", text: "Add a DeepSeek, Qwen or custom API key in the rack to pick it here." }));
+  }
   return h("div", { class: "route-row" },
-    h("span", { class: "route-label", id, text: `${role} · Claude Code` }),
-    h("div", { class: "route-pair", role: "group", "aria-labelledby": id },
-      menu(modelKey, CLAUDE_MODELS, "model"),
-      menu(effortKey, EFFORTS, "thinking")));
+    h("span", { class: "route-label", id, text: role }),
+    menu(`${step}_source`, sources, `${role} source`, source),
+    ...menus);
+}
+
+function providerMenus(step, provider, settings) {
+  const role = STEP_WORDS[step];
+  const modelKey = `${step}_api_model`;
+  const current = settings[modelKey];
+  if (!S.models.has(provider.id) && provider.provider.has_key) loadModels(provider.id);
+  const listed = S.models.get(provider.id); // null while loading
+  const models = listed ? listed.models : [];
+  let modelPicker;
+  if (models.length) {
+    const options = [["", "Pick a model…"], ...models.map((m) => [m, m])];
+    if (current && !models.includes(current)) options.push([current, current]);
+    modelPicker = menu(modelKey, options, `${role} model`, current);
+  } else {
+    modelPicker = h("input", {
+      class: "provider-input",
+      value: current,
+      placeholder: listed ? "Model name" : "Loading models…",
+      "aria-label": `${role} model name`,
+      "data-focus-key": `route-${modelKey}`,
+      onchange: (e) => saveSetting(modelKey, e.target.value.trim()),
+    });
+  }
+  const thinking = provider.provider.thinking || ["default"];
+  const pieces = [h("div", { class: thinking.length > 1 ? "route-pair" : "" },
+    modelPicker,
+    thinking.length > 1
+      ? menu(`${step}_api_thinking`, thinking.map((t) => [t, THINKING_WORDS[t] || t]), `${role} thinking`, settings[`${step}_api_thinking`])
+      : null)];
+  if (listed && listed.error) pieces.push(h("p", { class: "route-note", "data-tone": "bad", text: listed.error }));
+  return pieces;
+}
+
+async function loadModels(pid) {
+  S.models.set(pid, null);
+  let response;
+  try {
+    response = await send("GET", `/api/providers/${encodeURIComponent(pid)}/models`);
+  } catch {
+    S.models.set(pid, { models: [], error: "Couldn't reach the control center." });
+    preservingFocus(renderRouting);
+    return;
+  }
+  S.models.set(pid, response.ok ? response.data : { models: [], error: `HTTP ${response.status}` });
+  preservingFocus(renderRouting);
 }
 
 function routeRow(label, key, value, options) {
@@ -999,7 +1198,7 @@ function trackWorkflow(job, line) {
   const match = /^([▶✓✗])\s+([a-z_]+)\.([a-z_]+)/.exec(line);
   if (!match) return;
   const status = { "▶": "testing", "✓": "passed", "✗": "failed" }[match[1]];
-  for (const stage of STEP_STAGES[match[2]] || []) S.stageTests.set(stage, status);
+  for (const stage of stepStages(match[2])) S.stageTests.set(stage, status);
   S.workflowStep = status === "testing" ? match[2] : null;
   preservingFocus(() => {
     renderChain();
