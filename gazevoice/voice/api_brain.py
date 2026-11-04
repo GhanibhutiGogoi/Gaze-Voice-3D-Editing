@@ -1,8 +1,7 @@
-"""A brain on an API provider (DeepSeek, Qwen, custom), behaving like a Claude Code session.
+"""An API brain (DeepSeek, Qwen, custom) with a local MCP tool loop.
 
-Claude Code and Codex bring their own agent loop. A plain chat API doesn't, so for
-editing GazeVoice runs it: send the command with the Blender MCP tools, run the
-tools the model asks for, send the results back, and repeat until it answers.
+Claude Code and Codex bring their own agent loop. For a plain chat API, GazeVoice
+lists the selected host's MCP tools, runs requested tools and returns their results.
 Cleanup is a plain chat.
 """
 
@@ -27,7 +26,7 @@ class _Interrupted(Exception):
 
 
 def mcp_tools(tools: list[dict]) -> list[dict]:
-    """Blender MCP tools as OpenAI-style function tools."""
+    """MCP tools as OpenAI-style function tools."""
     return [
         {"type": "function", "function": {
             "name": t["name"],
@@ -72,9 +71,12 @@ class _McpHandle:
         self._client.__exit__(None, None, None)
 
 
-def blender_mcp(server_cmd: dict, timeout: float = 180.0) -> Callable[[], Any]:
-    """A factory for ApiSession's mcp_factory: the official Blender MCP server, started on demand."""
+def host_mcp(server_cmd: dict, timeout: float = 180.0) -> Callable[[], Any]:
+    """A factory for ApiSession's MCP server process, started on demand."""
     return lambda: _McpHandle(server_cmd, timeout)
+
+
+blender_mcp = host_mcp
 
 
 class ApiSession:
@@ -89,6 +91,7 @@ class ApiSession:
         max_steps: int = 12,
         keep_commands: int = 8,
         provider: str = "",
+        host: str = "Blender",
     ):
         self.client = client
         self.model = model
@@ -98,6 +101,7 @@ class ApiSession:
         self.mcp_factory = mcp_factory
         self.max_steps = max_steps
         self.keep_commands = keep_commands
+        self.host = host
         self.init = {"model": model, **({"provider": provider} if provider else {})}
         self.effort = thinking if thinking and thinking != "default" else None
         self.turns = 0
@@ -120,7 +124,7 @@ class ApiSession:
         return body
 
     def start(self, timeout: float = 90.0, **_ignored) -> None:
-        """Connect (for editing, to the Blender MCP server) and check the key and model with one tiny request."""
+        """Connect to the host MCP server and check the key and model with one tiny request."""
         self._history = []
         if self.mcp_factory is not None:
             try:
@@ -129,7 +133,7 @@ class ApiSession:
                 self._tools = mcp_tools(self._mcp.list_tools())
             except (McpError, OSError) as exc:
                 self.close()
-                raise BrainError(f"Couldn't start the Blender MCP server: {exc}") from exc
+                raise BrainError(f"Couldn't start the {self.host} MCP server: {exc}") from exc
         try:
             self.client.chat(self._body([{"role": "user", "content": "Reply with exactly: ok"}], max_tokens=16),
                              timeout=timeout)
@@ -190,9 +194,9 @@ class ApiSession:
             on_tool(name)
         mcp = self._mcp
         if mcp is None:
-            raise BrainError("The Blender MCP server isn't running.")
+            raise BrainError(f"The {self.host} MCP server isn't running.")
         try:
-            text = tool_text(self._wait(lambda: mcp.call_tool(name, arguments), deadline, "Blender"))
+            text = tool_text(self._wait(lambda: mcp.call_tool(name, arguments), deadline, self.host))
         except (McpError, OSError) as exc:
             text = f"Error: {exc}"
         return {"role": "tool", "tool_call_id": call.get("id"), "content": text}

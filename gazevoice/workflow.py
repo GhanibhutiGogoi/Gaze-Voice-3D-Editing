@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Mapping
 
 from .components.base import ActionSpec, Component, ComponentState, Health
 from .components.brains import BRAIN_ORDER, STEPS as SOURCE_STEPS, resolve_sources
 from .jobs import Job, JobError
+from .mcp_client import McpError, StdioMcpClient
 from .probes import ProbeTimedOut
 
 SEVERITY = {Health.READY: 0, Health.CHECKING: 1, Health.INSTALLED: 2, Health.MISSING: 3, Health.ERROR: 4}
@@ -35,11 +37,21 @@ def workflow_stages(
     and (given the settings) a provider step with no model picked yet counts as installed, not ready."""
     sources = as_sources(sources)
     marker = {REFINER: "refiner", EDITOR: "editor"}
+    parts_by_stage = list(STAGES)
+    if settings is not None and getattr(settings, "voice_host", "blender") == "unity":
+        parts_by_stage[-2] = ("edit", "Editor", (EDITOR, "@unity"))
+        parts_by_stage[-1] = ("unity", "Unity", ("@unity",))
     stages = []
-    for stage_id, label, parts in STAGES:
-        resolved = [sources[marker[part]] if part in marker else part for part in parts]
+    for stage_id, label, parts in parts_by_stage:
+        resolved = ["unity" if part == "@unity" else sources[marker[part]] if part in marker else part for part in parts]
         healths = []
         for part, cid in zip(parts, resolved):
+            if part == "@unity":
+                from .blender_socket import port_open
+
+                ready = port_open("127.0.0.1", 9878)
+                healths.append(Health.READY if ready else Health.MISSING)
+                continue
             if cid is None:
                 healths.append(Health.MISSING)
                 continue
@@ -113,7 +125,7 @@ class WorkflowCheck(Component):
         for step in ("refiner", "editor"):
             source = sources[step]
             if source in BRAIN_ORDER:
-                if step == "editor":
+                if step == "editor" and self.settings.voice_host == "blender":
                     steps.append((source, "connect_blender"))
             elif (source, "test") not in steps:
                 steps.append((source, "test"))
@@ -126,7 +138,8 @@ class WorkflowCheck(Component):
         except JobError as exc:
             job.log(f"✗ brain: {exc}")
             raise
-        for component_id, action in (*STEPS, *brain_steps):
+        steps = STEPS if self.settings.voice_host == "blender" else STEPS[:2]
+        for component_id, action in (*steps, *brain_steps):
             component = self.components.get(component_id)
             if component is None:
                 raise JobError(f"{component_id} isn't part of this setup.")
@@ -145,5 +158,40 @@ class WorkflowCheck(Component):
                 raise JobError(f"{component.name} {action.replace('_', ' ')} failed: {exc}") from exc
             job.log(f"✓ {component_id}.{action}: {_brief(result)}")
             passed += 1
+        if self.settings.voice_host == "unity":
+            self._check_unity(job)
+            passed += 1
         job.log("Every stage passed. The workflow is ready.")
         return {"passed": passed}
+
+    def _check_unity(self, job: Job) -> None:
+        """Check the local Unity bridge and the configured stdio MCP server."""
+        from .blender_socket import bridge_request
+
+        job.log("▶ unity.bridge")
+        try:
+            hello = bridge_request({"cmd": "ping"}, port=9878, timeout=2.0)
+            if not hello.get("ok"):
+                raise JobError("The Unity Editor bridge returned an invalid reply.")
+        except (OSError, ValueError) as exc:
+            raise JobError(f"Unity Editor bridge test failed: {exc}") from exc
+        job.log(f"✓ unity.bridge: Unity {hello.get('unity', '')}")
+
+        import sys
+
+        command = self.settings.unity_mcp_command or sys.executable
+        args = self.settings.unity_mcp_args if self.settings.unity_mcp_command else ("-m", "gazevoice.unity_mcp")
+        env = None if self.settings.unity_mcp_command else {
+            "PYTHONPATH": str(Path(__file__).resolve().parent.parent)
+        }
+        job.log("▶ unity.mcp")
+        try:
+            client = StdioMcpClient([command, *args], env=env, timeout=15.0)
+            with client:
+                client.initialize()
+                tools = client.list_tools()
+                if not tools:
+                    raise McpError("The Unity MCP server returned no tools.")
+        except (McpError, OSError) as exc:
+            raise JobError(f"Unity MCP test failed: {exc}") from exc
+        job.log(f"✓ unity.mcp: {len(tools)} tools")

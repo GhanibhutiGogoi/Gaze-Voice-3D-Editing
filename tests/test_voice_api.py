@@ -183,6 +183,7 @@ class VoiceApiTest(unittest.TestCase):
         )
         status, snapshot = self.get("/api/voice")
         self.assertEqual((status, snapshot["state"]), (200, "off"))
+        self.assertEqual(snapshot["host"], "blender")
 
     def test_start_waits_while_check_everything_runs(self):
         self.start_server()
@@ -194,6 +195,12 @@ class VoiceApiTest(unittest.TestCase):
             self.assertEqual(self.voice.calls, [])
         finally:
             gate.set()
+
+    def test_off_snapshot_uses_currently_selected_host(self):
+        self.start_server()
+        self.assertEqual(self.get("/api/voice")[1]["host"], "blender")
+        self.center.update_settings({"voice_host": "unity"})
+        self.assertEqual(self.get("/api/voice")[1]["host"], "unity")
 
     def test_changing_thinking_while_voice_is_on_asks_for_a_restart(self):
         self.start_server()

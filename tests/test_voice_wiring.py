@@ -1,5 +1,8 @@
 import dataclasses
+import json
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from gazevoice.providers import KeyStore, preset
 from gazevoice.settings import update_settings
@@ -8,7 +11,7 @@ from gazevoice.voice.api_brain import ApiSession
 from gazevoice.components.microphone import LIST_DEVICES
 from gazevoice.events import EventBus
 from gazevoice.voice.audio import MicError
-from gazevoice.voice.wiring import build_voice
+from gazevoice.voice.wiring import build_voice, voice_readiness
 
 from .helpers import TempCtx
 
@@ -78,6 +81,52 @@ class BuildVoiceTest(unittest.TestCase):
         voice = build_voice(self.t.ctx, EventBus(), {"refiner": "claude", "editor": "claude"})
         argv = voice.factories.editor().argv
         self.assertEqual(argv[argv.index("--max-turns") + 1], "150")
+
+    def test_unity_uses_its_bridge_mcp_server_and_prompts(self):
+        self.t.ctx.settings = update_settings(self.t.ctx.settings, {
+            "voice_host": "unity", "unity_mcp_command": "/opt/unity-mcp", "unity_mcp_args": ["--stdio"]
+        })
+        voice = build_voice(self.t.ctx, EventBus(), {"refiner": "claude", "editor": "claude"})
+        editor = voice.factories.editor()
+        bridge = voice.factories.bridge()
+        self.assertEqual(voice.host, "unity")
+        self.assertEqual(bridge.port, 9878)
+        self.assertIn("mcp__unity", editor.argv)
+        config_path = Path(editor.argv[editor.argv.index("--mcp-config") + 1])
+        config = json.loads(config_path.read_text())
+        self.assertEqual(config["mcpServers"]["unity"], {
+            "command": "/opt/unity-mcp", "args": ["--stdio"]
+        })
+        prompt = Path(editor.argv[editor.argv.index("--system-prompt-file") + 1]).read_text()
+        self.assertIn("Unity MCP tools", prompt)
+
+    def test_unity_api_editor_gets_dynamic_mcp_tool_factory(self):
+        self.t.ctx.settings = update_settings(self.t.ctx.settings, {
+            "voice_host": "unity", "unity_mcp_command": "/opt/unity-mcp", "unity_mcp_args": ["serve"],
+            "providers": [preset("deepseek").to_dict()], "editor_source": "deepseek",
+            "editor_api_model": "deepseek-v4-pro"})
+        self.t.runner.add(["security", "find-generic-password", "-s", "GazeVoice", "-a", "deepseek", "-w"],
+                          stdout="sk-1234\n")
+        voice = build_voice(self.t.ctx, EventBus(), {"refiner": "claude", "editor": "deepseek"}, KeyStore(self.t.runner))
+        editor = voice.factories.editor()
+        self.assertEqual(editor.host, "Unity")
+        self.assertIsNotNone(editor.mcp_factory)
+
+    def test_unity_readiness_uses_unity_requirements_not_blender_units(self):
+        settings = update_settings(self.t.ctx.settings, {"voice_host": "unity"})
+        with patch("gazevoice.blender_socket.port_open", return_value=False):
+            missing = voice_readiness({}, {"refiner": None, "editor": None}, settings)
+        self.assertTrue(any("Unity Editor bridge" in item for item in missing))
+        self.assertFalse(any("Blender" in item for item in missing))
+
+    def test_unity_builtin_mcp_works_without_external_command(self):
+        self.t.ctx.settings = update_settings(self.t.ctx.settings, {"voice_host": "unity"})
+        voice = build_voice(self.t.ctx, EventBus(), {"refiner": "claude", "editor": "claude"})
+        editor = voice.factories.editor()
+        config_path = Path(editor.argv[editor.argv.index("--mcp-config") + 1])
+        server = json.loads(config_path.read_text())["mcpServers"]["unity"]
+        self.assertEqual(server["args"], ["-m", "gazevoice.unity_mcp"])
+        self.assertIn("PYTHONPATH", server["env"])
 
     def test_a_provider_without_a_key_fails_with_a_plain_message(self):
         self.t.ctx.settings = update_settings(self.t.ctx.settings, {

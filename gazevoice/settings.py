@@ -22,6 +22,9 @@ _RENAMED_MODELS = {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5", "ha
 
 @dataclass(frozen=True)
 class Settings:
+    voice_host: str = "blender"
+    unity_mcp_command: str = ""
+    unity_mcp_args: tuple = ()
     stt_engine: str = "parakeet"
     mic_device: str = ""  # "" = auto (prefer the built-in mic); otherwise an AVFoundation index
     # Each step has a source (a built-in brain or a provider id) and remembers its choices for both kinds.
@@ -55,6 +58,15 @@ def _providers(value: Any) -> tuple:
 
 
 def _check(key: str, value: Any) -> None:
+    if key == "voice_host" and value not in ("blender", "unity"):
+        raise ValueError("voice_host must be blender or unity")
+    if key == "unity_mcp_command" and not (isinstance(value, str) and len(value) <= 500 and value.isprintable()):
+        raise ValueError("unity_mcp_command must be a command path")
+    if key == "unity_mcp_args" and not (
+        isinstance(value, (list, tuple)) and len(value) <= 64
+        and all(isinstance(item, str) and len(item) <= 1000 and item.isprintable() for item in value)
+    ):
+        raise ValueError("unity_mcp_args must be a list of command arguments")
     if key in ("editor_source", "refiner_source") and not (isinstance(value, str) and value):
         raise ValueError(f"{key} must be a source name")
     if key in ("editor_api_model", "refiner_api_model") and not (
@@ -79,6 +91,8 @@ def update_settings(settings: Settings, changes: Mapping[str, Any]) -> Settings:
     if unknown:
         raise ValueError(f"Unknown setting: {', '.join(unknown)}")
     changes = dict(changes)
+    if "unity_mcp_args" in changes:
+        changes["unity_mcp_args"] = tuple(changes["unity_mcp_args"])
     if "providers" in changes:
         changes["providers"] = _providers(changes["providers"])
     for key, value in changes.items():
@@ -115,6 +129,8 @@ def load_settings(path: Path) -> Settings:
     for f in fields(Settings):
         if f.name in raw and f.name != "providers":
             value = raw[f.name]
+            if f.name == "unity_mcp_args" and isinstance(value, list):
+                value = tuple(value)
             if f.name in ("editor_model", "refiner_model") and value in _RENAMED_MODELS:
                 value = _RENAMED_MODELS[value]  # saved before models were chosen by full name
             try:

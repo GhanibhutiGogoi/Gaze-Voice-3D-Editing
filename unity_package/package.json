@@ -1,0 +1,10 @@
+{
+  "name": "com.gazevoice.bridge",
+  "version": "0.1.0",
+  "displayName": "GazeVoice Bridge",
+  "description": "Local voice command bridge for Unity Editor scenes.",
+  "unity": "2022.3",
+  "dependencies": {
+    "com.unity.nuget.newtonsoft-json": "3.2.1"
+  }
+}

@@ -154,7 +154,8 @@ class ControlCenter:
     # --- voice ---------------------------------------------------------------------------
     def _voice_config_now(self, sources: dict[str, str | None]) -> tuple:
         s = self.ctx.settings
-        return (sources["refiner"], sources["editor"], s.stt_engine, s.mic_device,
+        return (s.voice_host, s.unity_mcp_command, s.unity_mcp_args,
+                sources["refiner"], sources["editor"], s.stt_engine, s.mic_device,
                 s.editor_model, s.editor_effort, s.editor_api_model, s.editor_api_thinking,
                 s.refiner_model, s.refiner_effort, s.refiner_api_model, s.refiner_api_thinking,
                 json.dumps(s.providers, sort_keys=True))
@@ -163,6 +164,10 @@ class ControlCenter:
                        sources: dict[str, str | None] | None = None) -> dict:
         voice = self.voice
         snap = voice.snapshot() if voice is not None else {"state": "off", "reason": "", "recent": []}
+        if snap.get("state") in ("off", "error"):
+            snap["host"] = self.ctx.settings.voice_host
+        else:
+            snap.setdefault("host", self.ctx.settings.voice_host)
         on = snap.get("state") not in ("off", "error")
         if states is not None:
             sources = sources or self.sources(states)
@@ -197,7 +202,8 @@ class ControlCenter:
                 voice.start()
             except VoiceError as exc:
                 raise JobError(str(exc)) from exc
-            job.log(f"Voice is on. In Blender, hold {voice.key}, speak, and let go.")
+            host = "Unity" if getattr(voice, "host", self.ctx.settings.voice_host) == "unity" else "Blender"
+            job.log(f"Voice is on. In {host}, hold {voice.key}, speak, and let go.")
             return {"voice": "on"}
 
         with self._start_lock:

@@ -20,6 +20,7 @@ class SettingsTest(unittest.TestCase):
 
     def test_defaults(self):
         s = Settings()
+        self.assertEqual((s.voice_host, s.unity_mcp_command, s.unity_mcp_args), ("blender", "", ()))
         self.assertEqual((s.editor_source, s.refiner_source, s.stt_engine, s.mic_device),
                          ("auto", "auto", "parakeet", ""))
         self.assertEqual((s.editor_api_model, s.editor_api_thinking, s.providers), ("", "default", ()))
@@ -28,6 +29,17 @@ class SettingsTest(unittest.TestCase):
     def test_mic_device_accepts_auto_or_a_number(self):
         self.assertEqual(update_settings(Settings(), {"mic_device": "2"}).mic_device, "2")
         self.assertEqual(update_settings(Settings(mic_device="2"), {"mic_device": ""}).mic_device, "")
+
+    def test_unity_host_settings_round_trip_and_validate(self):
+        settings = update_settings(Settings(), {
+            "voice_host": "unity", "unity_mcp_command": "/opt/unity-mcp", "unity_mcp_args": ["serve", "--stdio"]
+        })
+        save_settings(self.path, settings)
+        self.assertEqual(load_settings(self.path), settings)
+        with self.assertRaises(ValueError):
+            update_settings(settings, {"voice_host": "godot"})
+        with self.assertRaises(ValueError):
+            update_settings(settings, {"unity_mcp_args": ["ok", 2]})
 
     def test_round_trip(self):
         s = update_settings(Settings(), {"editor_source": "codex", "stt_engine": "whisper", "mic_device": "2"})

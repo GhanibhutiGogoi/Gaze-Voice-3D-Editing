@@ -64,7 +64,7 @@ def short_tool(name: str) -> str:
 
 def claude_session_argv(
     system_prompt_file: Path, model: str | None, mcp_config: Path | None, max_turns: int = 12,
-    effort: str | None = None,
+    effort: str | None = None, mcp_server: str = "blender",
 ) -> list[str]:
     argv = [
         "claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
@@ -79,7 +79,7 @@ def claude_session_argv(
     if effort and effort != "default":
         argv += ["--effort", effort]
     if mcp_config is not None:
-        argv += ["--mcp-config", str(mcp_config), "--allowedTools", "mcp__blender"]
+        argv += ["--mcp-config", str(mcp_config), "--allowedTools", f"mcp__{mcp_server}"]
     return argv
 
 
@@ -285,10 +285,12 @@ class CodexSession:
         mcp_cmd: dict | None = None,
         command: Sequence[str] = ("codex",),
         env: Mapping[str, str] | None = None,
+        mcp_server: str = "blender",
     ):
         self.cwd = cwd
         self.instructions = instructions
         self.mcp_cmd = mcp_cmd
+        self.mcp_server = mcp_server
         self.command = [str(c) for c in command]
         self.env = dict(os.environ, **(env or {}))
         self.thread_id: str | None = None
@@ -308,7 +310,7 @@ class CodexSession:
         prompt = text if self.thread_id or not self.instructions else f"{self.instructions}\n\n{text}"
         argv = [*self.command, "exec", "--json", "--skip-git-repo-check", "--sandbox", "read-only"]
         if self.mcp_cmd:
-            argv += codex_mcp_args(self.mcp_cmd)
+            argv += codex_mcp_args(self.mcp_cmd, self.mcp_server)
         if self.thread_id:
             argv += ["resume", self.thread_id]
         argv.append(prompt)
