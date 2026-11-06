@@ -27,7 +27,6 @@ import time
 import blf
 import bpy
 import gpu
-import numpy as np  # Blender bundles it
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 from mathutils import Matrix, Vector
@@ -183,20 +182,24 @@ def _end_crop() -> None:
 
 
 def _crop_tick() -> float | None:
-    """A timer: ask the target viewport to repaint (its draw handler runs only then) until the crop is made or
-    given up on, then remove the handler."""
-    if _crop.state == "pending":
+    """A timer, alive while a crop is pending or its picture is unread: ask the target viewport to repaint (its draw
+    handler runs only then) until the crop is made or given up on, remove the handler, then keep looking at the slot,
+    which drops a picture nobody reads after CROP_KEEP_SECONDS."""
+    state = _crop.state
+    if state == "pending":
         target = _target()
         if target is not None:
             target[1].tag_redraw()
         return CROP_TICK
     _end_crop()
-    return None  # unregisters the timer
+    return POLL_SECONDS if state == "ready" else None  # None unregisters the timer
 
 
 def _crop_png(context, u: float, v: float, radius: list[float], size: int) -> bytes:
     """Draw the viewport into an offscreen buffer, cut out the box around the ring, scale it so its long side is `size`,
     draw the ring on it and encode it as PNG. All in memory; call it from a draw handler."""
+    import numpy as np  # Blender bundles it; imported here so that a missing one fails this crop, not the add-on
+
     region, region_3d = context.region, context.region_data
     wanted = protocol.crop_box(u, v, radius, region.width, region.height)
     # Draw no bigger than the picture needs: a box wider than `size` is drawn smaller, a small one at full size.

@@ -1,3 +1,4 @@
+import ast
 import base64
 import importlib.util
 import io
@@ -10,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 PROTOCOL = Path(__file__).resolve().parents[1] / "blender_addon" / "gazevoice_bridge" / "protocol.py"
+ADDON = PROTOCOL.with_name("__init__.py")
 
 
 def load_protocol():
@@ -682,8 +684,49 @@ class CropSlotTest(unittest.TestCase):
         slot.finish(b"after the drop")  # nobody is waiting for it
         self.assertEqual(slot.read(), {"error": "no picture is waiting"})
 
+    def test_an_unread_picture_is_dropped_after_a_while(self):
+        clock = Clock(10.0)
+        slot = protocol.CropSlot(clock=clock)
+        slot.begin()
+        slot.finish(b"nobody comes for this")
+        clock.now += protocol.CROP_KEEP_SECONDS - 0.1
+        self.assertEqual(slot.state, "ready")
+        clock.now += 0.2
+        self.assertEqual(slot.state, "idle")  # gone without anyone reading it
+        self.assertIsNone(slot._png)
+        self.assertEqual(slot.read(), {"error": "no picture is waiting"})
+
+    def test_a_picture_read_inside_the_limit_still_comes_once(self):
+        clock = Clock(10.0)
+        slot = protocol.CropSlot(clock=clock)
+        slot.begin()
+        slot.finish(b"in time")
+        clock.now += protocol.CROP_KEEP_SECONDS - 0.1
+        self.assertEqual(slot.read(), {"png": b"in time"})
+        self.assertEqual(slot.read(), {"error": "no picture is waiting"})
+
+    def test_a_picture_is_kept_from_when_it_was_made_not_from_when_it_was_asked_for(self):
+        clock = Clock(10.0)
+        slot = protocol.CropSlot(clock=clock)
+        slot.begin()
+        clock.now += protocol.CROP_SECONDS - 0.5  # the viewport took a while to draw
+        slot.finish(b"late but fresh")
+        clock.now += protocol.CROP_KEEP_SECONDS - 0.1
+        self.assertEqual(slot.read(), {"png": b"late but fresh"})
+
+    def test_a_dropped_picture_does_not_block_the_next_crop(self):
+        clock = Clock(10.0)
+        slot = protocol.CropSlot(clock=clock)
+        slot.begin()
+        slot.finish(b"old")
+        clock.now += protocol.CROP_KEEP_SECONDS + 1
+        self.assertTrue(slot.begin())
+        slot.finish(b"new")
+        self.assertEqual(slot.read(), {"png": b"new"})
+
     def test_the_timeout_is_a_few_seconds(self):
         self.assertEqual(protocol.CROP_SECONDS, 3.0)
+        self.assertEqual(protocol.CROP_KEEP_SECONDS, 30.0)
         self.assertEqual(protocol.MAX_CROP_SIZE, 1024)
 
 
@@ -808,6 +851,32 @@ class GazeCropTest(unittest.TestCase):
             reply = handle({"cmd": "gaze_crop_result"}, scene)
         self.assertTrue(reply["ok"])
         self.assertEqual(decode_png(base64.b64decode(reply["png"]))[:2], size)
+
+    def test_a_picture_nobody_reads_is_gone_by_the_next_ask(self):
+        clock = Clock(10.0)
+        scene = FakeScene()
+        scene.crop = protocol.CropSlot(clock=clock)
+        handle(self.ASK, scene)
+        scene.crop.finish(protocol.encode_png(2, 2, bytes(12)))
+        clock.now += protocol.CROP_KEEP_SECONDS + 0.1
+        self.assertEqual(handle({"cmd": "gaze_crop_result"}, scene), {"ok": False, "error": "no picture is waiting"})
+
+    def test_the_addon_does_not_need_numpy_to_start(self):
+        # A missing numpy must only fail a crop, never the add-on's register(), which would take voice down with it.
+        tree = ast.parse(ADDON.read_text())
+        top_level = [
+            name.split(".")[0]
+            for node in tree.body
+            for name in (
+                [alias.name for alias in node.names] if isinstance(node, ast.Import)
+                else [node.module or ""] if isinstance(node, ast.ImportFrom) else []
+            )
+        ]
+        self.assertIn("bpy", top_level)  # the scan sees the real imports
+        self.assertNotIn("numpy", top_level)
+        crop_png = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_crop_png")
+        inside = [alias.name for node in ast.walk(crop_png) if isinstance(node, ast.Import) for alias in node.names]
+        self.assertEqual(inside, ["numpy"])
 
     def test_protocol_stays_free_of_blender_and_numpy(self):
         source = PROTOCOL.read_text()

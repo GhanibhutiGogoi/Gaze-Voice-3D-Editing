@@ -55,7 +55,8 @@ top left. Nothing here edits the scene.
         when Blender repaints it, so gaze_crop returns at once and the picture follows a moment later;
         gaze_crop_result answers "pending" until it is ready, then hands it over exactly once: Blender keeps
         no copy and writes no file. A second gaze_crop while one is pending is refused. If the viewport
-        hasn't drawn within CROP_SECONDS (say the window is hidden), the result is an error.
+        hasn't drawn within CROP_SECONDS (say the window is hidden), the result is an error. A picture nobody
+        reads is dropped after CROP_KEEP_SECONDS, and then the result says no picture is waiting.
     While the push-to-talk key is held, "poll" also carries the mouse as a stand-in for gaze, at most
     MAX_POINTER_RATE a second, whether it moves or rests where it is:
         {"seq": 14, "type": "pointer", "u": 0.4, "v": 0.3, "t": …}
@@ -87,6 +88,7 @@ MAX_MARK_NAME = 40
 MAX_POINTER_RATE = 20  # pointer events a second, at most
 MAX_CROP_SIZE = 1024  # the long side of a gaze_crop picture, in pixels
 CROP_SECONDS = 3.0  # a crop whose viewport hasn't drawn by then is given up
+CROP_KEEP_SECONDS = 30.0  # a finished picture nobody has read by then is dropped
 CROP_MARGIN = 2.5  # a crop reaches this many ring radii out from the target, each way
 RING_COLOR = (90, 190, 255)  # the ring drawn on a crop: one bright colour...
 RING_EDGE_COLOR = (12, 12, 16)  # ...with a dark edge, so it shows on any background
@@ -190,17 +192,22 @@ class CropSlot:
 
     The picture is made inside a draw callback some time after the request, so there is a short wait in between:
     idle, pending (asked for, not drawn yet), then ready (a picture) or failed (an error). Reading a picture or an
-    error clears it. A pending crop that isn't done within `timeout` seconds becomes a failure.
+    error clears it. A pending crop that isn't done within `timeout` seconds becomes a failure, and a picture nobody
+    has read `keep` seconds after it was made is dropped. Both are noticed whenever `state` is looked at, so whoever
+    owns a slot must look at it from a timer for as long as it holds a picture.
     """
 
     NOTHING_WAITING = "no picture is waiting"
     TIMED_OUT = "Blender's viewport didn't draw in time (is its window hidden?)"
 
-    def __init__(self, clock: Callable[[], float] = time.monotonic, timeout: float = CROP_SECONDS):
+    def __init__(self, clock: Callable[[], float] = time.monotonic, timeout: float = CROP_SECONDS,
+                 keep: float = CROP_KEEP_SECONDS):
         self._clock = clock
         self._timeout = timeout
+        self._keep = keep
         self._state = "idle"
         self._started = 0.0
+        self._made = 0.0
         self._png: bytes | None = None
         self._error = ""
 
@@ -209,6 +216,8 @@ class CropSlot:
         """"idle", "pending", "ready" or "failed"."""
         if self._state == "pending" and self._clock() - self._started > self._timeout:
             self._state, self._error = "failed", self.TIMED_OUT
+        if self._state == "ready" and self._clock() - self._made > self._keep:
+            self._state, self._png = "idle", None  # nobody came for it
         return self._state
 
     def begin(self) -> bool:
@@ -221,7 +230,7 @@ class CropSlot:
     def finish(self, png: bytes) -> None:
         """The picture is made. Ignored unless a crop is pending, so a late one (after giving up) is thrown away."""
         if self.state == "pending":
-            self._state, self._png = "ready", png
+            self._state, self._png, self._made = "ready", png, self._clock()
 
     def fail(self, error: str) -> None:
         if self.state == "pending":
