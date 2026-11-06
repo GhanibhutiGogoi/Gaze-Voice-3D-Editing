@@ -1,4 +1,5 @@
 import json
+import signal
 import sys
 import tempfile
 import threading
@@ -126,13 +127,47 @@ class ClaudeSessionTest(unittest.TestCase):
         self.assertIsInstance(outcome[0], BrainError)  # the turn that was running learns the process is gone
         s.close()
 
-    def test_close_can_be_told_how_long_to_wait_for_a_process_that_wont_leave(self):
-        s = self.session(env={"FAKE_CLAUDE_NEVER_READS": "1"})  # it never notices that its input has closed
+    def test_release_returns_at_once_and_the_process_leaves_by_itself(self):
+        left = Path(self.tmp.name) / "left"
+        s = self.session(env={"FAKE_CLAUDE_EXIT_DELAY": "0.6", "FAKE_CLAUDE_EXIT_OUT": str(left)})
+        s.start()
+        s.send("hello")
+        began = time.monotonic()
+        leaving = s.release()
+        self.assertLess(time.monotonic() - began, 0.3)  # does not wait for the tidying up
+        self.assertTrue(s.alive)
+        leaving.join(5)
+        self.assertFalse(leaving.is_alive())
+        self.assertEqual((s.alive, s.proc.returncode, left.read_text()), (False, 0, "left"))  # left, wasn't killed
+
+    def test_release_asks_a_process_that_will_not_leave_to_stop_and_then_kills_it(self):
+        asked = Path(self.tmp.name) / "asked"
+        s = self.session(env={"FAKE_CLAUDE_EXIT_DELAY": "60", "FAKE_CLAUDE_IGNORE_TERM": str(asked)})
+        s.start()
+        s.send("hello")
+        began = time.monotonic()
+        leaving = s.release(wait=0.3, term_wait=0.3)
+        leaving.join(5)
+        self.assertLess(time.monotonic() - began, 3.0)
+        self.assertEqual((s.alive, s.proc.returncode), (False, -signal.SIGKILL))  # it ignored the first request
+        self.assertEqual(asked.read_text(), "term")
+
+    def test_release_stops_with_the_gentler_signal_when_that_is_enough(self):
+        s = self.session(env={"FAKE_CLAUDE_NEVER_READS": "1"})  # ends when asked to
+        s.start()
+        leaving = s.release(wait=0.3, term_wait=5.0)
+        began = time.monotonic()
+        leaving.join(5)
+        self.assertLess(time.monotonic() - began, 2.0)  # not the five seconds it would have been given
+        self.assertEqual(s.proc.returncode, -signal.SIGTERM)
+
+    def test_close_still_waits_three_seconds_then_kills_for_the_long_lived_sessions(self):
+        s = self.session(env={"FAKE_CLAUDE_NEVER_READS": "1"})
         s.start()
         began = time.monotonic()
-        s.close(grace=0.3)
-        self.assertLess(time.monotonic() - began, 2.5)
-        self.assertFalse(s.alive)
+        s.close()
+        self.assertTrue(2.5 < time.monotonic() - began < 5.0)
+        self.assertEqual(s.proc.returncode, -signal.SIGKILL)
 
     def test_tools_are_reported_live_and_in_the_result(self):
         seen = []

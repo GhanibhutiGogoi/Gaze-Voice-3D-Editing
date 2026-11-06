@@ -13,6 +13,11 @@ image's media type, length and SHA-256, and the text. FAKE_CLAUDE_PID_OUT=<file>
 FAKE_CLAUDE_NEVER_READS=1 sleeps without ever reading stdin, like a process that hung before it started.
 FAKE_CLAUDE_LEAK_BASE64=<dir> and FAKE_CLAUDE_LEAK_RAW=<dir> make it behave like a Claude Code that keeps a copy of
 the picture there (as sent, or decoded), so the leftover check has something to find.
+
+Leaving: once its input closes it exits at once, unless FAKE_CLAUDE_EXIT_DELAY=<seconds> keeps it tidying up first.
+Then FAKE_CLAUDE_EXIT_OUT=<file> gets "left" (a process that is killed never writes it), and
+FAKE_CLAUDE_LEAK_ON_EXIT=<dir> gets a copy of the last picture's base64, written as it goes. With
+FAKE_CLAUDE_IGNORE_TERM=<file> a SIGTERM is noted in that file and otherwise ignored, so only SIGKILL ends it.
 """
 
 import base64
@@ -30,6 +35,13 @@ if os.environ.get("FAKE_CLAUDE_ARGV_OUT"):
         json.dump(sys.argv[1:], fh)
 
 signal.signal(signal.SIGINT, lambda *_: os._exit(0))
+
+if os.environ.get("FAKE_CLAUDE_IGNORE_TERM"):
+    def noted_term(*_):
+        with open(os.environ["FAKE_CLAUDE_IGNORE_TERM"], "w") as fh:
+            fh.write("term")
+
+    signal.signal(signal.SIGTERM, noted_term)
 
 if os.environ.get("FAKE_CLAUDE_PID_OUT"):
     with open(os.environ["FAKE_CLAUDE_PID_OUT"], "w") as fh:
@@ -68,6 +80,7 @@ def result(text, ok=True):
 
 
 threading.Thread(target=read, daemon=True).start()
+last_picture = None
 first = True
 while True:
     message = messages.get()
@@ -82,6 +95,8 @@ while True:
     if isinstance(content, list):  # content blocks: text, and maybe an image
         images = [b for b in content if b.get("type") == "image"]
         pictured = bool(images)
+        if images:
+            last_picture = images[0]["source"]["data"]
         if os.environ.get("FAKE_CLAUDE_STDIN_OUT"):
             image = images[0]["source"] if images else {}
             data = image.get("data", "")
@@ -131,3 +146,12 @@ while True:
             result("Finished the slow job.")
     else:
         result(content if pictured else f"echo: {content}")
+
+# stdin has closed: tidy up, as Claude Code does, and leave
+time.sleep(float(os.environ.get("FAKE_CLAUDE_EXIT_DELAY", "0")))
+if os.environ.get("FAKE_CLAUDE_LEAK_ON_EXIT") and last_picture:
+    with open(os.path.join(os.environ["FAKE_CLAUDE_LEAK_ON_EXIT"], f"late-{os.getpid()}.bin"), "wb") as fh:
+        fh.write(b"cache: " + last_picture.encode())
+if os.environ.get("FAKE_CLAUDE_EXIT_OUT"):
+    with open(os.environ["FAKE_CLAUDE_EXIT_OUT"], "w") as fh:
+        fh.write("left")

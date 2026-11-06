@@ -128,8 +128,9 @@ class Factories:
     # Builds a gaze part: .start(), .stop(), .alive, .track (a GazeTrack), .radius and .view (the viewport size it was
     # calibrated for, or None when it needs no calibration). None means no gaze.
     gaze: Callable[[], Any] | None = None
-    # Builds the picture part, or returns None when pictures are off: .ready() says whether pictures may be used right
-    # now, and .describe(png_base64, word, object_name, timeout=…, cancelled=…) gives one clean sentence, or None.
+    # Builds the picture part, or returns None when pictures are off: .refresh() starts finding out in the background
+    # whether pictures may be used, .ready() answers from what it last found without ever waiting, and
+    # .describe(png_base64, word, object_name, timeout=…, cancelled=…) gives one clean sentence, or None.
     # It is called every time voice starts, so it is also where leftovers from a crash are swept. None means neither.
     pictures: Callable[[], Any] | None = None
 
@@ -436,6 +437,8 @@ class VoiceService:
             return
         try:
             part = factory()
+            if part is not None:
+                part.refresh()  # starts finding out, off this thread, whether pictures may be used; never waits for it
         except Exception:  # noqa: BLE001 - pictures never stop voice
             print(NO_PICTURE, file=sys.stderr)
             return
@@ -1192,7 +1195,8 @@ class VoiceService:
         All of it, the crops and the describers, shares one PICTURE_SECONDS. Nothing here can stop a command: pictures
         off, a check that hasn't passed for this Claude Code, an add-on that can't crop, an error, a describer that is
         slow or says "unclear", all leave `picture` None and the command goes on with the text it has. A stop, or voice
-        turning off, ends the wait at once and kills the describer.
+        turning off, ends the wait at once and kills the describer. Whether pictures may be used is only read, from
+        what the picture part last found out (see Factories.pictures), so nothing about it can hold the command up.
         """
         pictures = self._pictures
         wanted = [t for t in grounding.targets if needs_picture(t)]

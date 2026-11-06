@@ -263,8 +263,7 @@ class ClaudeSession:
             except (ProcessLookupError, PermissionError):
                 pass
 
-    def close(self, grace: float = 3.0) -> None:
-        """Close its input and give the process `grace` seconds to leave by itself, then kill it."""
+    def close(self) -> None:
         proc = self.proc
         if proc is None:
             return
@@ -274,13 +273,54 @@ class ClaudeSession:
         except OSError:
             pass
         try:
-            proc.wait(timeout=grace)
+            proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 proc.kill()
             proc.wait(timeout=3)
+        self._drop_streams()
+
+    def release(self, wait: float = 10.0, term_wait: float = 2.0) -> threading.Thread:
+        """Let go of a session that has done its job: close its input and return at once.
+
+        Claude Code tidies up as it exits (it rewrites a config file it shares with every other session), and has taken
+        several seconds to do it, so it is given `wait` seconds to leave by itself. A thread waits for that and, if
+        the process is still there, asks it to stop (SIGTERM to its whole group), and kills it `term_wait` seconds
+        later. Returns that thread: join it to wait until the process is gone and its pipes are closed.
+        """
+        proc = self.proc
+        try:
+            if proc is not None and proc.stdin:
+                proc.stdin.close()
+        except OSError:
+            pass
+        thread = threading.Thread(target=self._leave, args=(wait, term_wait), daemon=True, name="brain-exit")
+        thread.start()
+        return thread
+
+    def _leave(self, wait: float, term_wait: float) -> None:
+        proc = self.proc
+        if proc is None:
+            return
+        for sig, patience in ((None, wait), (signal.SIGTERM, term_wait), (signal.SIGKILL, 3.0)):
+            if sig is not None:
+                try:
+                    os.killpg(proc.pid, sig)
+                except (ProcessLookupError, PermissionError):
+                    proc.kill()
+            try:
+                proc.wait(timeout=patience)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        self._drop_streams()
+
+    def _drop_streams(self) -> None:
+        proc = self.proc
+        if proc is None:
+            return
         for thread in self._threads:
             thread.join(timeout=1)
         for stream in (proc.stdout, proc.stderr):

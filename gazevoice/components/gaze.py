@@ -26,9 +26,11 @@ from ..blender_socket import BridgeClient
 from ..download import download
 from ..jobs import Job, JobError
 from ..paths import AppPaths
+from ..probes import ProbeTimedOut
 from ..voice.gaze import MIN_CONFIDENCE, viewport_size
 from ..voice.gaze_tracker import GazeError, GazeTracker, view_of
-from ..voice.picture import CHECK_CONFIRM as PICTURE_CHECK_CONFIRM, read_picture_check, run_leftover_check
+from ..voice.leftovers import CHECK_CONFIRM as PICTURE_CHECK_CONFIRM, run_leftover_check
+from ..voice.picture import read_picture_check
 from .base import ActionSpec, Component, ComponentState, Health
 from .microphone import Microphone, face_cameras, pick_camera
 
@@ -171,7 +173,10 @@ class Gaze(Component):
         """Add what pictures need to whatever state the camera side is in: they go through Claude Code, not the camera."""
         if not self.runner.which("claude"):
             return state
-        parts = self.probe(["claude", "--version"], ttl=600).stdout.split()
+        try:
+            parts = self.probe(["claude", "--version"], ttl=600).stdout.split()
+        except ProbeTimedOut:  # a Claude Code that is slow to answer says nothing about the camera side of this card
+            return state
         installed = parts[0] if parts else None
         check = read_picture_check(self.paths.gaze_picture_check)
         if check is None:

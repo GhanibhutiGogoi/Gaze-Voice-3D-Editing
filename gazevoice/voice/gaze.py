@@ -30,7 +30,9 @@ PICTURE_MAX_CHARS = 120  # a picture's sentence is cut to this many characters
 _GOLDEN_ANGLE = math.pi * (3 - math.sqrt(5))
 _EDGE_PUNCTUATION = re.compile(r"^\W+|\W+$")
 _SLACK = 1e-9  # 13/24 - 7/24 is 0.24999999999999994, and still a lead of exactly 0.25
-_QUOTES = dict.fromkeys(map(ord, "\"'`\u00b4\u2018\u2019\u201a\u201b\u201c\u201d\u201e\u201f\u00ab\u00bb\u2039\u203a"))
+# Every mark that reads as a quote: straight, curly, angle, full-width, corner and prime marks, and the grave accent.
+_QUOTES = dict.fromkeys(map(ord, "\"'`\u00b4\u2018\u2019\u201a\u201b\u201c\u201d\u201e\u201f\u00ab\u00bb\u2039\u203a"
+                                 "\u2032\u2033\u2035\u2036\u301d\u301e\u301f\uff02\uff07\uff40"))
 _UNCLEAR = re.compile(r"\W*unclear\W*", re.IGNORECASE)
 
 

@@ -17,10 +17,10 @@ from gazevoice.events import EventBus
 from gazevoice.voice.audio import MicError, RingBuffer
 from gazevoice.voice.brains import BrainError, TurnResult
 from gazevoice.paths import AppPaths
-from gazevoice.probes import ProbeCache
 from gazevoice.runner import FakeRunner
 from gazevoice.voice.gaze import GazeSample, GazeTrack
-from gazevoice.voice.picture import Describer, clear_leftover_images, make_noise_picture, write_picture_check
+from gazevoice.voice.leftovers import make_noise_picture
+from gazevoice.voice.picture import Describer, clear_leftover_images, write_picture_check
 from gazevoice.voice.service import Factories, PointerTracker, VoiceError, VoiceService
 from gazevoice.voice.stt import SpeechError
 
@@ -307,8 +307,11 @@ class FakePictures:
     def __init__(self, reply="the left wing tip", ready=True):
         self.reply = reply  # a sentence, None, an Exception to raise, or a function of the call
         self.is_ready = ready
-        self.ready_calls = 0
+        self.ready_calls = self.refreshes = 0
         self.calls = []
+
+    def refresh(self):
+        self.refreshes += 1
 
     def ready(self):
         self.ready_calls += 1
@@ -1903,7 +1906,7 @@ class GazePictureTest(VoiceTestBase):
         self.service.bus.publish = lambda kind, data: (published.append(json.dumps([kind, data])), real(kind, data))[1]
         self.gaze.look(0.5, 0.5)
         record = self.speak()
-        saved = (Path(self.tmp.name) / "commands" / record["id"] / "record.json").read_text()
+        saved = saved_record_text(self.tmp.name, record)
         everything = "\n".join([json.dumps(self.service.snapshot()["recent"]), saved, *published,
                                  *self.status_texts()])
         self.assertIn("the left wing tip", saved)
@@ -1921,6 +1924,24 @@ class GazePictureTest(VoiceTestBase):
         self.assertEqual(self.editor.sent[0].count("picture (only a description"), 2)
 
     # --- when it doesn't happen -------------------------------------------------------------------------------
+    def test_voice_starts_finding_out_whether_pictures_may_be_used_without_waiting_for_it(self):
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.assertEqual((self.pictures.refreshes, self.pictures.ready_calls), (1, 0))
+        self.speak()
+        self.assertEqual(self.pictures.refreshes, 1)  # a command only reads the answer
+
+    def test_a_picture_part_that_cant_start_looking_leaves_voice_working_without_pictures(self):
+        def broken():
+            raise OSError("no threads for you")
+
+        self.pictures.refresh = broken
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            record = self.run_it()
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertEqual((self.bridge.crops, self.pictures.calls), ([], []))
+        self.assertIn("no picture", errors.getvalue())
+
     def test_a_named_part_needs_no_picture(self):
         self.bridge.piece_reply = WING_PIECE
         record = self.run_it()
@@ -2163,22 +2184,25 @@ class GazePictureRealRouteTest(VoiceTestBase):
         super().tearDown()
         self.out.cleanup()
 
-    def use_claude(self, reply=None, **env):
+    def use_claude(self, reply=None, hung=0.0, **env):
         runner = FakeRunner(which={"claude": "/Users/me/.local/bin/claude"})
-        runner.add(["claude", "--version"], stdout="2.1.303 (Claude Code)\n")
+        runner.add(["claude", "--version"], stdout="2.1.303 (Claude Code)\n", delay=hung)
         runner.add(["claude", "auth", "status"], stdout=LOGGED_IN)
         environ = {"FAKE_CLAUDE_PID_OUT": str(self.pid_file)}
         if reply is not None:
             environ["FAKE_CLAUDE_PICTURE"] = reply
-        self.pictures = Describer(self.paths, runner, ProbeCache(), command=FAKE_CLAUDE, env={**environ, **env})
+        self.runner = runner
+        self.pictures = Describer(self.paths, runner, command=FAKE_CLAUDE, env={**environ, **env})
 
     def make_pictures(self):
         clear_leftover_images(self.paths)
         return super().make_pictures()
 
-    def run_it(self, mode="on"):
+    def run_it(self, mode="on", ready=True):
         self.build(gaze_mode=mode, gaze_source="mouse").start()
         self.gaze.look(0.5, 0.5)
+        if ready:
+            wait_for(self.pictures.ready)  # voice asked claude about itself as it started; that takes a moment
         return self.speak()
 
     def picture_data_in_the_app_folder(self):
@@ -2204,7 +2228,62 @@ class GazePictureRealRouteTest(VoiceTestBase):
         record = self.run_it()
         self.assertEqual(record["stage"], "done", record["error"])
         self.assertIn('  picture (only a description of what the ring shows): "the left wing tip"', self.editor.sent[0])
-        self.assertTrue(self.process_gone())
+        self.assertTrue(wait_until_true(self.process_gone))  # its input was closed, and it leaves by itself
+
+    def test_the_edit_isnt_held_up_while_the_describer_is_still_leaving(self):
+        self.use_claude(FAKE_CLAUDE_EXIT_DELAY="3")
+        began = time.monotonic()
+        record = self.run_it()
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertLess(time.monotonic() - began, 2.5)
+        self.assertIn("picture (", self.editor.sent[0])
+        self.assertFalse(self.process_gone())  # still tidying up, as the edit goes on
+        self.assertTrue(wait_until_true(self.process_gone, 8.0))
+
+    def test_voice_asks_about_claude_as_it_starts_and_not_again_per_command(self):
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        wait_for(self.pictures.ready)
+        asked = self.runner.calls.count(("claude", "--version"))
+        self.assertEqual(asked, 1)
+        self.gaze.look(0.5, 0.5)
+        record = self.speak()
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertEqual(self.runner.calls.count(("claude", "--version")), 1)
+
+    def test_a_claude_that_hangs_on_its_version_costs_the_command_nothing(self):
+        self.use_claude(hung=2.0)  # `claude --version` takes two seconds to answer
+        began = time.monotonic()
+        record = self.run_it(ready=False)
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertLess(time.monotonic() - began, 1.5)  # no waiting for it
+        self.assertEqual(self.bridge.crops, [])  # no answer yet: this command went on as text only
+        self.assertNotIn("picture", record["timings"])
+        self.assertNotIn("Looking closer…", [text for text, _ in self.bridge.statuses])
+        self.assertEqual(self.runner.calls.count(("claude", "--version")), 1)  # and the command didn't ask it again
+        self.assertTrue(wait_until_true(self.pictures.ready, 6.0))  # when it does answer, the next one can have a picture
+
+    def test_turning_voice_off_while_claude_is_being_asked_doesnt_wait_for_it(self):
+        self.use_claude(hung=3.0)
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        began = time.monotonic()
+        self.service.stop()
+        self.assertLess(time.monotonic() - began, 2.0)
+        self.assertEqual(self.service.snapshot()["state"], "off")
+        lookers = [t for t in threading.enumerate() if t.name == "picture-ready"]
+        self.assertTrue(all(t.daemon for t in lookers))  # it can't keep the app from quitting either
+        self.assertTrue(wait_until_true(lambda: not [t for t in threading.enumerate() if t.name == "picture-ready"], 6.0))
+
+    def test_a_stop_while_claude_is_being_asked_still_stops_the_command(self):
+        self.use_claude(hung=3.0)
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.gaze.look(0.5, 0.5)
+        self.service.ptt("down", 1002.0)
+        self.service.ptt("up", 1003.0)
+        spoken = self.last_record()
+        self.service.say("stop")
+        wait_for(lambda: spoken["stage"] in ("stopped", "done", "failed"))
+        self.assertIn(spoken["stage"], ("stopped", "done"))  # whichever got there first; neither waited for claude
+        self.assertTrue(wait_until_true(lambda: not [t for t in threading.enumerate() if t.name == "picture-ready"], 6.0))
 
     def test_no_picture_is_left_behind(self):
         # The scan has to be able to see one: plant a copy and watch it get found.
@@ -2219,9 +2298,9 @@ class GazePictureRealRouteTest(VoiceTestBase):
                     self.use_claude(reply)
                 record = self.run_it()
                 self.assertEqual(record["stage"], "done", record["error"])
-                self.assertIn("record.json", [p.name for p in Path(self.tmp.name).rglob("*.json")])
+                saved_record_text(self.tmp.name, record)  # it is written just after the stage says "done"
                 self.assertEqual(self.picture_data_in_the_app_folder(), [])
-                self.assertTrue(self.process_gone())
+                self.assertTrue(wait_until_true(self.process_gone))
                 self.service.stop()
 
     def test_a_slow_describer_is_given_up_on_and_the_edit_carries_on(self):
@@ -2273,10 +2352,25 @@ class GazePictureRealRouteTest(VoiceTestBase):
 
     def test_records_never_hold_the_image(self):
         record = self.run_it()
-        saved = (Path(self.tmp.name) / "commands" / record["id"] / "record.json").read_text()
+        saved = saved_record_text(self.tmp.name, record)
         self.assertIn("the left wing tip", saved)
         self.assertNotIn("iVBOR", saved)
         self.assertNotIn("iVBOR", json.dumps(self.service.snapshot()["recent"]))
+
+
+def saved_record_text(root, record) -> str:
+    """record.json, once it has been written: it appears a moment after the command's stage says it is done."""
+    path = Path(root) / "commands" / record["id"] / "record.json"
+
+    def written() -> bool:
+        try:
+            json.loads(path.read_text())  # whole, not just begun
+        except (OSError, ValueError):
+            return False
+        return True
+
+    wait_for(written)
+    return path.read_text()
 
 
 def wait_until_true(predicate, seconds=3.0):

@@ -195,7 +195,7 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
 
     def pictures() -> Describer | None:
         clear_leftover_images(paths)  # whatever a crash left goes at every start, with pictures on or not
-        return Describer(paths, ctx.runner, ctx.probes) if settings.gaze_pictures else None
+        return Describer(paths, ctx.runner) if settings.gaze_pictures else None
 
     factories = Factories(
         bridge=bridge_factory,

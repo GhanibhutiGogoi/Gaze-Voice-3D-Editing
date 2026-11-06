@@ -17,7 +17,7 @@ from gazevoice.voice.audio import MicError
 from gazevoice.voice.gaze_tracker import GazeError, GazeTracker
 from gazevoice.components.brains import CLAUDE_ISOLATION
 from gazevoice.voice.brains import claude_session_argv
-from gazevoice.voice.picture import PICTURE_MODEL, PICTURE_PROMPT, Describer
+from gazevoice.voice.picture import PICTURE_MODEL, PICTURE_RULES, Describer
 from gazevoice.voice.service import PointerTracker
 from gazevoice.voice.wiring import build_voice, voice_readiness
 
@@ -194,7 +194,7 @@ class BuildVoiceTest(unittest.TestCase):
     def test_the_refiner_and_the_describer_are_started_in_the_same_folder_with_the_same_isolation(self):
         voice = self.gaze_voice(gaze_mode="on", gaze_source="mouse", gaze_pictures=True)
         refiner = voice.factories.refiner()
-        argv = claude_session_argv(PICTURE_PROMPT, PICTURE_MODEL, None, max_turns=1)
+        argv = claude_session_argv(PICTURE_RULES, PICTURE_MODEL, None, max_turns=1)
         self.assertEqual(str(refiner.cwd), str(self.t.paths.work))
         for flag in CLAUDE_ISOLATION:
             self.assertIn(flag, refiner.argv)

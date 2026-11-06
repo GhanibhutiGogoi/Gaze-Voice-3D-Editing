@@ -290,7 +290,7 @@ function resultLine(job) {
   if (r.calibrated) return typeof r.median === "number" ? `Typically off by ${Math.round(r.median * 100)}% of the viewport` : "Calibrated";
   if (r.tested) return typeof r.followed === "number" ? `The ring found you ${Math.round(r.followed * 100)}% of the time` : "Tested";
   if (r.installed) return "Installed";
-  if (r.passed) return `Pictures are cleaned up with Claude Code ${r.claude}`;
+  if (r.passed === true && r.claude) return `Pictures are cleaned up with Claude Code ${r.claude}`;
   return "Done";
 }
 
