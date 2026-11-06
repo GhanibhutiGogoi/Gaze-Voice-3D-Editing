@@ -163,7 +163,7 @@ class EditorMessageTest(unittest.TestCase):
         self.assertEqual(text, "\n".join([
             'Focus (gaze): "there" at 1.2 s → Eagle (82%), Perch (14%)',
             "  part: Wing.L · point (0.41, 0.12, 0.73) on face 3120 · connected piece of 480 of 5120 faces",
-            "  gaze is accurate to about 10% of the viewport · selected: nothing",
+            "  gaze is accurate to about 10% of the viewport · selected: nothing · mode OBJECT",
         ]))
 
     def test_the_gaze_text_leaves_out_what_it_doesnt_know(self):
@@ -177,7 +177,7 @@ class EditorMessageTest(unittest.TestCase):
         self.assertIn("\n  point (0.41, 0.12, 0.73)\n", no_piece)
         self.assertNotIn("face 3120", no_piece)
         bare = describe_focus(gaze_focus(gaze_target(candidates=[candidate("Eagle", 0.8, point=())])))
-        self.assertEqual(bare.splitlines()[1], "  gaze is accurate to about 10% of the viewport · selected: nothing")
+        self.assertEqual(bare.splitlines()[1], "  gaze is accurate to about 10% of the viewport · selected: nothing · mode OBJECT")
 
     def test_a_picture_sentence_is_a_description_line_under_its_target(self):
         big = {"face": 3120, "part": None, "piece_faces": 4000, "object_faces": 5120}
@@ -186,7 +186,7 @@ class EditorMessageTest(unittest.TestCase):
             'Focus (gaze): "there" at 1.2 s → Eagle (82%), Perch (14%)',
             "  point (0.41, 0.12, 0.73) on face 3120 · connected piece of 4000 of 5120 faces",
             '  picture (only a description of what the ring shows): "the left wing tip"',
-            "  gaze is accurate to about 10% of the viewport · selected: nothing",
+            "  gaze is accurate to about 10% of the viewport · selected: nothing · mode OBJECT",
         ]))
         second = describe_focus(gaze_focus(gaze_target("this", 0.4), looked_at))
         self.assertIn('\n    picture (only a description of what the ring shows): "the left wing tip"\n', second)
@@ -207,9 +207,20 @@ class EditorMessageTest(unittest.TestCase):
             text = describe_focus(gaze_focus({**gaze_target(), "picture": nothing}))
             self.assertNotIn("picture", text)
 
+    def test_the_gaze_text_says_which_mode_blender_is_in(self):
+        for mode in ("EDIT", "OBJECT"):
+            text = describe_focus({**gaze_focus(gaze_target()), "mode": mode})
+            self.assertTrue(text.endswith(f"  gaze is accurate to about 10% of the viewport · selected: nothing · mode {mode}"),
+                            text)
+
+    def test_the_mode_is_left_out_when_blender_didnt_say(self):
+        self.assertNotIn("mode", describe_focus({**gaze_focus(gaze_target()), "mode": None}))
+        self.assertTrue(describe_focus({**gaze_focus(gaze_target(), selected=None), "mode": "EDIT"}).endswith(
+            "  gaze is accurate to about 10% of the viewport · mode EDIT"))
+
     def test_the_gaze_text_says_what_is_selected_and_how_sure_the_gaze_is(self):
         text = describe_focus(gaze_focus(gaze_target(), selected=["Chair", "Leg.001"], radius=(0.02, 0.03)))
-        self.assertTrue(text.endswith("  gaze is accurate to about 2% of the viewport · selected: Chair, Leg.001"))
+        self.assertTrue(text.endswith("  gaze is accurate to about 2% of the viewport · selected: Chair, Leg.001 · mode OBJECT"))
         unknown = describe_focus(gaze_focus(gaze_target(), selected=None))  # Blender couldn't report a selection
         self.assertTrue(unknown.endswith("  gaze is accurate to about 10% of the viewport"), unknown)
 

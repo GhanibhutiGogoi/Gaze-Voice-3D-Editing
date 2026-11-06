@@ -1243,7 +1243,7 @@ class GazeVoiceTest(VoiceTestBase):
             'Heard: "add blue color there"',
             'Focus (gaze): "there" at 1.0 s → Eagle (79%), Perch (17%)',
             "  part: Wing.L · point (0.41, 0.12, 0.73) on face 3120 · connected piece of 480 of 5120 faces",
-            "  gaze is accurate to about 10% of the viewport · selected: nothing",
+            "  gaze is accurate to about 10% of the viewport · selected: nothing · mode OBJECT",
         ]))
         self.assertEqual(record["gaze"]["status"], "resolved")
         self.assertEqual(self.bridge.pieces[0]["uid"], 116)  # the top guess was looked at closer
@@ -2304,7 +2304,7 @@ class GazePictureTest(VoiceTestBase):
             'Focus (gaze): "there" at 1.0 s → Eagle (79%), Perch (17%)',
             "  point (0.41, 0.12, 0.73) on face 3120 · connected piece of 4000 of 5120 faces",
             '  picture (only a description of what the ring shows): "the left wing tip"',
-            "  gaze is accurate to about 10% of the viewport · selected: nothing",
+            "  gaze is accurate to about 10% of the viewport · selected: nothing · mode OBJECT",
         ]))
         self.assertIn("the left wing tip", json.loads(self.refiner.sent[0])["gaze"])
         for sent in (*self.editor.sent, *self.refiner.sent):

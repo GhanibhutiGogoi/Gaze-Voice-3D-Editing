@@ -171,6 +171,8 @@ def _describe_gaze(focus: dict) -> str:
         footer.append(f"gaze is accurate to about {round(gaze['radius'][0] * 100)}% of the viewport")
     if focus.get("selected") is not None:  # None means Blender couldn't say, which is not the same as nothing
         footer.append(f"selected: {', '.join(focus['selected']) or 'nothing'}")
+    if focus.get("mode"):
+        footer.append(f"mode {focus['mode']}")
     if footer:
         lines.append("  " + " · ".join(footer))
     return "\n".join(lines)

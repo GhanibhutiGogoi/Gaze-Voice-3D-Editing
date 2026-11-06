@@ -339,28 +339,12 @@ class BpyScene:
         obj = next((o for o in bpy.data.objects if o.session_uid == uid), None)
         if obj is None or obj.type != "MESH":
             return None
+        if obj.mode == "EDIT":
+            obj.update_from_editmode()  # until this, obj.data doesn't hold what was done since Edit Mode began
         depsgraph = bpy.context.evaluated_depsgraph_get()
         world = Vector(point)
         mesh = obj.data
         material_count = sum(1 for slot in obj.material_slots if slot.material)
-
-        # The face you see: nearest point on the evaluated mesh, so a mirrored wing reads Wing.R.
-        evaluated = obj.evaluated_get(depsgraph)
-        _found, _location, _normal, seen = evaluated.closest_point_on_mesh(
-            evaluated.matrix_world.inverted() @ world, depsgraph=depsgraph)
-        weights: dict[str, float] = {}
-        material = None
-        seen_mesh = evaluated.data
-        if 0 <= seen < len(seen_mesh.polygons):
-            polygon = seen_mesh.polygons[seen]
-            for index in polygon.vertices:
-                for element in seen_mesh.vertices[index].groups:
-                    name = evaluated.vertex_groups[element.group].name
-                    weights[name] = weights.get(name, 0.0) + element.weight
-            if polygon.material_index < len(obj.material_slots):
-                slot_material = obj.material_slots[polygon.material_index].material
-                material = slot_material.name if slot_material else None
-        part = protocol.face_part(weights, material, material_count)
 
         # The original face, which the modifiers renumber: nearest point on the cage.
         faces = [tuple(polygon.vertices) for polygon in mesh.polygons]
@@ -373,6 +357,29 @@ class BpyScene:
                 if found[2] is not None and (nearest is None or found[3] < nearest[3]):
                     nearest = found
             face = nearest[2] if nearest else None
+
+        # The face you see: nearest point on the evaluated mesh, so a mirrored wing reads Wing.R. In Edit Mode with
+        # no modifier showing, that mesh has no polygons and can't be searched, and what you see is the original.
+        evaluated = obj.evaluated_get(depsgraph)
+        seen_mesh = evaluated.data
+        if obj.mode == "EDIT" and not seen_mesh.polygons:
+            seen_mesh, seen = mesh, -1 if face is None else face
+        else:
+            _found, _location, _normal, seen = evaluated.closest_point_on_mesh(
+                evaluated.matrix_world.inverted() @ world, depsgraph=depsgraph)
+        weights: dict[str, float] = {}
+        material = None
+        if 0 <= seen < len(seen_mesh.polygons):
+            polygon = seen_mesh.polygons[seen]
+            for index in polygon.vertices:
+                for element in seen_mesh.vertices[index].groups:
+                    name = evaluated.vertex_groups[element.group].name
+                    weights[name] = weights.get(name, 0.0) + element.weight
+            if polygon.material_index < len(obj.material_slots):
+                slot_material = obj.material_slots[polygon.material_index].material
+                material = slot_material.name if slot_material else None
+        part = protocol.face_part(weights, material, material_count)
+
         piece_faces = None
         if face is not None and len(faces) <= protocol.MAX_PIECE_FACES:
             piece_faces = protocol.linked_face_count(faces, face)
