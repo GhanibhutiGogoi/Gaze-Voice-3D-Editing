@@ -28,7 +28,7 @@ Every unit shows its real state on this Mac. Nothing installs, records audio or 
 1. **Blender:** *Install Blender* (Homebrew), then *Launch*. Launch turns on online access, which the MCP add-on needs to start.
 2. **Blender MCP add-on:** *Install add-on* downloads Blender Lab's official add-on (v1.0.3). After installing, quit Blender and *Launch* it again.
 3. **Blender MCP server:** *Install server* downloads Blender Lab's server and installs its packages with `uv`. *Test* lists its tools and, if Blender is open, reads the scene.
-4. **GazeVoice Bridge:** *Install add-on* adds our small Blender add-on (v0.2.0). It gives Blender the hold-to-talk key and a GazeVoice tab in the sidebar, shares your selection, and shows a status line in the viewport. If you installed an older version, the unit says *Update add-on*. Restart Blender after installing or updating.
+4. **GazeVoice Bridge:** *Install add-on* adds our small Blender add-on (v0.3.0). It gives Blender the hold-to-talk key and a GazeVoice tab in the sidebar, shares your selection, and shows a status line in the viewport. If you installed an older version, the unit says *Update add-on*. Restart Blender after installing or updating.
 5. **Speech-to-text:** *Install* sets up Parakeet (or Whisper, chosen in Routing) in its own Python environment and downloads the model. *Test* transcribes a clip spoken by macOS.
 6. **Microphone:** *Test* records 3 seconds. If it hears silence, allow the app you started GazeVoice from in System Settings › Privacy & Security › Microphone.
 7. **Claude Code / Codex:** detected automatically, using whatever login they already have. GazeVoice never asks for a key for these two. *Test* and *Connect to Blender* each spend a little of your plan.

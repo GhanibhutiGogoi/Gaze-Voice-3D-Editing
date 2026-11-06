@@ -7,18 +7,27 @@
 - Shows GazeVoice's status at the bottom-left of every 3D viewport and in the
   sidebar's "GazeVoice" tab.
 - Lets the app add one undo step per voice command, and undo or redo by voice.
+- Answers what is under a point in the largest 3D viewport and what part of the model
+  that is, draws the app's gaze dot, ring and numbered marks there, and while the key is
+  held reports the mouse as a stand-in for gaze. None of that edits the scene.
 
 Listens on 127.0.0.1 only. A bpy timer polls a non-blocking socket, so all
-scene access happens on Blender's main thread. Later, gaze plugs in here.
+scene access happens on Blender's main thread.
 """
 
 from __future__ import annotations
 
+import math
 import socket
 import time
 
 import blf
 import bpy
+import gpu
+from bpy_extras import view3d_utils
+from gpu_extras.batch import batch_for_shader
+from mathutils import Matrix, Vector
+from mathutils.bvhtree import BVHTree
 
 from . import protocol
 
@@ -40,6 +49,13 @@ STATE_COLORS = {
     "error": (1.0, 0.40, 0.35, 1.0),
 }
 STATE_ICONS = {"idle": "INFO", "listening": "REC", "working": "TIME", "done": "CHECKMARK", "error": "ERROR"}
+GAZE_COLOR = (0.40, 0.72, 1.0, 0.95)  # the dot and the ring
+MARK_COLOR = (1.0, 0.80, 0.25, 1.0)  # a numbered mark's disc
+MARK_TEXT_COLOR = (0.08, 0.08, 0.08, 1.0)
+DOT_RADIUS = 7  # pixels
+MARK_RADIUS = 12
+RING_WIDTH = 2.5
+CIRCLE_STEPS = 48
 
 _server: socket.socket | None = None
 _clients: dict[socket.socket, bytearray] = {}
@@ -47,6 +63,7 @@ _events = protocol.EventQueue()
 _status = {"text": "", "state": "idle", "last": "", "at": 0.0}
 _changed = {"since_mark": True}
 _shown = {"status": False, "live": False}  # what the viewport and sidebar last showed
+_gaze = {"dot": None, "ring": None, "marks": []}  # what the app asked to have drawn
 _draw_handle = None
 _addon_keymaps: list = []
 
@@ -111,6 +128,44 @@ def _run_op(op, **kwargs) -> bool:
     return "FINISHED" in result
 
 
+def _target():
+    """(window, area, main region) of the 3D viewport gaze looks at, or None.
+
+    It is the largest VIEW_3D area in the first window, and the first of equals, so it is the same one every time.
+    """
+    windows = bpy.context.window_manager.windows
+    best = None
+    for area in windows[0].screen.areas if windows else ():
+        region = next((r for r in area.regions if r.type == "WINDOW"), None) if area.type == "VIEW_3D" else None
+        if region is None or region.width <= 0 or region.height <= 0:
+            continue
+        if best is None or area.width * area.height > best[1].width * best[1].height:
+            best = (windows[0], area, region)
+    return best
+
+
+def _mirrored_points(obj, local: Vector) -> list[Vector]:
+    """`local` (a point in obj's space) and where it lands reflected across the planes of obj's Mirror modifiers,
+    in every combination: a mirrored copy of the mesh is where the evaluated surface is, not the original's."""
+    points = [local]
+    for modifier in obj.modifiers:
+        if modifier.type != "MIRROR" or not modifier.show_viewport:
+            continue
+        # the planes pass through the origin of the mirror object, else of obj itself
+        into = Matrix.Identity(4)
+        if modifier.mirror_object is not None:
+            into = modifier.mirror_object.matrix_world.inverted() @ obj.matrix_world
+        back = into.inverted()
+        for axis in range(3):
+            if not modifier.use_axis[axis]:
+                continue
+            for point in list(points):
+                flipped = into @ point
+                flipped[axis] = -flipped[axis]
+                points.append(back @ flipped)
+    return points
+
+
 class BpyScene:
     """protocol.SceneAccess backed by the live Blender session."""
 
@@ -170,6 +225,83 @@ class BpyScene:
 
     def mark_unchanged(self) -> None:
         _changed["since_mark"] = False
+
+    def gaze_view(self) -> tuple[int, int] | None:
+        target = _target()
+        return (target[2].width, target[2].height) if target else None
+
+    def gaze_pick(self, points: list[tuple[float, float]]) -> list[dict | None] | None:
+        target = _target()
+        if target is None:
+            return None
+        _window, area, region = target
+        region_3d = area.spaces.active.region_3d
+        scene = bpy.context.scene
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        hits = []
+        for u, v in points:
+            coord = (u * region.width, (1.0 - v) * region.height)
+            origin = view3d_utils.region_2d_to_origin_3d(region, region_3d, coord)
+            direction = view3d_utils.region_2d_to_vector_3d(region, region_3d, coord)
+            hit, location, _normal, _face, obj, _matrix = scene.ray_cast(depsgraph, origin, direction)
+            if not hit or obj is None:
+                hits.append(None)
+                continue
+            original = obj.original
+            hits.append({
+                "uid": original.session_uid,
+                "name": original.name,
+                "faces": len(original.data.polygons) if original.type == "MESH" else 0,
+                "point": [round(c, 6) for c in location],
+            })
+        return hits
+
+    def gaze_piece(self, uid: int, point: tuple[float, float, float]) -> dict | None:
+        obj = next((o for o in bpy.data.objects if o.session_uid == uid), None)
+        if obj is None or obj.type != "MESH":
+            return None
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        world = Vector(point)
+        mesh = obj.data
+        material_count = sum(1 for slot in obj.material_slots if slot.material)
+
+        # The face you see: nearest point on the evaluated mesh, so a mirrored wing reads Wing.R.
+        evaluated = obj.evaluated_get(depsgraph)
+        _found, _location, _normal, seen = evaluated.closest_point_on_mesh(
+            evaluated.matrix_world.inverted() @ world, depsgraph=depsgraph)
+        weights: dict[str, float] = {}
+        material = None
+        seen_mesh = evaluated.data
+        if 0 <= seen < len(seen_mesh.polygons):
+            polygon = seen_mesh.polygons[seen]
+            for index in polygon.vertices:
+                for element in seen_mesh.vertices[index].groups:
+                    name = evaluated.vertex_groups[element.group].name
+                    weights[name] = weights.get(name, 0.0) + element.weight
+            if polygon.material_index < len(obj.material_slots):
+                slot_material = obj.material_slots[polygon.material_index].material
+                material = slot_material.name if slot_material else None
+        part = protocol.face_part(weights, material, material_count)
+
+        # The original face, which the modifiers renumber: nearest point on the cage.
+        faces = [tuple(polygon.vertices) for polygon in mesh.polygons]
+        face = None
+        if faces:
+            cage = BVHTree.FromPolygons([vertex.co.copy() for vertex in mesh.vertices], faces)
+            nearest = None
+            for candidate in _mirrored_points(obj, obj.matrix_world.inverted() @ world):
+                found = cage.find_nearest(candidate)
+                if found[2] is not None and (nearest is None or found[3] < nearest[3]):
+                    nearest = found
+            face = nearest[2] if nearest else None
+        piece_faces = None
+        if face is not None and len(faces) <= protocol.MAX_PIECE_FACES:
+            piece_faces = protocol.linked_face_count(faces, face)
+        return {"face": face, "part": part, "piece_faces": piece_faces, "object_faces": len(faces)}
+
+    def gaze_show(self, dot: list | None, ring: list | None, marks: list[dict]) -> None:
+        _gaze.update(dot=dot, ring=ring, marks=marks)
+        _redraw()
 
 
 # --- socket server ----------------------------------------------------------------
@@ -267,6 +399,17 @@ def _voice_ready(operator) -> bool:
     return True
 
 
+def _pointer_uv(context, event) -> tuple[float, float] | None:
+    """Where the mouse is across the gaze viewport, 0 to 1 from the top left; None when it is anywhere else."""
+    target = _target()
+    if target is None or context.window != target[0]:
+        return None
+    region = target[2]
+    u = (event.mouse_x - region.x) / region.width
+    v = 1.0 - (event.mouse_y - region.y) / region.height
+    return (u, v) if 0.0 <= u <= 1.0 and 0.0 <= v <= 1.0 else None
+
+
 class GAZEVOICE_OT_push_to_talk(bpy.types.Operator):
     """Hold to talk to GazeVoice; release to send. Esc cancels"""
 
@@ -294,6 +437,10 @@ class GAZEVOICE_OT_push_to_talk(bpy.types.Operator):
             return {"CANCELLED"}
         if event.type == self._key:
             return {"RUNNING_MODAL"}  # swallow key repeats (Space would play the animation)
+        if event.type == "MOUSEMOVE":
+            position = _pointer_uv(context, event)
+            if position is not None:
+                _events.add_pointer(*position)  # the mouse stands in for gaze while the key is held
         return {"PASS_THROUGH"}
 
 
@@ -336,7 +483,69 @@ class GAZEVOICE_PT_panel(bpy.types.Panel):
         layout.label(text=f"Or hold {BpyScene().key_label()} anywhere")
 
 
+def _draw_shape(kind: str, points: list[tuple[float, float]], color: tuple, width: float = 0.0) -> None:
+    if width:
+        shader = gpu.shader.from_builtin("POLYLINE_UNIFORM_COLOR")
+        shader.uniform_float("viewportSize", gpu.state.viewport_get()[2:])
+        shader.uniform_float("lineWidth", width)
+    else:
+        shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+    shader.uniform_float("color", color)
+    batch_for_shader(shader, kind, {"pos": points}).draw(shader)
+
+
+def _ellipse(x: float, y: float, rx: float, ry: float) -> list[tuple[float, float]]:
+    angles = (2.0 * math.pi * i / CIRCLE_STEPS for i in range(CIRCLE_STEPS))
+    return [(x + rx * math.cos(a), y + ry * math.sin(a)) for a in angles]
+
+
+def _disc(x: float, y: float, radius: float) -> list[tuple[float, float]]:
+    """A filled circle as a triangle fan."""
+    rim = _ellipse(x, y, radius, radius)
+    return [(x, y)] + rim + [rim[0]]
+
+
+def _draw_gaze() -> None:
+    """The dot, ring and numbered marks, in the gaze viewport only and only while the app is there to clear them."""
+    if not (_gaze["dot"] or _gaze["ring"] or _gaze["marks"]) or not _events.live():
+        return
+    target, area = _target(), bpy.context.area
+    if target is None or area is None or target[1].as_pointer() != area.as_pointer():
+        return
+    width, height = bpy.context.region.width, bpy.context.region.height
+
+    def at(u: float, v: float) -> tuple[float, float]:
+        return u * width, (1.0 - v) * height  # pixels from the region's bottom left
+
+    gpu.state.blend_set("ALPHA")
+    if _gaze["ring"]:
+        u, v, ru, rv = _gaze["ring"]
+        _draw_shape("LINE_LOOP", _ellipse(*at(u, v), ru * width, rv * height), GAZE_COLOR, RING_WIDTH)
+    if _gaze["dot"]:
+        x, y = at(*_gaze["dot"])
+        _draw_shape("TRI_FAN", _disc(x, y, DOT_RADIUS), GAZE_COLOR)
+    font = 0
+    blf.size(font, 14)
+    for mark in _gaze["marks"]:
+        x, y = at(mark["u"], mark["v"])
+        _draw_shape("TRI_FAN", _disc(x, y, MARK_RADIUS), MARK_COLOR)
+        number = str(mark["n"])
+        text_width, text_height = blf.dimensions(font, number)
+        blf.color(font, *MARK_TEXT_COLOR)
+        blf.position(font, x - text_width / 2, y - text_height / 2, 0)
+        blf.draw(font, number)
+        if mark["name"]:
+            blf.enable(font, blf.SHADOW)
+            blf.shadow(font, 3, 0.0, 0.0, 0.0, 0.8)
+            blf.color(font, *MARK_COLOR)
+            blf.position(font, x + MARK_RADIUS + 6, y - text_height / 2, 0)
+            blf.draw(font, mark["name"])
+            blf.disable(font, blf.SHADOW)
+    gpu.state.blend_set("NONE")
+
+
 def _draw_status() -> None:
+    _draw_gaze()
     if not _status_visible():
         return
     text = _status["text"]
@@ -388,6 +597,7 @@ def register() -> None:
 def unregister() -> None:
     global _draw_handle
     _stop_server()
+    _gaze.update(dot=None, ring=None, marks=[])
     _unregister_keymap()
     if _on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph_update)

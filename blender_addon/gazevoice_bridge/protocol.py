@@ -3,7 +3,7 @@
 Newline-delimited JSON over a local TCP socket. This module never imports bpy,
 so it can be tested outside Blender.
 
-    {"cmd": "ping"}                -> {"ok": true, "bridge": "0.2.0", "blender": "5.2.2", "key": "⌥ Space"}
+    {"cmd": "ping"}                -> {"ok": true, "bridge": "0.3.0", "blender": "5.2.2", "key": "⌥ Space"}
     {"cmd": "selection"}           -> {"ok": true, "active": "Cube", "selected": ["Cube"], "mode": "OBJECT"}
     {"cmd": "status", "text": "…", -> {"ok": true}   (shown in the 3D viewport and sidebar)
      "state": "listening"}
@@ -19,23 +19,55 @@ so it can be tested outside Blender.
     {"cmd": "undo"} / {"cmd": "redo"} -> {"ok": true}
         Undo operations answer {"ok": false, "error": "busy"} while another modal operator
         (say, a G/R/S transform) runs; the app tries again a moment later.
+
+Gaze. The target is the largest 3D viewport in the first window. "u, v" are 0 to 1 across it, from the
+top left. Nothing here edits the scene.
+    {"cmd": "gaze_view"}           -> {"ok": true, "width": 1840, "height": 1100}
+                                      or {"ok": false, "error": "no 3D viewport"}
+    {"cmd": "gaze_pick",           -> {"ok": true, "hits": [{"uid": 116, "name": "Eagle", "faces": 5120,
+     "points": [[u, v], …]}                                   "point": [x, y, z]} or null, …]}
+        One hit per point, in order; null is a miss. "uid" identifies the object for as long as Blender
+        runs (names are only for people), "faces" counts the original mesh's faces, "point" is in world
+        space. At most MAX_POINTS points, each inside the viewport.
+    {"cmd": "gaze_piece", "uid": 116, "point": [x, y, z]}
+                                   -> {"ok": true, "face": 3120, "part": "Wing.L" or null,
+                                       "piece_faces": 480 or null, "object_faces": 5120}
+        What part of the model the world-space point on object "uid" is. "face" is the ORIGINAL
+        mesh's face (modifiers renumber faces, and edits change the original); it is null only when
+        the original mesh has no faces, say because Geometry Nodes makes them all. "part" is read off the
+        face you SEE, so a mirrored wing reads "Wing.R": the vertex group with the most weight, else the
+        material name when the object has two or more, else null. "piece_faces" is how many faces
+        connect to that face through shared vertices, null above MAX_PIECE_FACES.
+    {"cmd": "gaze_show", "dot": [u, v] or null, "ring": [u, v, ru, rv] or null,
+     "marks": [{"n": 1, "u": 0.4, "v": 0.3, "name": "Chair"}]}      -> {"ok": true}
+        Draws in the target viewport (a null/empty field draws nothing). "ru, rv" are the ring's radii
+        as shares of the viewport's width and height.
+    While the push-to-talk key is held, "poll" also carries the mouse as a stand-in for gaze, at most
+    MAX_POINTER_RATE a second:
+        {"seq": 14, "type": "pointer", "u": 0.4, "v": 0.3, "t": …}
 """
 
 from __future__ import annotations
 
 import json
+import math
 import secrets
 import time
 from typing import Callable, Protocol
 
 BRIDGE_PORT = 9877
-BRIDGE_VERSION = "0.2.0"
+BRIDGE_VERSION = "0.3.0"
 MAX_STATUS = 200
 MAX_NAMES = 300
 MAX_LINE = 64 * 1024
 MAX_EVENTS = 100
 MAX_UNDO_NAME = 63  # Blender keeps 64 bytes of an undo step's name, the closing NUL included
 LIVE_SECONDS = 3.0  # polled this recently means the app's voice loop is on
+MAX_POINTS = 64  # rays in one gaze_pick
+MAX_PIECE_FACES = 200000  # above this many faces, counting a piece is skipped so a huge mesh can't freeze Blender
+MAX_MARKS = 20
+MAX_MARK_NAME = 40
+MAX_POINTER_RATE = 20  # pointer events a second, at most
 STATUS_STATES = ("idle", "listening", "working", "done", "error")
 INVALID = {"cmd": "__invalid__"}
 _KEY_NAMES = {"SPACE": "Space", "RET": "Return", "ESC": "Esc", "TAB": "Tab", "BACK_SPACE": "Delete"}
@@ -68,6 +100,17 @@ class SceneAccess(Protocol):
 
     def mark_unchanged(self) -> None: ...
 
+    def gaze_view(self) -> tuple[int, int] | None:
+        """The target viewport's (width, height) in pixels, or None when there is no 3D viewport."""
+
+    def gaze_pick(self, points: list[tuple[float, float]]) -> list[dict | None] | None:
+        """One hit (uid, name, faces, point) or None for each (u, v); None when there is no 3D viewport."""
+
+    def gaze_piece(self, uid: int, point: tuple[float, float, float]) -> dict | None:
+        """face, part, piece_faces and object_faces, or None when no mesh object has this uid."""
+
+    def gaze_show(self, dot: list | None, ring: list | None, marks: list[dict]) -> None: ...
+
 
 class EventQueue:
     """Hold-to-talk events waiting for the app to poll them."""
@@ -78,12 +121,25 @@ class EventQueue:
         self.clock = clock
         self.last_poll = 0.0
         self._seq = 0
+        self._last_pointer = -math.inf
         self._events: list[dict] = []
 
     def add(self, event_type: str, **fields) -> None:
         self._seq += 1
         self._events.append({"seq": self._seq, "type": event_type, "t": self.clock(), **fields})
-        del self._events[:-self.limit]
+        while len(self._events) > self.limit:
+            # Mouse positions are a stream: shed the oldest of those before a hold's down or up.
+            oldest_pointer = next((i for i, event in enumerate(self._events) if event["type"] == "pointer"), 0)
+            del self._events[oldest_pointer]
+
+    def add_pointer(self, u: float, v: float) -> bool:
+        """Queue where the mouse is, unless one was queued less than 1/MAX_POINTER_RATE seconds ago."""
+        now = self.clock()
+        if now - self._last_pointer < 1 / MAX_POINTER_RATE:
+            return False
+        self._last_pointer = now
+        self.add("pointer", u=u, v=v)
+        return True
 
     def poll(self, ack: int | None) -> list[dict]:
         self.last_poll = self.clock()
@@ -111,6 +167,41 @@ def key_label(key_type: str, ctrl: bool = False, alt: bool = False, shift: bool 
     mods = "".join(sym for on, sym in ((ctrl, "⌃"), (alt, "⌥"), (shift, "⇧"), (oskey, "⌘")) if on)
     name = _KEY_NAMES.get(key_type) or key_type.replace("_", " ").title()
     return f"{mods} {name}" if mods else name
+
+
+def linked_face_count(faces: list[list[int]], start: int) -> int:
+    """How many faces connect to face `start` through shared vertices, itself included. 0 if there is no such face."""
+    if not 0 <= start < len(faces):
+        return 0
+    by_vertex: dict[int, list[int]] = {}
+    for index, face in enumerate(faces):
+        for vertex in face:
+            by_vertex.setdefault(vertex, []).append(index)
+    seen = {start}
+    visited_vertices: set[int] = set()
+    stack = [start]
+    while stack:
+        for vertex in faces[stack.pop()]:
+            if vertex in visited_vertices:
+                continue
+            visited_vertices.add(vertex)
+            for other in by_vertex[vertex]:
+                if other not in seen:
+                    seen.add(other)
+                    stack.append(other)
+    return len(seen)
+
+
+def face_part(weights: dict[str, float], material: str | None = None, material_count: int = 0) -> str | None:
+    """The part of the model a face belongs to: the vertex group with the most weight on it (`weights` is the
+    summed weight per group), else the face's material when the object has two or more, else None."""
+    best, best_weight = None, 0.0
+    for name, weight in weights.items():
+        if weight > best_weight:
+            best, best_weight = name, weight
+    if best is not None:
+        return best
+    return material if material_count >= 2 else None
 
 
 def decode_lines(buffer: bytearray) -> list[dict]:
@@ -183,4 +274,81 @@ def handle(request: dict, scene: SceneAccess, events: EventQueue) -> dict:
         if scene.busy():
             return {"ok": False, "error": "busy"}
         return {"ok": bool(scene.undo() if command == "undo" else scene.redo())}
+    if command == "gaze_view":
+        view = scene.gaze_view()
+        if view is None:
+            return _no_viewport()
+        return {"ok": True, "width": view[0], "height": view[1]}
+    if command == "gaze_pick":
+        return _gaze_pick(request.get("points"), scene)
+    if command == "gaze_piece":
+        return _gaze_piece(request.get("uid"), request.get("point"), scene)
+    if command == "gaze_show":
+        return _gaze_show(request, scene)
     return {"ok": False, "error": "unknown command"}
+
+
+def _no_viewport() -> dict:
+    return {"ok": False, "error": "no 3D viewport"}
+
+
+def _real(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _unit(value) -> bool:
+    """A number from 0 to 1. NaN and infinity are not."""
+    return _real(value) and 0.0 <= value <= 1.0
+
+
+def _gaze_pick(points, scene: SceneAccess) -> dict:
+    if not isinstance(points, list) or not all(
+        isinstance(p, (list, tuple)) and len(p) == 2 and all(_real(c) for c in p) for p in points
+    ):
+        return {"ok": False, "error": "points must be a list of [u, v] pairs"}
+    if len(points) > MAX_POINTS:
+        return {"ok": False, "error": f"at most {MAX_POINTS} points"}
+    if not all(_unit(u) and _unit(v) for u, v in points):
+        return {"ok": False, "error": "points must be inside the viewport (0 to 1)"}
+    hits = scene.gaze_pick([(float(u), float(v)) for u, v in points])
+    if hits is None:
+        return _no_viewport()
+    return {"ok": True, "hits": hits}
+
+
+def _gaze_piece(uid, point, scene: SceneAccess) -> dict:
+    if not isinstance(uid, int) or isinstance(uid, bool):
+        return {"ok": False, "error": "uid must be an integer"}
+    if not (isinstance(point, (list, tuple)) and len(point) == 3 and all(_real(c) and math.isfinite(c) for c in point)):
+        return {"ok": False, "error": "point must be [x, y, z]"}
+    piece = scene.gaze_piece(uid, (float(point[0]), float(point[1]), float(point[2])))
+    if piece is None:
+        return {"ok": False, "error": "no such mesh object"}
+    return {"ok": True, **piece}
+
+
+def _gaze_show(request: dict, scene: SceneAccess) -> dict:
+    dot, ring, marks = request.get("dot"), request.get("ring"), request.get("marks", [])
+    if dot is not None and not (isinstance(dot, (list, tuple)) and len(dot) == 2 and all(_unit(c) for c in dot)):
+        return {"ok": False, "error": "dot must be [u, v] or null"}
+    if ring is not None and not (isinstance(ring, (list, tuple)) and len(ring) == 4 and all(_unit(c) for c in ring)):
+        return {"ok": False, "error": "ring must be [u, v, ru, rv] or null"}
+    if marks is None:
+        marks = []
+    if not isinstance(marks, list) or not all(isinstance(m, dict) for m in marks):
+        return {"ok": False, "error": "marks must be a list of {n, u, v, name}"}
+    if len(marks) > MAX_MARKS:
+        return {"ok": False, "error": f"at most {MAX_MARKS} marks"}
+    clean = []
+    for mark in marks:
+        n, name = mark.get("n"), mark.get("name", "")
+        if not (isinstance(n, int) and not isinstance(n, bool) and _unit(mark.get("u")) and _unit(mark.get("v"))
+                and isinstance(name, str)):
+            return {"ok": False, "error": "marks must be a list of {n, u, v, name}"}
+        clean.append({"n": n, "u": float(mark["u"]), "v": float(mark["v"]), "name": name[:MAX_MARK_NAME]})
+    scene.gaze_show(
+        None if dot is None else [float(c) for c in dot],
+        None if ring is None else [float(c) for c in ring],
+        clean,
+    )
+    return {"ok": True}
