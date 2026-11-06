@@ -1436,7 +1436,8 @@ class GazeVoiceTest(VoiceTestBase):
                 raise RuntimeError("no track")
 
         self.gaze = BrokenTrack()
-        record = self.run_gaze("on", look=False)
+        with contextlib.redirect_stderr(io.StringIO()):
+            record = self.run_gaze("on", look=False)
         self.assertEqual(record["stage"], "done", record["error"])
         self.assertEqual(record["_gaze_note"], "Gaze lost, using your selection")
 

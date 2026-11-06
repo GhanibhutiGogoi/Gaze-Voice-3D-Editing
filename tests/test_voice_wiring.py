@@ -18,7 +18,7 @@ from gazevoice.voice.gaze_tracker import GazeError, GazeTracker
 from gazevoice.components.brains import CLAUDE_ISOLATION
 from gazevoice.voice.brains import claude_session_argv
 from gazevoice.voice.picture import PICTURE_MODEL, PICTURE_RULES, Describer
-from gazevoice.voice.service import PointerTracker
+from gazevoice.voice.service import PointerTracker, VoiceError
 from gazevoice.voice.wiring import build_voice, voice_readiness
 
 from .helpers import TempCtx
@@ -330,6 +330,27 @@ class BuildVoiceTest(unittest.TestCase):
                              "unity": dict(host="unity", gaze_mode="on", gaze_source="camera")}.items():
             with self.subTest(name):
                 self.assertIsNone(self.gaze_voice(**chosen).camera)
+
+    def test_voice_that_doesnt_use_the_camera_starts_during_a_calibrate_and_leaves_the_claim_alone(self):
+        self.set_up_gaze()
+        self.t.ctx.camera.take("gaze")
+        for name, chosen in {"gaze off": dict(gaze_mode="off"), "the mouse": dict(gaze_mode="on", gaze_source="mouse")}.items():
+            with self.subTest(name):
+                voice = self.gaze_voice(**chosen)
+                self.fake_parts(voice)
+                voice.start()
+                self.assertEqual(voice.state, "ready")
+                self.assertEqual(self.t.ctx.camera.holder, "gaze")
+                voice.stop()
+                self.assertEqual(self.t.ctx.camera.holder, "gaze")
+
+    def test_voice_that_uses_the_camera_still_waits_for_a_calibrate_and_says_why(self):
+        self.set_up_gaze()
+        self.t.ctx.camera.take("gaze")
+        voice = self.gaze_voice(gaze_mode="on", gaze_source="camera")
+        self.fake_parts(voice)
+        with self.assertRaisesRegex(VoiceError, "Gaze is using the camera"):
+            voice.start()
 
     def test_camera_gaze_that_isnt_set_up_makes_no_claim_either(self):
         self.assertIsNone(self.gaze_voice(gaze_mode="on", gaze_source="camera").camera)

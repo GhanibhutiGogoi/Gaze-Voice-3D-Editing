@@ -18,10 +18,10 @@ where the person looked. When a spoken command has a pointing word like "there",
 what was under that spot and, in "on" mode, tells the brains in the focus. When the guesses are too close to call,
 or the only one is very weak, the edit thread puts numbers on them in the viewport and waits for the person to say
 one; the stt thread keeps running, so the answer is heard. Gaze never edits anything, and whatever goes wrong with it,
-the command runs on the selection. A target that is a big stretch of mesh with nothing to name it can also be looked at closer, when
-the person has turned pictures on: a crop of the viewport goes from Blender's memory to one short-lived process that says
-in a few words what is inside the ring (see picture.py). Only that sentence joins the focus, and if anything about it
-fails or takes too long the command goes on without it.
+the command runs on the selection. A target that is a big stretch of mesh with nothing to name it can also be looked
+at closer, when the person has turned pictures on: a crop of the viewport goes from Blender's memory to one short-lived
+process that says in a few words what is inside the ring (see picture.py). Only that sentence joins the focus, and if
+anything about it fails or takes too long the command goes on without it.
 
 Everything a command did is kept in a record (shown on the dashboard, saved to
 logs/commands/<time>-<n>/record.json next to its audio).
@@ -630,7 +630,7 @@ class VoiceService:
                 self._listening = False
                 held = t - self._down_t
                 t0, t1 = self._down_t, min(t, self._down_t + MAX_HOLD)
-                if held >= MIN_HOLD:  # counted here, so that from the key coming up there is no moment it's unaccounted for
+                if held >= MIN_HOLD:  # counted now, so there is no moment after the key comes up when it's unaccounted for
                     self._clips_coming += 1
             else:
                 return
@@ -990,8 +990,8 @@ class VoiceService:
         """Copy where the person looked during this clip, before the command waits its turn.
 
         Edits can run for minutes, so the track may have moved on by the time this command reaches the edit thread.
-        The copy goes in a key that starts with an underscore, so it is never saved or shown, and it goes with the
-        command as soon as the command is over. Gaze never stops voice: with no copy, the command just has no gaze.
+        The copy goes in a key that starts with an underscore, so it is never saved or shown, and it is dropped as soon
+        as the command is over. Gaze never stops voice: with no copy, the command just has no gaze.
         """
         gaze = self._gaze
         clip_start = record["_t0"] - PREROLL  # the clip _transcribe cut starts here
@@ -1330,9 +1330,10 @@ class VoiceService:
 
         The answer goes in record["gaze"]. In "on" mode it also joins the focus the brains read, and guesses that aren't
         clear (see is_clear) are put to the person first (see _ask_which). Nothing here can stop a command: if gaze is
-        lost or breaks, or nobody says which one, the command runs on the selection. The one exception is that last case with
-        nothing selected. There is nothing to run it on, so the command fails and this returns False. A camera that was
-        calibrated on a differently sized viewport is treated like lost gaze, and the status line says to calibrate again.
+        lost or breaks, or nobody says which one, the command runs on the selection. The one exception is that last case
+        with nothing selected. There is nothing to run it on, so the command fails and this returns False. A camera that
+        was calibrated on a differently sized viewport is treated like lost gaze, and the status line says to calibrate
+        again.
         """
         gaze = self._gaze  # there is none when gaze is off, can't start, or has no camera part yet
         if gaze is None:
