@@ -151,14 +151,18 @@ def _gaze_detail(target: dict) -> str:
 def _describe_gaze(focus: dict) -> str:
     """One block for every pointing word: what it was said at, the guesses, and what is known about the best one.
 
-    A target's `at` is seconds into the spoken command. The first word's lines are led by the label, the
-    rest are indented under it.
+    A target's `at` is seconds into the spoken command. The first word's lines are led by the label, the rest are
+    indented under it. A word that looked at empty space gets a line saying so, in its place among the others.
     """
     gaze = focus["gaze"]
     lines = []
-    for number, target in enumerate(gaze["targets"]):
-        guesses = ", ".join(f"{c['name']} ({round(c['score'] * 100)}%)" for c in target["candidates"])
+    said = sorted([*gaze["targets"], *gaze.get("misses", [])], key=lambda word: word["at"])
+    for number, target in enumerate(said):
         lead, indent = ("Focus (gaze): ", "  ") if number == 0 else ("  ", "    ")
+        if "candidates" not in target:
+            lines.append(f'{lead}"{target["word"]}" at {target["at"]:.1f} s → nothing under the gaze')
+            continue
+        guesses = ", ".join(f"{c['name']} ({round(c['score'] * 100)}%)" for c in target["candidates"])
         lines.append(f'{lead}"{target["word"]}" at {target["at"]:.1f} s → {guesses}')
         detail = _gaze_detail(target)
         if detail:

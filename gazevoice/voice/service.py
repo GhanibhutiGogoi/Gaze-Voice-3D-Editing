@@ -1375,8 +1375,8 @@ class VoiceService:
             record["_gaze_note"] = NO_ANSWER
             return True
         # The brains read how long into the command each word was said, not the clock time.
-        targets = [{**t, "at": t["at"] - clip_start} for t in found["targets"]]
-        record["focus"] = {**(record["focus"] or {}), "gaze": {**found, "targets": targets}}
+        targets, misses = ([{**t, "at": t["at"] - clip_start} for t in found[key]] for key in ("targets", "misses"))
+        record["focus"] = {**(record["focus"] or {}), "gaze": {**found, "targets": targets, "misses": misses}}
         return True
 
     def _refine(self, record: dict, run: _Run):

@@ -423,6 +423,35 @@ class GroundTest(unittest.TestCase):
         self.assertEqual(grounding.status, "resolved")
         self.assertEqual([c.name for c in self.pieces], ["Chair", "Table"])
 
+    def this_and_there(self, pick):
+        words = said(("move", 0.0, 0.3), ("this", 0.4, 0.6), ("over", 0.7, 0.9), ("there", 1.0, 1.3))
+        track = track_of(*steady(100.0, 0.2, 0.3, count=6), *steady(101.0, 0.8, 0.7, count=6))
+        return ground(words, self.CLIP, track, DEFAULT_RADIUS, pick, self.piece)
+
+    def test_a_word_whose_rays_all_hit_nothing_is_noted(self):
+        grounding = self.this_and_there(
+            lambda points: votes((CHAIR, 22), rays=len(points)) if points[0][0] < 0.5 else [None] * len(points))
+        self.assertEqual([t.word for t in grounding.targets], ["this"])
+        self.assertEqual(grounding.status, "resolved")  # empty space needs no question
+        self.assertEqual([m.word for m in grounding.misses], ["there"])
+        self.assertAlmostEqual(grounding.misses[0].at, 101.0)
+
+    def test_every_word_missing_is_no_gaze_to_go_on_and_still_noted(self):
+        grounding = self.this_and_there(lambda points: [None] * len(points))
+        self.assertEqual((grounding.status, grounding.targets), ("none", []))
+        self.assertEqual([m.word for m in grounding.misses], ["this", "there"])
+
+    def test_a_word_with_no_gaze_to_go_on_is_not_a_miss(self):
+        grounding = self.look([(CHAIR, 20)], track=GazeTrack())
+        self.assertEqual((grounding.status, grounding.misses), ("none", []))
+
+    def test_blender_being_unable_to_say_is_not_a_miss(self):
+        grounding = self.this_and_there(lambda points: None)
+        self.assertEqual((grounding.status, grounding.misses), ("none", []))
+
+    def test_a_hit_is_not_a_miss(self):
+        self.assertEqual(self.look([(CHAIR, 20)]).misses, [])
+
     def test_one_unclear_target_makes_the_whole_thing_unclear(self):
         words = said(("this", 0.4, 0.6), ("there", 1.0, 1.3))
         track = track_of(*steady(100.0, 0.2, 0.3, count=6), *steady(101.0, 0.8, 0.7, count=6))
@@ -531,7 +560,7 @@ class ToDictTest(unittest.TestCase):
 
     def test_no_gaze_still_says_so(self):
         data = ground([], 0.0, GazeTrack(), DEFAULT_RADIUS, lambda p: None, lambda c: None).to_dict()
-        self.assertEqual(data, {"status": "none", "targets": [], "radius": list(DEFAULT_RADIUS)})
+        self.assertEqual(data, {"status": "none", "targets": [], "radius": list(DEFAULT_RADIUS), "misses": []})
         self.assertEqual(json.loads(json.dumps(data)), data)
 
     def test_changing_the_dict_leaves_the_grounding_alone(self):

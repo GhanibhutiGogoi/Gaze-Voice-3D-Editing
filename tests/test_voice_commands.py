@@ -207,6 +207,38 @@ class EditorMessageTest(unittest.TestCase):
             text = describe_focus(gaze_focus({**gaze_target(), "picture": nothing}))
             self.assertNotIn("picture", text)
 
+    def with_a_miss(self, *targets, word="there", at=1.2):
+        focus = gaze_focus(*targets)
+        focus["gaze"]["misses"] = [{"word": word, "at": at}]
+        return focus
+
+    def test_a_word_that_looked_at_empty_space_gets_its_own_line(self):
+        text = describe_focus(self.with_a_miss(gaze_target("this", 0.4, [candidate("Chair", 0.9)])))
+        lines = text.splitlines()
+        self.assertEqual(lines[0], 'Focus (gaze): "this" at 0.4 s → Chair (90%)')
+        self.assertIn('  "there" at 1.2 s → nothing under the gaze', lines)
+        self.assertTrue(lines[-1].startswith("  gaze is accurate"))
+
+    def test_the_lines_keep_the_order_the_words_were_said_in(self):
+        text = describe_focus(self.with_a_miss(gaze_target("this", 1.2, [candidate("Chair", 0.9)]), at=0.4))
+        lines = text.splitlines()
+        self.assertEqual(lines[0], 'Focus (gaze): "there" at 0.4 s → nothing under the gaze')
+        self.assertEqual(lines[1], '  "this" at 1.2 s → Chair (90%)')
+
+    def test_empty_space_gives_no_point_and_no_guess_of_one(self):
+        line = next(l for l in describe_focus(self.with_a_miss(gaze_target("this", 0.4))).splitlines() if "nothing" in l)
+        self.assertNotIn("point", line)
+        self.assertNotIn("(", line)
+
+    def test_the_refiner_reads_the_same_line(self):
+        focus = self.with_a_miss(gaze_target("this", 0.4, [candidate("Chair", 0.9)]))
+        self.assertIn('"there" at 1.2 s → nothing under the gaze', json.loads(refiner_message("put this there", focus, [], []))["gaze"])
+
+    def test_focus_without_any_note_of_misses_reads_as_it_did(self):
+        focus = gaze_focus(gaze_target("this", 0.4, [candidate("Chair", 0.9)]))
+        self.assertNotIn("misses", focus["gaze"])
+        self.assertNotIn("nothing under", describe_focus(focus))
+
     def test_the_gaze_text_says_which_mode_blender_is_in(self):
         for mode in ("EDIT", "OBJECT"):
             text = describe_focus({**gaze_focus(gaze_target()), "mode": mode})

@@ -2096,6 +2096,26 @@ class GazeChoiceTest(VoiceTestBase):
         self.assertEqual(self.bridge.undos, 1)
         self.assertEqual(spoken["gaze"]["targets"][0]["candidates"][0]["name"], "Perch")
 
+    def looking_at_empty_space_for_there(self):
+        self.stt = FakeStt(["move this over there"], words=THIS_AND_THERE)
+        self.refiner = FakeSession([TurnResult(json.dumps({"kind": "command", "text": "Move this over there."}), False)])
+        self.bridge.pick_reply = lambda points: [EAGLE] * len(points) if points[0][0] < 0.5 else [None] * len(points)
+        self.start(look=False)
+        self.gaze.look(0.2, 0.3, start=1001.7, count=7)  # for "this", which is said 0.5 s in
+        self.gaze.look(0.8, 0.7, start=1002.6, count=8)  # for "there", 1 s in
+
+    def test_a_word_that_looked_at_empty_space_is_noted_for_the_editor(self):
+        self.looking_at_empty_space_for_there()
+        record = self.speak()
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertEqual(self.labelled(), [])  # nothing to ask about
+        lines = self.editor.sent[0].splitlines()
+        self.assertEqual(lines[2], 'Focus (gaze): "this" at 0.5 s → Eagle (100%)')
+        self.assertIn('  "there" at 1.0 s → nothing under the gaze', lines)
+        self.assertIn('"there" at 1.0 s → nothing under the gaze', json.loads(self.refiner.sent[0])["gaze"])
+        self.assertEqual([m["word"] for m in record["gaze"]["misses"]], ["there"])
+        self.assertEqual(len(self.bridge.pieces), 1)  # the Eagle's: empty space has no piece, and no 3D point
+
     def test_each_unclear_word_is_asked_in_order(self):
         self.stt = FakeStt(["move this there", "two", "one"], words=THIS_AND_THERE)
         self.start()

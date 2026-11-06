@@ -12,7 +12,7 @@ import statistics
 import threading
 import unicodedata
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Callable, Sequence
 
 POINTING_WORDS = ("this", "that", "these", "those", "it", "them", "here", "there")
@@ -265,19 +265,29 @@ class Target:
 
 
 @dataclass
+class Miss:
+    """A pointing word said while the eyes had settled on empty space: every ray missed, so there's no 3D point."""
+
+    word: str
+    at: float
+
+
+@dataclass
 class Grounding:
     """What the pointing words in a sentence refer to.
 
     `status` is "resolved" when every target has a clear winner, "clarify" when some target needs the user to
-    choose, and "none" when there is no gaze to go on.
+    choose, and "none" when there is no gaze to go on. `misses` are the words that looked at nothing at all.
     """
 
     status: str
     targets: list[Target]
     radius: tuple[float, float]
+    misses: list[Miss] = field(default_factory=list)
 
     def to_dict(self) -> dict:
-        return {"status": self.status, "targets": [t.to_dict() for t in self.targets], "radius": list(self.radius)}
+        return {"status": self.status, "targets": [t.to_dict() for t in self.targets], "radius": list(self.radius),
+                "misses": [asdict(m) for m in self.misses]}
 
 
 def is_clear(target: Target) -> bool:
@@ -304,12 +314,13 @@ def ground(
 
     For each one, the gaze from BEFORE_WORD before it starts to AFTER_WORD after it ends is settled into a
     fixation, `pick` is asked what the rays across the patch hit, and the top guess is looked at closer with
-    `piece`. A word that has no gaze, or whose rays hit nothing, gets no target. `pick` returns None when it
-    couldn't ask. A `piece` that returns None or can't reach Blender (OSError or ValueError) still leaves
-    the object as a guess, with `piece=None`.
+    `piece`. A word that has no gaze gets no target, and one whose rays all hit nothing gets a Miss in its place.
+    `pick` returns None when it couldn't ask. A `piece` that returns None or can't reach Blender (OSError or
+    ValueError) still leaves the object as a guess, with `piece=None`.
     """
     radius = (float(radius[0]), float(radius[1]))
     targets = []
+    misses = []
     for word in pointing_words(words, clip_start):
         fixation = fixate(track.between(word.start - BEFORE_WORD, word.end + AFTER_WORD))
         if fixation is None:
@@ -320,6 +331,7 @@ def ground(
             continue
         candidates = score_hits(points, list(hits))
         if not candidates:
+            misses.append(Miss(word.text, word.start))
             continue
         try:
             looked_closer = piece(candidates[0])
@@ -327,5 +339,5 @@ def ground(
             looked_closer = None
         targets.append(Target(word.text, word.start, candidates, fixation, piece=looked_closer))
     if not targets:
-        return Grounding("none", [], radius)
-    return Grounding("resolved" if all(is_clear(t) for t in targets) else "clarify", targets, radius)
+        return Grounding("none", [], radius, misses)
+    return Grounding("resolved" if all(is_clear(t) for t in targets) else "clarify", targets, radius, misses)
