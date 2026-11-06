@@ -31,24 +31,35 @@ PERMISSION_HELP = (
     "(Terminal or your editor), then try again."
 )
 _DEVICE = re.compile(r"\]\s*\[(\d+)\]\s+(.+?)\s*$")
+_DEVICES_HEADER = re.compile(r"AVFoundation (audio|video) devices")
+_BUILT_IN_CAMERA = re.compile(r"(?=.*MacBook)(?=.*Camera)", re.IGNORECASE)
+_NOT_A_FACE_CAMERA = re.compile(r"desk view|capture screen", re.IGNORECASE)
 
 
-def parse_avfoundation_devices(listing: str) -> list[tuple[str, str]]:
-    """Audio inputs as (index, name), from `ffmpeg -f avfoundation -list_devices true` output."""
+def _devices_listed_under(listing: str, kind: str) -> list[tuple[str, str]]:
+    """The (index, name) lines under "AVFoundation <kind> devices:" in ffmpeg's listing."""
     devices: list[tuple[str, str]] = []
-    in_audio = False
+    listing_kind = None
     for line in listing.splitlines():
-        if "AVFoundation audio devices" in line:
-            in_audio = True
+        header = _DEVICES_HEADER.search(line)
+        if header:
+            listing_kind = header.group(1)
             continue
-        if "AVFoundation video devices" in line:
-            in_audio = False
-            continue
-        if in_audio:
+        if listing_kind == kind:
             match = _DEVICE.search(line)
             if match:
                 devices.append((match.group(1), match.group(2)))
     return devices
+
+
+def parse_avfoundation_devices(listing: str) -> list[tuple[str, str]]:
+    """Audio inputs as (index, name), from `ffmpeg -f avfoundation -list_devices true` output."""
+    return _devices_listed_under(listing, "audio")
+
+
+def parse_video_devices(listing: str) -> list[tuple[str, str]]:
+    """Cameras and screens as (index, name), from the same listing. The numbers are the ones `-i` takes."""
+    return _devices_listed_under(listing, "video")
 
 
 def pick_device(devices: list[tuple[str, str]], setting: str) -> tuple[str, str, bool] | None:
@@ -67,6 +78,23 @@ def pick_device(devices: list[tuple[str, str]], setting: str) -> tuple[str, str,
         if not _NOT_A_MIC.search(name):
             return index, name, True
     return (devices[0][0], devices[0][1], True) if devices else None
+
+
+def pick_camera(devices: list[tuple[str, str]], setting: str) -> tuple[str, str] | None:
+    """(index, name) of the camera to watch the face with; "" means auto. None if there is no such camera.
+
+    Auto prefers the MacBook's own camera, then the first device that isn't a Desk View camera or a screen.
+    A phone can be listed first, and nobody expects their phone's camera to be switched on.
+    A setting is a device index; it must still be in the list, because plugging things in renumbers it.
+    """
+    if setting:
+        names = dict(devices)
+        return (setting, names[setting]) if setting in names else None
+    usable = [(index, name) for index, name in devices if not _NOT_A_FACE_CAMERA.search(name)]
+    for index, name in usable:
+        if _BUILT_IN_CAMERA.search(name):
+            return index, name
+    return usable[0] if usable else None
 
 
 def wav_level_dbfs(path: Path) -> float:
