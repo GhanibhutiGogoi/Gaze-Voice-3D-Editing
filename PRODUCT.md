@@ -48,7 +48,7 @@ LLM 3D editing today works from the prompt alone. GazeVoice also passes focus co
   - Actions marked "uses your plan" spend Claude or Codex usage.
 - **Camera:** it's open only while voice is on with gaze turned on, and during a confirmed Calibrate or Test. Frames are processed on the Mac and aren't saved or sent.
 - **Pictures:** off by default. A picture of the Blender viewport (never the camera) goes only to Claude Code, and only after a check that it gets cleaned up has passed for the installed Claude Code version.
-- **Gaze is rough:** it can tell objects and big parts apart, not small details. When it isn't sure it numbers its guesses, and when it can't help the command uses the selection.
+- **Gaze is rough:** we expect it to tell objects and big parts apart, not small details. When it isn't sure it numbers its guesses, and when it can't help the command uses the selection.
 - **No key prompts:** it never asks for an API key.
 - **Self-contained:** the server uses only Python's standard library. The page uses no CDN and no web fonts, so it works offline.
 - **Scope:** personal use only.

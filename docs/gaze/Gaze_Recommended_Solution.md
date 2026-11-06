@@ -1,7 +1,7 @@
 # Recommended Gaze Solution for GazeVoice
 
 **Date:** 2026-11-06
-**Status:** Built for Blender on the branch `feature/gaze-blender`. Unity is not built. The real camera and voice checks are still to do.
+**Status:** Built for Blender. Unity is not built. The real camera and voice checks are still to do.
 **Scope:** Gaze grounding for Unity and Blender. This proposal does not replace current Unity Voice work and does not select a final gaze model.
 
 ## 1. Goals and Design Decisions
