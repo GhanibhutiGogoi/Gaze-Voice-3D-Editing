@@ -80,6 +80,22 @@ class PackageTest(unittest.TestCase):
             for name in re.findall(r"class (\w+)\s*:\s*EditorWindow", path.read_text()):
                 self.assertEqual(path.stem, name)
 
+    def test_calls_removed_in_newer_unity_only_compile_on_older_ones(self):
+        """Unity 6000.5 turned these into compile errors, which blocks the whole project."""
+        source = SOURCE.read_text()
+        newer, older = source.split("#else", 1)[0], source.split("#else", 1)[1].split("#endif", 1)[0]
+        self.assertEqual(source.count("#if UNITY_6000_5_OR_NEWER"), 1)
+        for removed in ("GetInstanceID", "InstanceIDToObject", "Assembly.Load("):
+            self.assertNotIn(removed, newer)
+            self.assertNotIn(removed, source.split("#endif", 1)[1])
+            self.assertIn(removed, older)
+
+    def test_references_come_from_unitys_own_compile_list(self):
+        source = SOURCE.read_text()
+        self.assertIn("CompilationPipeline.GetAssemblies", source)
+        self.assertNotIn("GetAssemblies()", source)
+        self.assertNotIn(".Location", source)
+
     def test_it_never_listens_in_batch_mode(self):
         self.assertIn("Application.isBatchMode", SOURCE.read_text())
 

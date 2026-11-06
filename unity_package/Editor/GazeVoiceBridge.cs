@@ -46,7 +46,7 @@ internal static class GazeVoiceBridge
     static int sequence;
     static string status = "Voice is off";
     static int undoGroup = -1;
-    static Dictionary<int, string> beforeEdit;
+    static Dictionary<long, string> beforeEdit;
     static bool editSurvivedReload;
     static int consoleCount;
     static DateTime scriptsPendingUntil = DateTime.MinValue;
@@ -303,26 +303,18 @@ internal static class GazeVoiceBridge
         });
     }
 
+    // What Unity itself compiles Editor scripts against, plus the project's own compiled scripts.
     static string[] ReferencePaths()
     {
+        var project = Directory.GetParent(Application.dataPath).FullName;
         var byName = new Dictionary<string, string>();
-        foreach (var loaded in AppDomain.CurrentDomain.GetAssemblies())
+        foreach (var compiled in UnityEditor.Compilation.CompilationPipeline.GetAssemblies(UnityEditor.Compilation.AssembliesType.Editor))
         {
-            if (loaded.IsDynamic) continue;
-            string path;
-            try { path = loaded.Location; }
-            catch (NotSupportedException) { continue; }
-            if (String.IsNullOrEmpty(path) || !File.Exists(path)) continue;
-            var name = Path.GetFileNameWithoutExtension(path);
-            if (!byName.ContainsKey(name)) byName[name] = path;
-        }
-        var facades = Path.Combine(Path.GetDirectoryName(typeof(object).Assembly.Location), "Facades");
-        if (Directory.Exists(facades))
-        {
-            foreach (var path in Directory.GetFiles(facades, "*.dll"))
+            foreach (var reference in compiled.allReferences.Append(compiled.outputPath))
             {
+                var path = Path.GetFullPath(Path.Combine(project, reference));
                 var name = Path.GetFileNameWithoutExtension(path);
-                if (!byName.ContainsKey(name)) byName[name] = path;
+                if (File.Exists(path) && !byName.ContainsKey(name)) byName[name] = path;
             }
         }
         return byName.Values.ToArray();
@@ -401,7 +393,7 @@ internal static class GazeVoiceBridge
                 reply = new { ok = false, error = "The C# didn't compile.", details = errors };
             else
             {
-                var snippet = System.Reflection.Assembly.Load(compiled).GetType(SnippetClass);
+                var snippet = LoadCompiled(compiled).GetType(SnippetClass);
                 var result = snippet.GetMethod("Run").Invoke(null, null);
                 reply = new { ok = true, result = Describe(result, 0), logs = LogsSince(logStart) };
             }
@@ -525,7 +517,7 @@ internal static class GazeVoiceBridge
             if (name == "get_scene_objects")
                 return new { ok = true, objects = Resources.FindObjectsOfTypeAll<GameObject>()
                     .Where(go => go != null && go.scene.IsValid() && go.hideFlags == HideFlags.None)
-                    .Take(300).Select(go => new { id = go.GetInstanceID(), go.name,
+                    .Take(300).Select(go => new { id = IdOf(go), go.name,
                         parent = go.transform.parent != null ? go.transform.parent.name : null,
                         selected = Selection.Contains(go) }).ToArray() };
             if (name == "create_primitive")
@@ -539,7 +531,7 @@ internal static class GazeVoiceBridge
                 if (args.Value<string>("name") is string newName && !String.IsNullOrWhiteSpace(newName)) created.name = newName;
                 if (hasPosition) created.transform.position = position;
                 Undo.RegisterCreatedObjectUndo(created, "GazeVoice create primitive");
-                return new { ok = true, id = created.GetInstanceID(), created.name };
+                return new { ok = true, id = IdOf(created), created.name };
             }
             if (!new[] { "get_object_details", "select_object", "transform_object", "set_color",
                     "duplicate_object", "delete_object" }.Contains(name))
@@ -550,16 +542,16 @@ internal static class GazeVoiceBridge
             {
                 case "get_object_details":
                     var renderer = target.GetComponent<Renderer>();
-                    return new { ok = true, id = target.GetInstanceID(), target.name,
+                    return new { ok = true, id = IdOf(target), target.name,
                         position = Vector(target.transform.localPosition), rotation = Vector(target.transform.localEulerAngles),
                         scale = Vector(target.transform.localScale),
                         components = target.GetComponents<Component>().Where(c => c != null).Select(c => c.GetType().Name).ToArray(),
                         color = renderer != null && renderer.sharedMaterial != null && renderer.sharedMaterial.HasProperty("_Color")
                             ? ColorUtility.ToHtmlStringRGBA(renderer.sharedMaterial.color) : null };
                 case "select_object":
-                    if (args.Value<int?>("target") == null) return new { ok = false, error = "target is required" };
+                    if (args.Value<long?>("target") == null) return new { ok = false, error = "target is required" };
                     Selection.activeGameObject = target;
-                    return new { ok = true, id = target.GetInstanceID(), target.name };
+                    return new { ok = true, id = IdOf(target), target.name };
                 case "transform_object":
                     var didTransform = TryVector(args, "position", out var newPosition);
                     var didRotate = TryVector(args, "rotation", out var newRotation);
@@ -571,7 +563,7 @@ internal static class GazeVoiceBridge
                     if (didRotate) target.transform.localEulerAngles = newRotation;
                     if (didScale) target.transform.localScale = newScale;
                     EditorUtility.SetDirty(target.transform);
-                    return new { ok = true, id = target.GetInstanceID() };
+                    return new { ok = true, id = IdOf(target) };
                 case "set_color":
                     var colorText = args.Value<string>("color");
                     if (!ColorUtility.TryParseHtmlString(colorText, out var color))
@@ -591,14 +583,14 @@ internal static class GazeVoiceBridge
                     Undo.RecordObject(targetRenderer, "GazeVoice color");
                     targetRenderer.sharedMaterial = material;
                     EditorUtility.SetDirty(targetRenderer);
-                    return new { ok = true, id = target.GetInstanceID(), color = colorText };
+                    return new { ok = true, id = IdOf(target), color = colorText };
                 case "duplicate_object":
                     var duplicate = UnityEngine.Object.Instantiate(target, target.transform.parent);
                     duplicate.name = args.Value<string>("name") ?? target.name + " Copy";
                     Undo.RegisterCreatedObjectUndo(duplicate, "GazeVoice duplicate");
-                    return new { ok = true, id = duplicate.GetInstanceID(), duplicate.name };
+                    return new { ok = true, id = IdOf(duplicate), duplicate.name };
                 case "delete_object":
-                    if (args.Value<int?>("target") == null) return new { ok = false, error = "target is required" };
+                    if (args.Value<long?>("target") == null) return new { ok = false, error = "target is required" };
                     Undo.DestroyObjectImmediate(target);
                     return new { ok = true };
                 default:
@@ -675,10 +667,21 @@ internal static class GazeVoiceBridge
         return new { ok = true, started = identifier.Trim() };
     }
 
+    // Unity 6000.5 replaced instance IDs with EntityId and made the old calls compile errors.
+#if UNITY_6000_5_OR_NEWER
+    static long IdOf(UnityEngine.Object item) => (long)EntityId.ToULong(item.GetEntityId());
+    static UnityEngine.Object ObjectWithId(long id) => EditorUtility.EntityIdToObject(EntityId.FromULong((ulong)id));
+    static System.Reflection.Assembly LoadCompiled(byte[] compiled) => UnityEngine.Assemblies.CurrentAssemblies.LoadFromBytes(compiled);
+#else
+    static long IdOf(UnityEngine.Object item) => item.GetInstanceID();
+    static UnityEngine.Object ObjectWithId(long id) => EditorUtility.InstanceIDToObject((int)id);
+    static System.Reflection.Assembly LoadCompiled(byte[] compiled) => System.Reflection.Assembly.Load(compiled);
+#endif
+
     static GameObject Target(JObject args)
     {
-        var id = args.Value<int?>("target");
-        return id.HasValue ? EditorUtility.InstanceIDToObject(id.Value) as GameObject : Selection.activeGameObject;
+        var id = args.Value<long?>("target");
+        return id.HasValue ? ObjectWithId(id.Value) as GameObject : Selection.activeGameObject;
     }
 
     static float[] Vector(Vector3 value) => new[] { value.x, value.y, value.z };
@@ -719,21 +722,21 @@ internal static class GazeVoiceBridge
 
     internal static string Status => status;
 
-    static Dictionary<int, string> SceneSnapshot()
+    static Dictionary<long, string> SceneSnapshot()
     {
-        var snapshot = new Dictionary<int, string>();
+        var snapshot = new Dictionary<long, string>();
         foreach (var go in Resources.FindObjectsOfTypeAll<GameObject>()
                      .Where(item => item != null && item.scene.IsValid() && item.hideFlags == HideFlags.None))
         {
             var parts = new List<string> { EditorJsonUtility.ToJson(go) };
             foreach (var component in go.GetComponents<Component>())
                 if (component != null) parts.Add(EditorJsonUtility.ToJson(component));
-            snapshot[go.GetInstanceID()] = String.Join("\n", parts);
+            snapshot[IdOf(go)] = String.Join("\n", parts);
         }
         return snapshot;
     }
 
-    static bool SnapshotsEqual(Dictionary<int, string> first, Dictionary<int, string> second)
+    static bool SnapshotsEqual(Dictionary<long, string> first, Dictionary<long, string> second)
     {
         return first.Count == second.Count && first.All(pair => second.TryGetValue(pair.Key, out var value) && value == pair.Value);
     }

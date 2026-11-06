@@ -69,7 +69,8 @@ class UnityBridge(Component):
         remove = [self._remove_action(project)]
         if not port_open("127.0.0.1", self.port):
             if is_running(self.runner, self.ctx.probes):
-                problem = package_compile_error(self.editor_log)
+                problem = (package_compile_error(project / "Logs" / "Editor.log")  # newer Unity logs here
+                           or package_compile_error(self.editor_log))
                 if problem:
                     return self.state(Health.ERROR, f"Unity couldn't compile the package: {problem}", details, remove)
                 return self.state(Health.INSTALLED, "Added. Switch to Unity so it can load the package.",

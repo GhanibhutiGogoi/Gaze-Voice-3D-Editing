@@ -158,6 +158,19 @@ class BridgeUnitTest(unittest.TestCase):
         self.assertEqual(state.health, Health.ERROR)
         self.assertIn("CS0246", state.summary)
 
+    def test_a_compile_error_in_the_projects_own_log_is_found(self):
+        """Newer Unity versions log to the project, not to ~/Library/Logs."""
+        self.env.choose(self.project)
+        add_bridge(self.project)
+        self.env.running()
+        self.unit.editor_log = self.env.t.root / "no-such.log"
+        (self.project / "Logs").mkdir()
+        (self.project / "Logs" / "Editor.log").write_text(
+            "Packages/com.gazevoice.bridge/Editor/GazeVoiceBridge.cs(528,56): error CS0619: 'x' is obsolete\n")
+        state = self.unit.check()
+        self.assertEqual(state.health, Health.ERROR)
+        self.assertIn("CS0619", state.summary)
+
     def test_someone_elses_compile_error_isnt_blamed_on_the_package(self):
         self.env.choose(self.project)
         add_bridge(self.project)
