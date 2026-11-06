@@ -167,6 +167,7 @@ class _Run:
     audio_q: queue.Queue = field(default_factory=queue.Queue)
     edit_q: queue.Queue = field(default_factory=queue.Queue)
     threads: list[threading.Thread] = field(default_factory=list)
+    parts: list = field(default_factory=list)  # everything that was started for this run, for a start that is abandoned
 
 
 @dataclass
@@ -459,11 +460,16 @@ class VoiceService:
         self._publish_state()
 
     def _attach(self, run: _Run, name: str, part):
-        """Make a part stop()-able before it starts, so stopping mid-start reaches it."""
+        """Make a part stop()-able before it starts, so stopping mid-start reaches it.
+
+        A stop can still land before the part has anything to stop (say, before its process exists). The run keeps
+        it too, so that _abort_start ends it once it has really started.
+        """
         with self._lock:
             cancelled = run.stop.is_set()
             if not cancelled:
                 setattr(self, name, part)
+                run.parts.append(part)
         if cancelled:
             _end(part)
             raise _Cancelled()
@@ -492,6 +498,8 @@ class VoiceService:
 
     def _abort_start(self, run: _Run, exc: Exception) -> NoReturn:
         self._teardown_parts()
+        for part in reversed(run.parts):  # the ones a stop cleared before they had anything to stop
+            _end(part)
         self._close_bridge()
         self._give_back_camera()  # the gaze worker, if there was one, has let go of it by now
         with self._lock:

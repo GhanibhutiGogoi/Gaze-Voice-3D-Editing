@@ -4,6 +4,7 @@ import json
 import math
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -12,6 +13,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from gazevoice import gaze_worker
 from gazevoice.components.base import CameraClaim
 from gazevoice.events import EventBus
 from gazevoice.voice.audio import MicError, RingBuffer
@@ -19,6 +21,7 @@ from gazevoice.voice.brains import BrainError, TurnResult
 from gazevoice.paths import AppPaths
 from gazevoice.runner import FakeRunner
 from gazevoice.voice.gaze import GazeSample, GazeTrack
+from gazevoice.voice.gaze_tracker import GazeTracker
 from gazevoice.voice.leftovers import make_noise_picture
 from gazevoice.voice.picture import Describer, clear_leftover_images, write_picture_check
 from gazevoice.voice.service import Factories, PointerTracker, VoiceError, VoiceService
@@ -745,6 +748,96 @@ class CameraSharingTest(VoiceTestBase):
     def test_without_a_claim_voice_starts_as_it_always_did(self):
         self.build().start()
         self.assertEqual(self.service.state, "ready")
+
+
+class StopInTheGapTest(VoiceTestBase):
+    """A part is known before it has started, so a stop can reach it while it has nothing to stop yet."""
+
+    def stop_while_starting(self, in_the_gap, go_on, gone_from_the_service):
+        """Start voice, stop it inside the gap, then let the part carry on starting."""
+        errors = []
+
+        def start():
+            try:
+                self.service.start()
+            except VoiceError as exc:
+                errors.append(str(exc))
+
+        starter = threading.Thread(target=start)
+        starter.start()
+        self.assertTrue(in_the_gap.wait(5))
+        stopper = threading.Thread(target=self.service.stop)
+        stopper.start()
+        wait_for(gone_from_the_service)  # the stop has been, and found nothing to stop yet
+        go_on.set()
+        starter.join(10)
+        stopper.join(10)
+        self.assertFalse(starter.is_alive() or stopper.is_alive())
+        self.assertEqual(errors, ["Voice was turned off before it finished starting."])
+        self.assertEqual(self.service.state, "off")
+
+    def test_a_stop_before_the_gaze_worker_exists_leaves_no_worker(self):
+        real_popen = subprocess.Popen
+        in_the_gap, go_on = threading.Event(), threading.Event()
+
+        def slow_popen(*args, **kwargs):
+            in_the_gap.set()
+            go_on.wait(5)
+            return real_popen(*args, **kwargs)
+
+        camera = CameraClaim()
+        self.gaze = GazeTracker(Path(sys.executable), Path(gaze_worker.__file__), "0", extra_args=["--fake"])
+        self.addCleanup(self.gaze.stop)  # a failing run mustn't leave the worker behind
+        self.build(gaze_mode="on", gaze_source="camera", camera=camera)
+        with patch("gazevoice.voice.gaze_tracker.subprocess.Popen", slow_popen):
+            self.stop_while_starting(in_the_gap, go_on, lambda: self.service._gaze is None)
+        self.assertIsNotNone(self.gaze.proc)  # it really did start, after the stop
+        self.assertFalse(self.gaze.alive)
+        self.assertRaises(ProcessLookupError, os.kill, self.gaze.proc.pid, 0)
+        self.assertIsNone(camera.holder)
+
+    def late_part(self, base):
+        """A part whose start() goes on after a stop that came too early for it to notice."""
+        in_the_gap, go_on = threading.Event(), threading.Event()
+
+        class Late(base):
+            def start(self):
+                in_the_gap.set()
+                go_on.wait(5)
+                self.running = True
+                return super().start()
+
+            def stop(self):
+                self.running = False
+                super().stop()
+
+        return Late, in_the_gap, go_on
+
+    def test_a_stop_before_the_mic_has_started_leaves_no_mic_open(self):
+        Late, in_the_gap, go_on = self.late_part(FakeMic)
+        self.mic = Late()
+        self.build()
+        self.stop_while_starting(in_the_gap, go_on, lambda: self.service._mic is None)
+        self.assertFalse(self.mic.running)
+
+    def test_a_stop_before_the_speech_worker_has_started_leaves_no_worker(self):
+        Late, in_the_gap, go_on = self.late_part(FakeStt)
+        self.stt = Late([])
+        self.build()
+        self.stop_while_starting(in_the_gap, go_on, lambda: self.service._stt is None)
+        self.assertFalse(self.stt.running)
+
+    def test_every_part_is_ended_when_a_start_fails_and_ending_twice_does_no_harm(self):
+        self.mic = FakeMic(silent=True)  # fails after the mic, the speech worker and both brains are up
+        stops = []
+        real_stop = self.stt.stop
+        self.stt.stop = lambda: (stops.append("stt"), real_stop())
+        with self.assertRaises(VoiceError):
+            self.build().start()
+        self.assertEqual(stops, ["stt", "stt"])  # by the teardown, and again from the run's own list
+        self.assertFalse(self.mic.started)
+        self.assertTrue(self.refiner.closed and self.editor.closed)
+        self.assertEqual(self.service.state, "error")
 
 
 class DeafSession(FakeSession):
