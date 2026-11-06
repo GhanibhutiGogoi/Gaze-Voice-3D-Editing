@@ -85,6 +85,8 @@ Plan on about **2–4 cm of error**. The best large real-world result is 2.39 cm
 
 ### Task 0: Prove the three risky parts on this Mac
 
+**Status:** S3, S4 and S5 are done, and G3 and G4 passed. See `docs/superpowers/specs/2026-11-06-gaze-spike.md`. S1 and S2 need a person at the camera, so they run in the hand session at the end, using the product's own Calibrate key.
+
 **Who:** I run the scripts and you look at the dots. Throwaway code goes in the scratch folder and nothing goes in the repo.
 
 **You approve first:**
@@ -200,8 +202,10 @@ The mouse stands in for your eyes, so the whole path can be tried for real befor
   - The target is the largest `VIEW_3D` area in the first window, chosen the same way every time.
   - A pick converts `u, v` to `x = u * region.width`, `y = (1 - v) * region.height`, uses `view3d_utils.region_2d_to_origin_3d` and `region_2d_to_vector_3d`, then `scene.ray_cast(depsgraph, origin, direction)`.
   - `uid` is `obj.original.session_uid`, and `point` is the world-space hit. Names are for people, IDs are for matching.
-  - `gaze_piece` finds the object by `session_uid`, then calls `obj.closest_point_on_mesh(obj.matrix_world.inverted() @ point)` on the original object. That gives an original face even when modifiers change the mesh, so the editor's code can use it. See S4.
-  - `part` is the vertex group with the most weight on that face, else the material name if the object has two or more materials, else null.
+  - `gaze_piece` finds the object by `session_uid` and needs two faces, because modifiers renumber them. `docs/superpowers/specs/2026-11-06-gaze-spike.md` S4 has working code for both:
+    - **The face you see**, for `part`: `closest_point_on_mesh` on the evaluated object, then read groups off the evaluated mesh. A mirrored wing correctly reads `Wing.R`.
+    - **The original face**, for `face` and `piece_faces`: a `mathutils.bvhtree.BVHTree.FromPolygons` of the original mesh, `find_nearest` on the local point, and for each axis a Mirror modifier uses, also try the reflected point and keep the closer. The editor's code changes the original mesh, so this is the index it needs. Don't use `closest_point_on_mesh` for this: it searches evaluated geometry and was right on only 2 of 24 rays.
+  - `part` is the vertex group with the largest summed weight on the evaluated face, else the material name if the object has two or more materials, else null.
   - Draw the dot, ring and numbered marks in the existing `_draw_status` handler, in the target area only.
   - In `GAZEVOICE_OT_push_to_talk.modal`, turn `MOUSEMOVE` into pointer events. Return `PASS_THROUGH` as now.
 - [ ] **Step 4: Run the full suite.** Expected: OK. Then, in real Blender after **Update add-on**, run `gaze_pick` at a known point over the default cube and get `Cube` back.
@@ -312,7 +316,7 @@ Focus (gaze): "there" at 1.2 s → Eagle (82%), Perch (14%)
     ← {"cmd": "fit"}  → {"fit": {model}, "check": {…}}
     ← {"cmd": "load", "model": {…}}
     ```
-  - `camera_argv(index: str, width: int, height: int, fps: int = 30) -> list[str]`, from S1, with `-i "<index>:none"`, `-f rawvideo -pix_fmt rgb24 pipe:1`.
+  - `CAMERA_SIZE = (960, 540)` and `camera_argv(index: str, width: int, height: int, fps: int = 30) -> list[str]`, with `-framerate 30 -i "<index>:none" -vf scale=960:540 -f rawvideo -pix_fmt rgb24 pipe:1`. Fixing the size in ffmpeg means it works whatever modes the camera offers.
   - `parse_video_devices(listing: str) -> list[tuple[str, str]]` and `pick_camera(devices, setting: str) -> tuple[str, str] | None`.
   - `GazeTracker(python, worker, camera, calibration: dict | None, env=None)`, a gaze part like Task 3 describes, plus `.collect(uv)`, `.stop_collect()`, `.fit() -> dict`. It's built like `SpeechService`.
 
@@ -328,7 +332,7 @@ Focus (gaze): "there" at 1.2 s → Eagle (82%), Perch (14%)
   - `test_a_dead_worker_reads_as_not_alive`
   - `test_stop_ends_ffmpeg_too`
 - [ ] **Step 2: Run them and see them fail.**
-- [ ] **Step 3: Implement.** The worker reads one frame at a time from ffmpeg and keeps none, and it stamps each with `time.time()`. Confidence is 0 for no face or a blink, read from MediaPipe's `eyeBlink` blendshapes. `mediapipe` is imported only when serving for real, so tests run without it.
+- [ ] **Step 3: Implement.** The worker reads one frame at a time from ffmpeg and keeps none, and it stamps each with `time.time()`. Confidence is 0 for no face or a blink, read from MediaPipe's `eyeBlink` blendshapes. `mediapipe` is imported only when serving for real, so tests run without it. `mp.solutions` no longer exists: the spike doc has the working Tasks API code, including the spelling `output_facial_transformation_matrixes`.
 - [ ] **Step 4: Run the tests.** Expected: OK.
 - [ ] **Step 5: Commit** with the message "Add the gaze worker: camera, face landmarks, calibration maths".
 
@@ -344,8 +348,8 @@ Focus (gaze): "there" at 1.2 s → Eagle (82%), Perch (14%)
   - `Gaze(Component)`: `id = "gaze"`, `name = "Gaze"`, `role = "Sees where you're looking, on this Mac"`. It joins the Input shelf. It isn't in `voice_readiness` or the strip, because gaze is optional.
   - Settings: `camera_device = ""`, where `""` means auto.
   - `paths.gaze_model_file` and `paths.gaze_calibration`, in `state/`. The calibration file holds numbers only.
-  - Model: `https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task`, with the SHA-256 pinned from the first download.
-  - Action: `install`, with a confirm stating the download size measured in Task 0.
+  - Model: `https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task`, 3,758,596 bytes, SHA-256 `64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff`.
+  - Action: `install`, with a confirm saying it downloads about 340 MB. Pin `mediapipe==1.2.2`.
 
 - [ ] **Step 1: Write the failing tests:**
   - `test_not_installed_offers_install`
@@ -417,7 +421,7 @@ If G3 or G4 failed, skip this phase.
   - `test_a_crop_result_can_only_be_read_once`
   - `test_protocol_never_touches_the_file_system`: `open` is patched to fail during a crop.
 - [ ] **Step 2: Run them and see them fail.**
-- [ ] **Step 3: Implement.** Use a one-shot `POST_PIXEL` draw handler, `GPUOffScreen.draw_view3d` and `read_color`, as proven in S3. Scale the crop so its long side is `size` with Blender's bundled numpy. If S3 showed memory capture doesn't work, follow G3's route instead, and drop `test_protocol_never_touches_the_file_system`.
+- [ ] **Step 3: Implement.** Use a one-shot `POST_PIXEL` draw handler, `GPUOffScreen.draw_view3d` and `read_color`. The spike doc's S3 section has code that works on Blender 5.2. Follow it: the handler fires only if a timer calls `area.tag_redraw()`; pass `do_color_management=True` or the picture comes out too dark; pixels are RGBA with the bottom row first; never use `buf.to_list()`; allow up to 380 ms for the first grab; remove the handler afterward. Scale the crop so its long side is `size` with Blender's bundled numpy.
 - [ ] **Step 4: Run the full suite,** then capture for real.
 - [ ] **Step 5: Commit** with the message "Bridge: capture a viewport crop for gaze".
 
