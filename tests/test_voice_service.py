@@ -1331,6 +1331,89 @@ class GazeVoiceTest(VoiceTestBase):
         self.assertEqual(record["gaze"]["status"], "none")
         self.assertFalse([text for text, _ in self.bridge.statuses if "Gaze" in text])
 
+    # --- a command that has to wait its turn ----------------------------------------------------------
+    def queue_one_behind_a_long_edit(self, mode="on"):
+        """Two commands with a pointing word: the first is held in the editor, the second queued behind it."""
+        self.stt = FakeStt(["add blue color there", "add red color there"], words=THERE_WORDS)
+        self.refiner = FakeSession([TurnResult(THERE_REFINED, False), TurnResult(THERE_REFINED, False)])
+        self.release_edit = threading.Event()
+        self.editor = FakeSession(block=self.release_edit)
+        self.build(gaze_mode=mode, gaze_source="mouse").start()
+        self.gaze.look(0.5, 0.5, start=1002.5)
+        self.service.ptt("down", 1002.0)
+        self.service.ptt("up", 1003.0)
+        first = self.last_record()
+        wait_for(lambda: self.editor.sent)
+        self.gaze.look(0.8, 0.2, start=1005.5)
+        self.service.ptt("down", 1005.0)
+        self.service.ptt("up", 1006.0)
+        second = self.last_record()
+        wait_for(lambda: self.service.snapshot()["queued"] == 1)  # heard, and waiting its turn
+        return first, second
+
+    def time_passes(self):
+        """The edit runs on for minutes: everything the track held from when the command was said is gone."""
+        track = self.gaze._track
+        track.seconds = 1.0
+        track.add(GazeSample(5000.0, 0.1, 0.1, 0.9))
+        self.assertEqual(track.between(1000.0, 1010.0), [])
+
+    def test_a_command_queued_behind_a_long_edit_keeps_its_gaze(self):
+        first, second = self.queue_one_behind_a_long_edit()
+        self.time_passes()
+        self.release_edit.set()
+        wait_for(lambda: second["stage"] == "done")
+        self.assertEqual(second["gaze"]["status"], "resolved")
+        self.assertEqual(self.bridge.picks[-1][0], [0.8, 0.2])  # where they looked for this one, not the first
+        self.assertIn('Focus (gaze): "there"', self.editor.sent[1])
+        self.assertEqual(second["_gaze_note"], "")  # it wasn't lost
+
+    def test_watching_only_keeps_it_too(self):
+        _, second = self.queue_one_behind_a_long_edit("shadow")
+        self.time_passes()
+        self.release_edit.set()
+        wait_for(lambda: second["stage"] == "done")
+        self.assertEqual(second["gaze"]["status"], "resolved")
+
+    def test_what_a_command_keeps_never_reaches_its_record(self):
+        _, second = self.queue_one_behind_a_long_edit()
+        self.assertIsNotNone(second["_look"])  # it does hold it, while it waits
+        self.assertNotIn("_look", self.service._public(second))
+        self.assertNotIn("_look", self.service._copy(second))
+        self.release_edit.set()
+        wait_for(lambda: second["stage"] == "done")
+        text = saved_record_text(Path(self.tmp.name), second)
+        self.assertNotIn("_look", text)
+        self.assertNotIn("confidence", text)  # nor any sample, under any name
+
+    def test_a_command_lets_go_of_it_once_it_has_finished(self):
+        _, second = self.queue_one_behind_a_long_edit()
+        self.release_edit.set()
+        wait_for(lambda: second["stage"] == "done")
+        self.assertIsNone(second["_look"])
+
+    def test_a_queued_command_that_is_stopped_lets_go_of_it(self):
+        _, second = self.queue_one_behind_a_long_edit()
+        self.service.say("stop")
+        wait_for(lambda: second["stage"] == "stopped")
+        self.assertIsNone(second["_look"])
+
+    def test_turning_voice_off_lets_go_of_it_even_for_a_command_that_never_ran(self):
+        _, second = self.queue_one_behind_a_long_edit()
+        self.service.stop()
+        self.assertIsNone(second["_look"])
+
+    def test_a_track_that_breaks_doesnt_stop_the_command(self):
+        class BrokenTrack(FakeGaze):
+            @property
+            def track(self):
+                raise RuntimeError("no track")
+
+        self.gaze = BrokenTrack()
+        record = self.run_gaze("on", look=False)
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertEqual(record["_gaze_note"], "Gaze lost, using your selection")
+
     def test_a_dead_socket_during_gaze_doesnt_stop_voice(self):
         self.bridge.gaze_error = ConnectionResetError("Blender went away")
         record = self.run_gaze("on")

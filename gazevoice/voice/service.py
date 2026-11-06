@@ -47,6 +47,8 @@ from .audio import SILENCE_HELP, MicError, is_digital_silence, write_wav
 from .brains import BrainError
 from .commands import choice_number, editor_message, meta_command, parse_refined, refiner_message, vocabulary_prompt
 from .gaze import (
+    AFTER_WORD,
+    BEFORE_WORD,
     MAX_CANDIDATES,
     Candidate,
     GazeSample,
@@ -577,6 +579,8 @@ class VoiceService:
             self._listening = self._stt_busy = False
             self._edit_stage = self._current = None
             self.state, self.reason = "off", ""
+            for record in self.recent:  # a command still queued never reaches _finish
+                record["_look"] = None
         self._publish_state()
 
     @staticmethod
@@ -745,6 +749,7 @@ class VoiceService:
             "gaze": None,  # what the pointing words referred to, when gaze was asked
             "timings": {},
             "_gaze_note": "",  # shown beside the status when gaze didn't help
+            "_look": None,  # the gaze for this clip while the command waits its turn; never saved (see _keep_look)
             "_t0": 0.0,
             "_t1": 0.0,
             "_stop": False,
@@ -790,6 +795,7 @@ class VoiceService:
 
     def _finish(self, record: dict, stage: str) -> None:
         record["stage"] = stage
+        record["_look"] = None
         record["timings"]["total"] = round(self.clock() - record["created"], 2)
         self._save(record)
         self._update(record)
@@ -966,9 +972,27 @@ class VoiceService:
             record["kind"] = record["refined"] = meta
         elif self._answer_choice(record):  # a number only means something while numbers are on screen
             return
+        else:
+            self._keep_look(record)
         record["stage"] = "queued"
         self._update(record)
         run.edit_q.put(record)
+
+    def _keep_look(self, record: dict) -> None:
+        """Copy where the person looked during this clip, before the command waits its turn.
+
+        Edits can run for minutes, so the track may have moved on by the time this command reaches the edit thread.
+        The copy goes in a key that starts with an underscore, so it is never saved or shown, and it goes with the
+        command as soon as the command is over. Gaze never stops voice: with no copy, the command just has no gaze.
+        """
+        gaze = self._gaze
+        clip_start = record["_t0"] - PREROLL  # the clip _transcribe cut starts here
+        if gaze is None or not pointing_words(record["words"], clip_start):
+            return
+        try:
+            record["_look"] = gaze.track.copy_between(clip_start - BEFORE_WORD, record["_t1"] + TAIL + AFTER_WORD)
+        except Exception as exc:  # noqa: BLE001
+            print(f"GazeVoice: gaze failed: {exc!r}", file=sys.stderr)
 
     def _answer_choice(self, record: dict) -> bool:
         """Give a spoken number to the command waiting for one. False when none is waiting: it's an ordinary command."""
@@ -1297,7 +1321,7 @@ class VoiceService:
             return True
         asked = settled = False
         try:
-            grounding = ground(words, clip_start, gaze.track, gaze.radius, self._pick, self._piece)
+            grounding = ground(words, clip_start, record["_look"] or GazeTrack(), gaze.radius, self._pick, self._piece)
             if self.gaze_mode == "on" and grounding.status == "clarify":
                 asked, settled = True, self._settle(record, grounding, run)
             if self.gaze_mode == "on" and grounding.status == "resolved":  # watching only never takes a picture

@@ -26,6 +26,7 @@ CONFIDENT_GAP = 0.25  # and this much more than the next guess
 LONE_GUESS_FLOOR = 0.2  # when only one object was hit, this share of the rays is enough: the rest hit nothing
 DEFAULT_RADIUS = (0.10, 0.15)  # half the patch the rays cover, as a share of the viewport width and height
 MAX_CANDIDATES = 3
+TRACK_SECONDS = 90.0  # gaze kept in memory: more than the longest hold, so all of a clip is still here once it's heard
 PICTURE_MAX_CHARS = 120  # a picture's sentence is cut to this many characters
 
 _GOLDEN_ANGLE = math.pi * (3 - math.sqrt(5))
@@ -96,9 +97,9 @@ class GazeSample:
 
 
 class GazeTrack:
-    """The last few seconds of gaze, kept in memory only. Safe to feed from one thread and read from another."""
+    """The last stretch of gaze, kept in memory only. Safe to feed from one thread and read from another."""
 
-    def __init__(self, seconds: float = 30.0):
+    def __init__(self, seconds: float = TRACK_SECONDS):
         self.seconds = seconds
         self._samples: deque[GazeSample] = deque()
         self._lock = threading.Lock()
@@ -115,6 +116,12 @@ class GazeTrack:
         """The samples from `t0` to `t1` inclusive, oldest first."""
         with self._lock:
             return [s for s in self._samples if t0 <= s.t <= t1]
+
+    def copy_between(self, t0: float, t1: float) -> GazeTrack:
+        """A track of its own with just the samples from `t0` to `t1`, whatever happens to this one afterwards."""
+        copy = GazeTrack(self.seconds)
+        copy._samples.extend(self.between(t0, t1))
+        return copy
 
     @property
     def latest_time(self) -> float | None:

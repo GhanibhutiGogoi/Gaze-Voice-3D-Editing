@@ -187,7 +187,7 @@ Stop and start voice after you change any of them.
 ### The camera
 
 - **When it's on.** While voice is on with **Gaze** set to Watch only or On and **Gaze source** set to Camera. Also for the length of *Calibrate* or *Test*, once you've confirmed. Those two won't run while voice is using the camera. With Gaze Off, or on Mouse, voice never opens it, and they can run while voice is on. Voice then doesn't draw over them: if it would need to ask you to pick a number, it uses your selection instead.
-- **What stays on this Mac.** Frames are processed on this Mac and aren't saved or sent. GazeVoice reads one at a time, finds where your eyes point and drops it. It keeps only the last 30 seconds of where you looked, as screen positions in memory, and your calibration, which is numbers only.
+- **What stays on this Mac.** Frames are processed on this Mac and aren't saved or sent. GazeVoice reads one at a time, finds where your eyes point and drops it. It keeps only the last 90 seconds of where you looked, as screen positions in memory, plus the part for any command still waiting its turn, and your calibration, which is numbers only.
 - **What leaves.** What you looked at reaches the editor as text with your command: object and part names, and how sure gaze was. It goes where your commands go, so with an API provider it goes to that company's servers, as your selection does. Command records on this Mac keep what gaze found, as names and numbers, never an image.
 
 ### Pictures (optional, off by default)

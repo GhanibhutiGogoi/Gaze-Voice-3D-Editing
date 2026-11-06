@@ -24,6 +24,7 @@ from gazevoice.voice.gaze import (
     score_hits,
     viewport_size,
 )
+from gazevoice.voice.service import MAX_HOLD
 
 CHAIR = {"uid": 11, "name": "Chair", "faces": 900, "point": [1.0, 1.0, 1.0]}
 TABLE = {"uid": 22, "name": "Table", "faces": 400, "point": [2.0, 2.0, 2.0]}
@@ -90,6 +91,23 @@ class GazeTrackTest(unittest.TestCase):
         track.add(GazeSample(105.0, 0.5, 0.5, 0.9))
         track.add(GazeSample(111.0, 0.5, 0.5, 0.9))
         self.assertEqual([s.t for s in track.between(0, 1000)], [105.0, 111.0])
+
+    def test_the_track_outlasts_the_longest_hold(self):
+        self.assertGreater(GazeTrack().seconds, MAX_HOLD)  # with room for the speech-to-text after it
+        track = GazeTrack()
+        track.add(GazeSample(100.0, 0.5, 0.5, 0.9))
+        track.add(GazeSample(100.0 + MAX_HOLD + 5, 0.5, 0.5, 0.9))
+        self.assertEqual(len(track.between(100.0, 100.0)), 1)  # the start of a held key is still here when it's let go
+
+    def test_a_copy_of_part_of_the_track_stands_on_its_own(self):
+        track = GazeTrack(seconds=10.0)
+        for t in (100.0, 101.0, 102.0, 103.0):
+            track.add(GazeSample(t, 0.5, 0.5, 0.9))
+        copy = track.copy_between(101.0, 102.0)
+        self.assertEqual([s.t for s in copy.between(0, 1000)], [101.0, 102.0])
+        track.add(GazeSample(500.0, 0.5, 0.5, 0.9))  # the track moves on, and forgets those
+        self.assertEqual(track.between(101.0, 102.0), [])
+        self.assertEqual([s.t for s in copy.between(0, 1000)], [101.0, 102.0])
 
     def test_between_is_inclusive_and_ordered(self):
         track = track_of(*[GazeSample(t, 0.5, 0.5, 0.9) for t in (1.0, 2.0, 3.0, 4.0)])
