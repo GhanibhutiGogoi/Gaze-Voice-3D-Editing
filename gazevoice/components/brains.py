@@ -70,11 +70,11 @@ def parse_codex_jsonl(text: str) -> str | None:
     return reply
 
 
-def write_mcp_config(paths: AppPaths, server_cmd: dict) -> Path:
-    """The --mcp-config file that gives a headless brain the Blender MCP server, and nothing else."""
-    path = paths.root / "mcp-blender.json"
+def write_mcp_config(paths: AppPaths, server_cmd: dict, server_name: str = "blender") -> Path:
+    """The --mcp-config file that gives a headless brain one host's MCP server."""
+    path = paths.root / f"mcp-{server_name}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"mcpServers": {"blender": server_cmd}}, indent=2))
+    path.write_text(json.dumps({"mcpServers": {server_name: server_cmd}}, indent=2))
     return path
 
 
@@ -85,14 +85,14 @@ def _toml(value) -> str:
     return json.dumps(value)
 
 
-def codex_mcp_args(cmd: dict) -> list[str]:
-    """`-c` overrides that give one `codex exec` run the Blender MCP server."""
+def codex_mcp_args(cmd: dict, server_name: str = "blender") -> list[str]:
+    """`-c` overrides that give one `codex exec` run one host's MCP server."""
     args = [
-        "-c", f"mcp_servers.blender.command={_toml(cmd['command'])}",
-        "-c", f"mcp_servers.blender.args={_toml(cmd['args'])}",
+        "-c", f"mcp_servers.{server_name}.command={_toml(cmd['command'])}",
+        "-c", f"mcp_servers.{server_name}.args={_toml(cmd['args'])}",
     ]
     if cmd.get("env"):
-        args += ["-c", f"mcp_servers.blender.env={_toml(cmd['env'])}"]
+        args += ["-c", f"mcp_servers.{server_name}.env={_toml(cmd['env'])}"]
     return args
 
 

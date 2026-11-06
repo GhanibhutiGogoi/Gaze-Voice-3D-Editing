@@ -60,6 +60,14 @@ class WorkflowStagesTest(unittest.TestCase):
         stages = {s["id"]: s for s in workflow_stages({}, "codex")}
         self.assertEqual(stages["edit"]["parts"], ["codex", "mcp_server"])
 
+    def test_unity_replaces_the_blender_stage(self):
+        settings = update_settings(Settings(), {"voice_host": "unity"})
+        stages = workflow_stages({}, "claude", settings)
+        self.assertEqual(stages[-1]["id"], "unity")
+        self.assertEqual(stages[-1]["label"], "Unity")
+        self.assertEqual(stages[-1]["parts"], ["unity"])
+        self.assertEqual(stages[-2]["parts"], ["claude", "unity"])
+
 
 if __name__ == "__main__":
     unittest.main()

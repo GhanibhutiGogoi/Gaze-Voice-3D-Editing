@@ -1,7 +1,7 @@
-"""The voice loop: hold a key in Blender, speak, and Blender changes.
+"""The voice loop: hold to speak, then the selected 3D editor changes.
 
-    Blender key down/up ─► mic ring buffer ─► speech-to-text ─┬─► stop (instant)
-                                                               └─► refiner ─► editor (Blender MCP) ─► one undo step
+    Host key down/up ─► mic ring buffer ─► speech-to-text ─┬─► stop (instant)
+                                                           └─► refiner ─► editor MCP ─► one undo step
 
 Three threads keep it responsive:
 - poll: fetches hold-to-talk events from the Bridge add-on 20 times a second.
@@ -44,19 +44,19 @@ MAX_HOLD = 60.0  # a key held longer than this is stuck: the command is dropped,
 POLL_SECONDS = 0.05
 IDLE_AFTER = 5.0  # seconds a result stays on the status line
 JOIN_SECONDS = 10.0  # how long stop() waits for each loop (and for an interrupted start) to finish
-BUSY_WAIT = 10.0  # how long an undo operation waits for Blender to finish a transform
+BUSY_WAIT = 10.0  # how long an undo operation waits for the host to finish an edit
 DEFAULT_KEY = "⌥ Space"
 UNDO_NAME_BYTES = 63  # Blender keeps 64 bytes of an undo step's name, the closing NUL included
 EDIT_SECONDS = 600.0  # a detailed build can take minutes; "stop" still ends it at once
 REFINE_SECONDS = 90.0
 REFINER_WARMUP = '{"heard": "hello", "focus": {}, "scene_objects": [], "previous_commands": []}'
 EDITOR_WARMUP = "Warm-up, not a command: don't use any tools and don't change anything. Reply with exactly: ready"
-READ_ONLY_TOOLS = ("get_", "search_", "render_viewport_to_path")  # Blender MCP tools that never change the scene
+READ_ONLY_TOOLS = ("get_", "search_", "render_viewport_to_path")
 _COULDNT = re.compile(r"(?:could(?:n['’]t| not)|can(?:['’]t|not))\b", re.IGNORECASE)  # the editor saying it failed
 
 
 def changes_scene(tools: list[str]) -> bool:
-    """Whether any of these Blender MCP tools can have changed the scene (and so needs an undo step)."""
+    """Whether a tool may have changed the scene and might need an undo step."""
     return any(not tool.startswith(READ_ONLY_TOOLS) for tool in tools)
 
 
@@ -120,17 +120,20 @@ class VoiceService:
         engine: str = "parakeet",
         brain: str = "claude",
         clock: Callable[[], float] = time.time,
+        host: str = "blender",
     ):
         self.logs_dir = Path(logs_dir)
         self.bus = bus
         self.factories = factories
         self.engine = engine
         self.brain = brain
+        self.host = host
+        self.host_label = "Unity" if host == "unity" else "Blender"
         self.clock = clock
         self.state = "off"
         self.reason = ""
-        self.blender_connected = False
-        self.key = DEFAULT_KEY  # the hold-to-talk key, as Blender reports it
+        self.host_connected = False
+        self.key = DEFAULT_KEY
         self.recent: collections.deque[dict] = collections.deque(maxlen=20)
         self._lock = threading.RLock()
         self._run: _Run | None = None
@@ -154,9 +157,11 @@ class VoiceService:
                 "reason": self.reason,
                 "brain": self.brain,
                 "engine": self.engine,
+                "host": self.host,
                 "key": self.key,
                 "listening": self._listening,
-                "blender_connected": self.blender_connected,
+                "host_connected": self.host_connected,
+                "blender_connected": self.host_connected,  # legacy dashboard clients
                 "queued": run.edit_q.qsize() if run else 0,
                 "recent": [self._public(r) for r in reversed(self.recent)],
             }
@@ -185,7 +190,7 @@ class VoiceService:
             self.reason = reason
         self._publish_state()
 
-    # --- Blender ---------------------------------------------------------------------------
+    # --- host bridge -----------------------------------------------------------------------
     def _bridge_call(self, request: dict, timeout: float | None = None) -> dict | None:
         bridge = self._bridge
         if bridge is None:
@@ -195,8 +200,8 @@ class VoiceService:
         except (OSError, ValueError):
             return None
 
-    def _blender_op(self, request: dict, run: _Run, wait: float = BUSY_WAIT) -> dict | None:
-        """An undo operation. While Blender says it's busy (mid-transform), try again for a while."""
+    def _host_op(self, request: dict, run: _Run, wait: float = BUSY_WAIT) -> dict | None:
+        """An undo operation. Retry while the host reports that an edit is in progress."""
         deadline = time.monotonic() + wait
         while True:
             reply = self._bridge_call(request, timeout=wait)
@@ -225,10 +230,10 @@ class VoiceService:
 
     def _set_connected(self, connected: bool) -> None:
         with self._lock:
-            if self.blender_connected == connected:
+            if self.host_connected == connected:
                 return
-            self.blender_connected = connected
-            self.reason = "" if connected else "Blender isn't connected. Voice picks up again when it's back."
+            self.host_connected = connected
+            self.reason = "" if connected else f"{self.host_label} isn't connected. Voice picks up again when it's back."
             editing = self._edit_stage is not None
         self._publish_state()
         if connected and not editing:  # mid-edit, "Working…" is still the truth
@@ -242,7 +247,7 @@ class VoiceService:
             run = self._run = _Run()
             self._reset_pending = False
             self._conversation_since = self.clock()
-            self.state, self.reason = "starting", "Connecting to Blender…"
+            self.state, self.reason = "starting", f"Connecting to {self.host_label}…"
         self._publish_state()
         try:
             try:
@@ -274,18 +279,18 @@ class VoiceService:
             hello = bridge.request({"cmd": "ping"})
         except (OSError, ValueError) as exc:
             raise VoiceError(
-                "Blender isn't connected. Launch Blender from the dashboard with the GazeVoice Bridge "
+                f"{self.host_label} isn't connected. Open a {self.host_label} project with the GazeVoice Bridge "
                 "installed, then turn voice on."
             ) from exc
         self.key = hello.get("key") or DEFAULT_KEY
-        self.blender_connected = True
+        self.host_connected = True
         self._step(run, "Opening the microphone…")
         mic = self._attach(run, "_mic", self.factories.mic())
         mic.start()
         self._step(run, "Loading speech-to-text (the first time takes a while)…")
         stt = self._attach(run, "_stt", self.factories.stt())
         stt.start()
-        self._step(run, "Starting the brain and connecting it to Blender…")
+        self._step(run, f"Starting the brain and connecting it to {self.host_label}…")
         sessions = [self._attach(run, "_refiner", self.factories.refiner()),
                     self._attach(run, "_editor", self.factories.editor())]
         self._start_sessions(sessions)
@@ -467,7 +472,7 @@ class VoiceService:
         try:
             fresh = self.factories.mic()
             fresh.start()
-        except Exception as exc:  # noqa: BLE001 - reported on Blender's status line
+        except Exception as exc:  # noqa: BLE001 - reported on the host status line
             self._status(f"✗ The microphone stopped: {exc}", "error", revert=True)
             return False
         with self._lock:
@@ -598,7 +603,8 @@ class VoiceService:
         self._finish(record, "failed")
 
     def _stopped(self, record: dict, reply: str, run: _Run) -> None:
-        if changes_scene(record["tools"]) and self._push_undo(record, run, " (stopped)"):
+        pushed = self._push_undo(record, run, " (stopped)") if self.host == "unity" or changes_scene(record["tools"]) else False
+        if pushed:
             reply = f"{reply} Undo takes back what it changed so far."
             self._status("■ Stopped · undo takes back what it changed so far", "done", revert=True)
         record["reply"] = reply
@@ -607,7 +613,7 @@ class VoiceService:
     def _push_undo(self, record: dict, run: _Run, suffix: str = "") -> bool:
         """One undo step for this command, if the scene changed since it began."""
         request = {"cmd": "undo_push", "message": undo_name(record["refined"], suffix), "only_if_changed": True}
-        reply = self._blender_op(request, run)
+        reply = self._host_op(request, run)
         record["undo_step"] = bool(reply and reply.get("ok") and reply.get("pushed", True))
         return record["undo_step"]
 
@@ -619,8 +625,8 @@ class VoiceService:
                 ack, boot = self._poll_once(run, ack, boot)
                 if self._listening and self.clock() - self._down_t > MAX_HOLD:
                     self.ptt("cancel", reason="too_long")
-            except Exception as exc:  # noqa: BLE001 - Blender's key only reaches us through this loop
-                print(f"GazeVoice: polling Blender failed: {exc!r}", file=sys.stderr)
+            except Exception as exc:  # noqa: BLE001 - host events only reach us through this loop
+                print(f"GazeVoice: polling {self.host_label} failed: {exc!r}", file=sys.stderr)
                 run.stop.wait(0.5)
                 continue
             run.stop.wait(POLL_SECONDS)
@@ -631,7 +637,7 @@ class VoiceService:
             return ack, boot
         try:
             reply = bridge.request({"cmd": "poll", "ack": ack, "boot": boot})
-        except TimeoutError:  # Blender is busy (a heavy edit), not gone; its events wait for the next poll
+        except TimeoutError:  # host is busy; its events wait for the next poll
             return ack, boot
         except (OSError, ValueError):
             self._set_connected(False)
@@ -694,7 +700,7 @@ class VoiceService:
         stt = self._speech(record, run)
         if stt is None:
             return
-        prompt = vocabulary_prompt(record["names"]) if self.engine == "whisper" else None
+        prompt = vocabulary_prompt(record["names"], self.host) if self.engine == "whisper" else None
         began = time.monotonic()
         try:
             result = stt.transcribe(audio, prompt=prompt)
@@ -770,14 +776,14 @@ class VoiceService:
             record["reply"] = "Stopped." if stopped else "Nothing was running."
             self._done(record, "■ Stopped" if stopped else record["reply"])
             return
-        reply = self._blender_op({"cmd": kind}, run)
+        reply = self._host_op({"cmd": kind}, run)
         if reply and reply.get("ok"):
             record["reply"] = "Undid the last change." if kind == "undo" else "Redid the change."
             self._done(record, "↶ Undid the last change" if kind == "undo" else "↷ Redid the change")
         elif reply and reply.get("error") == "busy":
-            self._fail(record, f"Blender is busy. Finish what you're doing, then say {kind} again.")
+            self._fail(record, f"{self.host_label} is busy. Finish what you're doing, then say {kind} again.")
         else:
-            self._fail(record, f"Blender couldn't {kind}.")
+            self._fail(record, f"{self.host_label} couldn't {kind}.")
 
     def _edit_loop(self, run: _Run) -> None:
         while True:
@@ -890,7 +896,7 @@ class VoiceService:
                 self._meta(refined.kind, record, run)
                 return
             if refined.kind == "ignore":
-                record["reply"] = "That didn't sound like a Blender command, so nothing changed."
+                record["reply"] = f"That didn't sound like a {self.host_label} command, so nothing changed."
                 self._done(record, record["reply"])
                 return
         else:
@@ -901,7 +907,7 @@ class VoiceService:
             return
         self._stage("editing", record)
         self._status(f"Working: {record['refined']}", "working")
-        self._bridge_call({"cmd": "begin_edit"})  # from here, Blender notes whether the scene changes
+        self._bridge_call({"cmd": "begin_edit"})  # from here, the host tracks changes for undo
 
         def on_tool(name: str) -> None:
             record["tools"].append(name)
@@ -924,7 +930,7 @@ class VoiceService:
             if record["_stop"]:  # it had to be stopped the hard way; the next command starts a new one
                 self._stopped(record, "Stopped.", run)
                 return
-            if changes_scene(record["tools"]):
+            if self.host == "unity" or changes_scene(record["tools"]):
                 self._push_undo(record, run, " (failed)")
             self._fail(record, str(exc))
             return
@@ -934,7 +940,7 @@ class VoiceService:
             return
         record["reply"] = turn.text
         failed = turn.is_error or bool(_COULDNT.match(turn.text))
-        if changes_scene(turn.tools):
+        if self.host == "unity" or changes_scene(turn.tools):
             self._push_undo(record, run, " (failed)" if failed else "")
         if failed:
             self._fail(record, turn.text or "The edit didn't finish.")

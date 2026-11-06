@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 from typing import Mapping
 
 from ..blender_socket import BridgeClient
@@ -10,17 +12,19 @@ from ..components.brains import BRAIN_ORDER, brain_pending
 from ..events import EventBus
 from ..providers import ChatClient, KeyStore
 from ..settings import Settings
-from .api_brain import ApiSession, blender_mcp
+from .api_brain import ApiSession, host_mcp
 from .audio import MicError, MicStream, mic_argv
 from .brains import BrainError, ClaudeSession, CodexSession, claude_session_argv
-from .commands import EDITOR_PROMPT, REFINER_PROMPT
+from .commands import EDITOR_PROMPT, REFINER_PROMPT, UNITY_EDITOR_PROMPT, UNITY_REFINER_PROMPT
 from .service import EDITOR_WARMUP, REFINER_WARMUP, Factories, VoiceService
 from .stt import SpeechService
 
 # unit id, the healths that are good enough, what to call it
-_NEEDED = (
+_COMMON_NEEDED = (
     ("microphone", {Health.READY, Health.INSTALLED}, "Microphone"),  # untested is fine: starting voice tests it
     ("speech", {Health.READY}, "Speech-to-text"),
+)
+_BLENDER_NEEDED = (
     ("blender", {Health.READY}, "Blender"),
     ("mcp_addon", {Health.READY}, "Blender MCP add-on"),
     ("mcp_server", {Health.READY, Health.INSTALLED}, "Blender MCP server"),
@@ -58,7 +62,15 @@ def voice_readiness(
 
     sources, settings = as_sources(sources), settings or Settings()
     missing: list[str] = []
-    for cid, good, label in _NEEDED:
+    needed = list(_COMMON_NEEDED)
+    if settings.voice_host == "blender":
+        needed.extend(_BLENDER_NEEDED)
+    else:
+        from ..blender_socket import port_open
+
+        if not port_open("127.0.0.1", 9878):
+            missing.append("Unity Editor bridge isn't connected. Open a Unity project with the GazeVoice package installed.")
+    for cid, good, label in needed:
         state = states.get(cid)
         if state is None:
             missing.append(f"{label} is missing.")
@@ -75,11 +87,9 @@ def voice_readiness(
 
 
 def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: KeyStore | None = None) -> VoiceService:
-    """A VoiceService wired to the real mic, speech engine, each step's brain and Blender."""
+    """A VoiceService wired to the selected editor host, mic, speech engine and brains."""
     from ..components.providers import config_for
 
-    from ..components.blender import find_blender
-    from ..components.blender_mcp import server_command
     from ..components.brains import write_mcp_config
     from ..components.microphone import Microphone, pick_device
     from ..components.speech import ENGINES, WORKER, Speech
@@ -96,12 +106,27 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
 
     speech = Speech(ctx)
     engine = ENGINES[settings.stt_engine]
-    server_cmd = server_command(paths, find_blender(ctx.runner))
-    mcp_config = write_mcp_config(paths, server_cmd)
+    host = settings.voice_host
+    mcp_server = host
+    if host == "blender":
+        from ..components.blender import find_blender
+        from ..components.blender_mcp import server_command
+
+        server_cmd = server_command(paths, find_blender(ctx.runner))
+        bridge_factory = BridgeClient
+    else:
+        server_cmd = ({"command": settings.unity_mcp_command, "args": list(settings.unity_mcp_args)}
+                      if settings.unity_mcp_command else
+                      {"command": sys.executable, "args": ["-m", "gazevoice.unity_mcp"],
+                       "env": {"PYTHONPATH": str(Path(__file__).resolve().parents[2])}})
+        bridge_factory = lambda: BridgeClient(port=9878)
+    mcp_config = write_mcp_config(paths, server_cmd, mcp_server)
+    editor_prompt = EDITOR_PROMPT if host == "blender" else UNITY_EDITOR_PROMPT
+    refiner_prompt = REFINER_PROMPT if host == "blender" else UNITY_REFINER_PROMPT
     paths.work.mkdir(parents=True, exist_ok=True)
 
     def claude(prompt, model, effort, mcp, max_turns, **start_kwargs) -> ClaudeSession:
-        argv = claude_session_argv(prompt, model, mcp, max_turns=max_turns, effort=effort)
+        argv = claude_session_argv(prompt, model, mcp, max_turns=max_turns, effort=effort, mcp_server=mcp_server)
         session = ClaudeSession(argv, cwd=paths.work)
         session.start_kwargs = start_kwargs
         session.effort = effort  # shown with each command, next to the model that answered
@@ -119,36 +144,36 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
         editing = step == "editor"
         return ApiSession(
             ChatClient(config, key), getattr(settings, f"{step}_api_model"),
-            (EDITOR_PROMPT if editing else REFINER_PROMPT).read_text(), kind=config.kind,
+            (editor_prompt if editing else refiner_prompt).read_text(), kind=config.kind,
             thinking=getattr(settings, f"{step}_api_thinking"),
-            mcp_factory=blender_mcp(server_cmd) if editing else None, provider=config.name,
-            max_steps=EDITOR_STEPS if editing else 1,
+            mcp_factory=host_mcp(server_cmd) if editing else None, provider=config.name,
+            max_steps=EDITOR_STEPS if editing else 1, host="Unity" if host == "unity" else "Blender",
         )
 
     def editor():
         source = sources["editor"]
         if source == "codex":
-            return CodexSession(paths.work, EDITOR_PROMPT.read_text(), mcp_cmd=server_cmd)
+            return CodexSession(paths.work, editor_prompt.read_text(), mcp_cmd=server_cmd, mcp_server=mcp_server)
         if source == "claude":
-            return claude(EDITOR_PROMPT, settings.editor_model, settings.editor_effort, mcp_config, EDITOR_STEPS,
-                          warmup=EDITOR_WARMUP, require_mcp="blender", timeout=150)
+            return claude(editor_prompt, settings.editor_model, settings.editor_effort, mcp_config, EDITOR_STEPS,
+                          warmup=EDITOR_WARMUP, require_mcp=mcp_server, timeout=150)
         return provider("editor", source)
 
     def refiner():
         source = sources["refiner"]
         if source == "codex":
-            return CodexSession(paths.work, REFINER_PROMPT.read_text())
+            return CodexSession(paths.work, refiner_prompt.read_text())
         if source == "claude":
-            return claude(REFINER_PROMPT, settings.refiner_model, settings.refiner_effort, None, 1,
+            return claude(refiner_prompt, settings.refiner_model, settings.refiner_effort, None, 1,
                           warmup=REFINER_WARMUP, timeout=90)
         return provider("refiner", source)
 
     factories = Factories(
-        bridge=BridgeClient,
+        bridge=bridge_factory,
         mic=mic,
         # The model was downloaded when speech-to-text was installed; loading it never needs the network.
         stt=lambda: SpeechService(speech.python, WORKER, engine.key, engine.model, env={"HF_HUB_OFFLINE": "1"}),
         refiner=refiner,
         editor=editor,
     )
-    return VoiceService(paths.logs, bus, factories, engine=engine.key, brain=sources["editor"])
+    return VoiceService(paths.logs, bus, factories, engine=engine.key, brain=sources["editor"], host=host)

@@ -11,6 +11,8 @@ from typing import Sequence
 PROMPTS = Path(__file__).parent / "prompts"
 EDITOR_PROMPT = PROMPTS / "editor.md"
 REFINER_PROMPT = PROMPTS / "refiner.md"
+UNITY_EDITOR_PROMPT = PROMPTS / "unity_editor.md"
+UNITY_REFINER_PROMPT = PROMPTS / "unity_refiner.md"
 KINDS = ("command", "undo", "redo", "stop", "ignore")
 
 # Said before or after an instant command, these don't change it: "no, wait, stop it right now".
@@ -29,6 +31,10 @@ _BLENDER_TERMS = (
     "modifier, array, mirror, solidify, shrinkwrap, decimate, remesh, smooth, shade smooth, shade flat, "
     "vertex, vertices, edge, face, normals, origin, pivot, scale, rotate, move, duplicate, join, separate, "
     "material, roughness, metallic, emission, UV, unwrap, armature, keyframe, camera, light"
+)
+_UNITY_TERMS = (
+    "Unity, GameObject, Transform, prefab, component, hierarchy, scene, mesh, material, shader, "
+    "renderer, collider, Rigidbody, light, camera, terrain, animation, animator, particle system"
 )
 
 
@@ -123,7 +129,8 @@ def editor_message(command: str, heard: str, focus: dict | None) -> str:
     return "\n".join(lines)
 
 
-def vocabulary_prompt(names: Sequence[str]) -> str:
-    """A short hint for Whisper: 3D terms, then the scene's object names (bounded for its prompt limit)."""
+def vocabulary_prompt(names: Sequence[str], host: str = "blender") -> str:
+    """A short hint for Whisper: host-specific 3D terms, then bounded scene names."""
     shown = ", ".join(list(names)[:40])
-    return f"{_BLENDER_TERMS}. Objects: {shown}." if shown else f"{_BLENDER_TERMS}."
+    terms = _UNITY_TERMS if host == "unity" else _BLENDER_TERMS
+    return f"{terms}. Objects: {shown}." if shown else f"{terms}."

@@ -91,16 +91,16 @@ const VOICE_WORDS = {
   listening: ["rec", "Listening…"],
   transcribing: ["busy", "Transcribing…"],
   refining: ["busy", "Understanding…"],
-  editing: ["busy", "Working in Blender…"],
+  editing: ["busy", "Working in the scene…"],
   error: ["fault", "Voice stopped"],
 };
 const STAGE_WORDS = {
   queued: "Waiting its turn…",
   transcribing: "Transcribing…",
   refining: "Understanding…",
-  editing: "Working in Blender…",
+  editing: "Working in the scene…",
 };
-const KIND_WORDS = { undo: "Undo", redo: "Redo", stop: "Stop", ignore: "Not a Blender command" };
+const KIND_WORDS = { undo: "Undo", redo: "Redo", stop: "Stop", ignore: "Not an editor command" };
 // Claude Code models by full name, and how much they think (`claude --effort`); the server checks the same lists.
 const CLAUDE_MODELS = [
   ["default", "Default (Claude Code picks)"],
@@ -439,14 +439,16 @@ function renderRack() {
     return;
   }
   const placed = new Set();
-  for (const group of GROUPS) {
+  const host = S.state.settings && S.state.settings.voice_host;
+  for (const group of GROUPS.filter((item) => !(host === "unity" && item.label === "Blender"))) {
     const ids = group.providers ? [...group.ids, ...components().filter((c) => c.provider).map((c) => c.id)] : group.ids;
     const units = ids.map(component).filter(Boolean);
     if (!units.length) continue;
     units.forEach((c) => placed.add(c.id));
     rack.append(shelf(group.label, group.hint, units));
   }
-  const others = components().filter((c) => !placed.has(c.id) && c.id !== "workflow");
+  const hiddenBlenderIds = host === "unity" ? new Set(["blender", "mcp_addon", "mcp_server", "bridge"]) : new Set();
+  const others = components().filter((c) => !placed.has(c.id) && c.id !== "workflow" && !hiddenBlenderIds.has(c.id));
   if (others.length) rack.append(shelf("Other", "", others));
 }
 
@@ -746,13 +748,15 @@ function renderVoice() {
     const v = voice();
     const on = voiceOn(v);
     const startingJob = jobRunning("voice");
-    const [led, word] = VOICE_WORDS[v.state] || VOICE_WORDS.off;
+    const [led, defaultWord] = VOICE_WORDS[v.state] || VOICE_WORDS.off;
     const key = v.key || "⌥ Space";
-    $("voice-note").textContent = `In Blender, hold ${key}, say what you want, and let go. Your selection is what “this” means.`;
+    const hostName = v.host === "unity" ? "Unity" : "Blender";
+    const word = v.state === "editing" ? `Working in ${hostName}…` : defaultWord;
+    $("voice-note").textContent = `In ${hostName}, hold ${key}, say what you want, and let go. Your selection is what “this” means.`;
     let reason = v.reason;
-    if (!reason && v.state === "ready") reason = `Hold ${key} in Blender, speak, and let go.`;
-    if (!reason && v.state === "off") reason = "Turn voice on to start talking to Blender.";
-    if (v.state === "ready" && v.blender_connected === false) reason = "Blender isn't connected. Voice picks up again when it's back.";
+    if (!reason && v.state === "ready") reason = `Hold ${key} in ${hostName}, speak, and let go.`;
+    if (!reason && v.state === "off") reason = `Turn voice on to start talking to ${hostName}.`;
+    if (v.state === "ready" && (v.host_connected ?? v.blender_connected) === false) reason = `${hostName} isn't connected. Voice picks up again when it's back.`;
 
     const keys = h("div", { class: "voice-keys" });
     if (!on) {
@@ -835,7 +839,7 @@ function renderVoice() {
       : h("p", {
         class: "cmd-empty",
         text: on
-          ? `Nothing yet. Hold ${key} in Blender and say something like “make this twice as tall”.`
+          ? `Nothing yet. Hold ${key} in ${hostName} and say something like “make this twice as tall”.`
           : "Commands you speak show up here: what was heard, what was understood, and what changed.",
       }));
   });
@@ -849,7 +853,7 @@ function providerNames() {
 function privacyNote(v) {
   const sources = (S.state && S.state.sources) || {};
   const providers = providerNames();
-  let note = "The mic is open while voice is on. Audio stays in memory; only the commands you speak are saved, in the app's logs folder.";
+  let note = "The mic is open while voice is on. Audio and command records are saved in the app's local logs folder.";
   if (Object.values(sources).includes("codex") || v.brain === "codex") note += " Codex keeps its own history of them.";
   if (providers.length) note += ` Your commands and scene details go to ${providers.join(" and ")}.`;
   return note;
@@ -857,7 +861,8 @@ function privacyNote(v) {
 
 function commandRow(r) {
   const led = { done: "live", failed: "fault", stopped: "off" }[r.stage] || "busy";
-  let understood = KIND_WORDS[r.kind] || r.refined || r.heard || STAGE_WORDS[r.stage] || "…";
+  let understood = (r.kind === "ignore" ? `Not a ${voice().host === "unity" ? "Unity" : "Blender"} command` : KIND_WORDS[r.kind])
+    || r.refined || r.heard || STAGE_WORDS[r.stage] || "…";
   if (r.kind === "command" && r.refined) understood = r.refined;
   const heard = r.heard ? `${r.source === "typed" ? "Typed" : "Heard"}: “${r.heard}”` : "";
   let tone = null;
@@ -1007,12 +1012,49 @@ function renderRouting() {
     return;
   }
   box.append(
+    routeRow("3D host", "voice_host", settings.voice_host, [["blender", "Blender"], ["unity", "Unity"]]),
     routeRow("Speech engine", "stt_engine", settings.stt_engine, [["parakeet", "Parakeet"], ["whisper", "Whisper"]]),
+    ...(settings.voice_host === "unity" ? unityMcpRows(settings) : []),
     inputRow(settings.mic_device),
     stepRow("editor", settings),
     stepRow("refiner", settings),
     h("p", { class: "route-note", text: "Auto uses Claude Code when it's logged in, otherwise Codex. More thinking can make big builds better, but each command takes longer." }),
     h("p", { class: "route-note", id: "route-note" }));
+}
+
+function unityMcpRows(settings) {
+  return [
+    h("label", { class: "route-row" },
+      h("span", { class: "route-label", text: "Unity MCP command" }),
+      h("input", {
+        class: "provider-input",
+        value: settings.unity_mcp_command || "",
+        placeholder: "Absolute path, for example /usr/local/bin/unity-mcp",
+        "aria-label": "Unity MCP command path",
+        "data-focus-key": "route-unity-mcp-command",
+        onchange: (e) => saveSetting("unity_mcp_command", e.target.value.trim()),
+      })),
+    h("label", { class: "route-row" },
+      h("span", { class: "route-label", text: "Unity MCP arguments" }),
+      h("input", {
+        class: "provider-input",
+        value: JSON.stringify(settings.unity_mcp_args || []),
+        placeholder: "[\"serve\"]",
+        "aria-label": "Unity MCP arguments as JSON",
+        "data-focus-key": "route-unity-mcp-args",
+        onchange: (e) => {
+          try {
+            const args = JSON.parse(e.target.value);
+            if (!Array.isArray(args) || !args.every((arg) => typeof arg === "string")) throw new Error("Use a JSON array of strings.");
+            saveSetting("unity_mcp_args", args);
+          } catch (error) {
+            const note = $("route-note");
+            if (note) { note.textContent = `Couldn't save: ${error.message}`; note.dataset.tone = "bad"; }
+          }
+        },
+      })),
+    h("p", { class: "route-note", text: "Unity needs the GazeVoice package open in the Editor. Leave the MCP command blank for the built-in scene tools, or provide another stdio MCP server." }),
+  ];
 }
 
 function menu(key, options, label, value, onchange) {

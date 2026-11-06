@@ -242,6 +242,8 @@ class ChatClient:
                     raise ProviderError(self._scrub(self._explain(exc.code, detail, model, path))) from None
             except TimeoutError:
                 raise ProviderError(f"{self.config.name} took too long to answer.") from None
+            except ConnectionResetError:
+                raise ProviderError(f"Lost the connection to {self.config.name} mid-answer. Try again.") from None
             except (urllib.error.URLError, OSError) as exc:
                 reason = getattr(exc, "reason", exc)
                 message = f"Couldn't reach {self.config.name}: {reason}"

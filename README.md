@@ -1,14 +1,14 @@
 # Gaze-Voice-3D-Editing
 
-GazeVoice lets you edit Blender scenes by talking now, and by looking later, without an AI chat window.
+GazeVoice lets you edit Blender or Unity scenes by talking now, and by looking later, without an AI chat window.
 
-- **Voice:** your speech is transcribed on your Mac and cleaned up into one clear instruction. Claude Code (or Codex) then edits Blender through Blender's official MCP server.
+- **Voice:** your speech is transcribed on your Mac and cleaned up into one clear instruction. Claude Code, Codex or a configured API provider edits the selected host through MCP.
 - **Focus:** each command carries what you're focused on, so edits stay scoped to it. For now that's your selection; later it will be your gaze.
 
 **Status:** two stages are built:
 
 - **The control center:** a local dashboard that installs each piece, connects them and checks that the whole workflow is ready.
-- **The voice loop:** hold a key in Blender, say what you want, let go, and Blender changes. The chain runs hold-to-talk → speech-to-text → cleanup → editor → one undo step.
+- **The voice loop:** hold to talk in Blender or Unity, say what you want, and release to edit. The chain runs hold-to-talk → speech-to-text → cleanup → editor → one undo step.
 
 Gaze comes later. See [the design](docs/superpowers/specs/2026-10-18-gazevoice-design.md), [the control center plan](docs/superpowers/plans/2026-10-18-control-center.md) and [the voice loop plan](docs/superpowers/plans/2026-10-19-voice-loop.md).
 
@@ -64,7 +64,18 @@ Every unit shows its real state on this Mac. Nothing installs, records audio or 
 - While you're holding the key, Esc cancels. So does switching away from Blender.
 - While voice is off, the key does nothing except say so in Blender's status bar.
 
-**More ways to talk:**
+## Talk to Unity
+
+The Unity target reuses the microphone, speech-to-text, cleanup, command queue and dashboard. It includes a fixed scene-editing MCP adapter and a local GazeVoice Editor bridge.
+
+1. In Unity Package Manager, choose **Add package from disk** and select `unity_package/package.json`.
+2. Open **Window › GazeVoice** in the Unity Editor. The package listens on `127.0.0.1:9878` and reports the current Unity selection and scene object names.
+3. In the control center's Routing unit, choose **Unity**. The built-in MCP adapter is selected automatically. To use another stdio Unity MCP server, set **Unity MCP command** and **Unity MCP arguments** (a JSON string array). The external server must provide its own Unity scene tools and implement the standard MCP stdio protocol.
+4. Start voice, then hold the **Talk** control in the GazeVoice window while speaking. Unity selection supplies the current focus; typed commands in the dashboard remain available.
+
+The built-in adapter offers scene inspection, selection, color, transform, duplicate, delete and primitive creation through a fixed API. The bridge groups recorded changes into one undo action and exposes voice undo/redo. External MCP tools that mutate scenes without using Unity's Undo API cannot be made undoable by the bridge.
+
+**More ways to talk in Blender:**
 
 - *Talk* in the sidebar starts listening on the first click and sends on the second.
 - The dashboard has *Hold to talk* and a box to **type a command**. Typing is handy for testing without a mic.
@@ -91,7 +102,7 @@ Every unit shows its real state on this Mac. Nothing installs, records audio or 
 **Privacy:**
 
 - The mic is open only while voice is on.
-- Audio stays in memory. Only the commands you speak are saved, in GazeVoice's own logs folder.
+- Audio and command records are saved in GazeVoice's local logs folder.
 - Claude Code runs with session saving off, so your commands don't appear in its history.
 - Codex keeps its own history of the commands it handled.
 
@@ -157,5 +168,6 @@ python3 -m unittest discover -s tests -t . -v
 | `gazevoice/voice/` | The voice loop: mic ring buffer, speech service, brain sessions, prompts, orchestration |
 | `gazevoice/server/static/` | The dashboard: plain HTML, CSS and JS |
 | `blender_addon/gazevoice_bridge/` | Our Blender add-on |
+| `unity_package/` | Unity Editor package and the matching local bridge protocol |
 | `DESIGN.md` | The dashboard's visual system |
 | `PRODUCT.md` | What the product is for |

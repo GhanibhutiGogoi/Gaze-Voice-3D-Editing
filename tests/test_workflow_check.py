@@ -109,6 +109,17 @@ class WorkflowCheckTest(unittest.TestCase):
         self.assertNotIn(("claude", "connect_blender"), self.calls)
         self.assertEqual(result["passed"], 5)  # one test, though both steps use DeepSeek
 
+    def test_unity_check_skips_blender_units_and_connection_action(self):
+        self.t.ctx.settings = update_settings(self.t.ctx.settings, {
+            "voice_host": "unity", "unity_mcp_command": "/opt/unity-mcp"})
+        workflow = self.build()
+        unity_checks = []
+        workflow._check_unity = lambda job: unity_checks.append("unity")
+        result = workflow.run_action("check", make_job("workflow", "check"))
+        self.assertEqual(self.calls, [("microphone", "test"), ("speech", "test")])
+        self.assertEqual(unity_checks, ["unity"])
+        self.assertEqual(result["passed"], 3)
+
     def test_no_brain_at_all_stops_with_a_plain_message(self):
         workflow = self.build(claude={"health": Health.MISSING}, codex={"health": Health.MISSING})
         with self.assertRaises(JobError) as caught:
