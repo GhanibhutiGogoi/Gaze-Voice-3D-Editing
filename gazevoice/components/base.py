@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
@@ -63,12 +64,43 @@ class ComponentState:
         }
 
 
+class CameraClaim:
+    """Who is using the camera right now, if anyone: "voice", or "gaze" while it calibrates or tests.
+
+    Voice and gaze calibration both open the camera, and a camera can only be opened once. Whoever takes it
+    first has it until they give it back, and the other is told plainly instead of failing in a muddle.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._holder: str | None = None
+
+    @property
+    def holder(self) -> str | None:
+        return self._holder
+
+    def take(self, who: str) -> str | None:
+        """Claim the camera. None means it is yours now; otherwise the name of whoever has it already."""
+        with self._lock:
+            if self._holder is None:
+                self._holder = who
+                return None
+            return self._holder
+
+    def release(self, who: str) -> None:
+        """Give the camera back. Only the one holding it can, so a user that was refused can clean up safely."""
+        with self._lock:
+            if self._holder == who:
+                self._holder = None
+
+
 @dataclass
 class Context:
     runner: CommandRunner
     paths: AppPaths
     settings: Settings
     probes: ProbeCache = field(default_factory=ProbeCache)
+    camera: CameraClaim = field(default_factory=CameraClaim)
 
 
 class Component(ABC):

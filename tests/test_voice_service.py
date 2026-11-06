@@ -9,6 +9,7 @@ import time
 import unittest
 from pathlib import Path
 
+from gazevoice.components.base import CameraClaim
 from gazevoice.events import EventBus
 from gazevoice.voice.audio import MicError, RingBuffer
 from gazevoice.voice.brains import BrainError, TurnResult
@@ -49,6 +50,7 @@ class FakeBridge:
         self.pick_reply = lambda points: [EAGLE] * len(points)  # what is under each gaze ray; None = no 3D viewport
         self.piece_reply = WING_PIECE  # what gaze_piece says about the top guess; None = no such mesh object
         self.gaze_error: Exception | None = None  # every gaze request raises this (a dead socket)
+        self.view_reply = {"ok": True, "width": 1840, "height": 1100}  # what gaze_view says the viewport is
         self.picks, self.pieces, self.shows = [], [], []
         self.lock = threading.Lock()
         self._events: list[dict] = []
@@ -112,6 +114,8 @@ class FakeBridge:
     def gaze(self, cmd, req):
         if self.gaze_error is not None:
             raise self.gaze_error
+        if cmd == "gaze_view":
+            return self.view_reply
         if cmd == "gaze_pick":
             self.picks.append(req["points"])
             if self.pick_reply is None:
@@ -240,9 +244,10 @@ class FakeSession:
 class FakeGaze:
     """A gaze part (a camera, or the mouse). Tests drop samples into its track with look()."""
 
-    def __init__(self, fail=False, radius=(0.10, 0.15)):
+    def __init__(self, fail=False, radius=(0.10, 0.15), view=None):
         self.fail = fail
         self.radius = radius
+        self.view = view  # the viewport size it was calibrated on; None for the mouse, which needs no calibration
         self.alive = False
         self.starts = self.stops = 0
         self.track_reads = 0
@@ -601,6 +606,83 @@ class VoiceServiceTest(VoiceTestBase):
     def test_say_requires_voice_on(self):
         with self.assertRaises(VoiceError):
             self.build().say("add a cube")
+
+
+class CameraSharingTest(VoiceTestBase):
+    """Voice and gaze calibration both need the camera, so they take turns."""
+
+    def setUp(self):
+        super().setUp()
+        self.camera = CameraClaim()
+        self.next_editor = FakeSession()  # for a restart
+
+    def test_voice_wont_start_while_gaze_is_using_the_camera(self):
+        self.camera.take("gaze")
+        with self.assertRaises(VoiceError) as caught:
+            self.build(camera=self.camera).start()
+        self.assertIn("calibrat", str(caught.exception))
+        self.assertIn("camera", str(caught.exception))
+        self.assertEqual(self.service.state, "off")  # nothing was started, and it can be tried again
+        self.assertFalse(self.mic.started)
+        self.assertEqual(self.camera.holder, "gaze")  # still gaze's
+        self.camera.release("gaze")
+        self.service.start()
+        self.assertEqual(self.service.state, "ready")
+
+    def test_voice_holds_the_camera_while_it_is_on_and_gives_it_back_when_it_stops(self):
+        service = self.build(camera=self.camera)
+        service.start()
+        self.assertEqual(self.camera.holder, "voice")
+        self.assertEqual(self.camera.take("gaze"), "voice")  # so calibrating is refused meanwhile
+        service.stop()
+        self.assertIsNone(self.camera.holder)
+        service.start()
+        self.assertEqual(self.camera.holder, "voice")
+
+    def test_a_second_start_while_on_does_not_disturb_the_first(self):
+        service = self.build(camera=self.camera)
+        service.start()
+        with self.assertRaises(VoiceError) as caught:
+            service.start()
+        self.assertIn("already on", str(caught.exception))
+        self.assertEqual(self.camera.holder, "voice")
+
+    def test_a_start_that_fails_gives_the_camera_back(self):
+        self.mic = FakeMic(fail=True)
+        with self.assertRaises(VoiceError):
+            self.build(camera=self.camera).start()
+        self.assertEqual(self.service.state, "error")
+        self.assertIsNone(self.camera.holder)
+
+    def test_stopping_while_starting_gives_the_camera_back(self):
+        self.stt = FakeStt([], block=threading.Event())
+        self.build(camera=self.camera)
+        starter = threading.Thread(target=lambda: self.start_quietly())
+        starter.start()
+        wait_for(lambda: self.service.reason.startswith("Loading speech"))
+        self.assertEqual(self.camera.holder, "voice")
+        self.service.stop()
+        starter.join(5)
+        self.assertEqual(self.service.state, "off")
+        self.assertIsNone(self.camera.holder)
+
+    def start_quietly(self):
+        try:
+            self.service.start()
+        except VoiceError:
+            pass
+
+    def test_stopping_after_a_failed_start_gives_nothing_back_twice(self):
+        self.mic = FakeMic(fail=True)
+        with self.assertRaises(VoiceError):
+            self.build(camera=self.camera).start()
+        self.camera.take("gaze")  # calibrating started once voice had failed
+        self.service.stop()  # clearing the error must not take the camera from gaze
+        self.assertEqual(self.camera.holder, "gaze")
+
+    def test_without_a_claim_voice_starts_as_it_always_did(self):
+        self.build().start()
+        self.assertEqual(self.service.state, "ready")
 
 
 class DeafSession(FakeSession):
@@ -1193,6 +1275,102 @@ class GazeVoiceTest(VoiceTestBase):
         self.assertEqual((self.gazes_made, self.gaze.starts), (0, 0))
         self.assertFalse([c for c in self.bridge.calls if c.startswith("gaze_")])
         self.assertIn("Focus: nothing selected", self.editor.sent[0])
+
+    # --- a resized viewport ------------------------------------------------------------------------
+    def saved_for(self, width=1840, height=1100):
+        self.gaze = FakeGaze(view=(width, height))
+
+    def test_a_resized_viewport_means_no_gaze_for_that_command_and_says_to_calibrate_again(self):
+        self.saved_for(1500, 1100)  # calibrated on a narrower viewport than Blender has now
+        self.bridge.selected = ["Chair"]
+        record = self.run_gaze("on", source="camera")
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertEqual(self.asked_gaze(), [])  # no ray was cast with a mapping that no longer fits
+        self.assertIn("Focus: selected Chair", self.editor.sent[0])  # it ran on the selection
+        self.assertNotIn("(gaze)", self.editor.sent[0])
+        self.assertEqual(record["gaze"]["status"], "none")
+        self.assertIs(record["gaze"]["viewport_changed"], True)
+        self.assertIsNone(record["gaze"]["matched_selection"])
+        texts = [text for text, _ in self.bridge.statuses]
+        self.assertTrue(any(t.startswith("Understanding") and "Viewport changed" in t and "calibrate gaze again" in t
+                            for t in texts), texts)
+        self.assertTrue(any(t.startswith("Working:") and "Viewport changed" in t for t in texts), texts)
+
+    def test_the_same_size_viewport_uses_gaze_as_usual(self):
+        self.saved_for(1840, 1100)
+        record = self.run_gaze("on", source="camera")
+        self.assertEqual(record["gaze"]["status"], "resolved")
+        self.assertNotIn("viewport_changed", record["gaze"])
+        self.assertTrue(self.asked_gaze())
+        self.assertIn("(gaze)", self.editor.sent[0])
+
+    def test_the_viewport_is_checked_for_every_command_not_once_when_voice_starts(self):
+        self.stt = FakeStt(["add blue color there", "and there"], words=THERE_WORDS)
+        self.refiner = FakeSession([TurnResult(THERE_REFINED, False)] * 2)
+        self.editor = FakeSession([TurnResult("Made the wing blue.", False, ["execute_blender_code"])] * 2)
+        self.saved_for(1840, 1100)
+        self.build(gaze_mode="on", gaze_source="camera").start()
+        self.gaze.look(0.5, 0.5)
+        first = self.speak()
+        self.assertEqual(first["gaze"]["status"], "resolved")
+        self.bridge.view_reply = {"ok": True, "width": 1840, "height": 900}  # the person resized it between commands
+        self.gaze.look(0.5, 0.5, start=1004.5)
+        second = self.speak(down=1004.0, up=1005.0)
+        self.assertEqual(second["stage"], "done", second["error"])
+        self.assertIs(second["gaze"]["viewport_changed"], True)
+        self.assertEqual(self.bridge.calls.count("gaze_view"), 2)
+
+    def test_watch_only_records_nothing_from_a_resized_viewport_and_says_why(self):
+        self.saved_for(1500, 1100)
+        self.bridge.selected = ["Chair"]
+        record = self.run_gaze("shadow", source="camera")
+        self.assertEqual(self.asked_gaze(), [])
+        self.assertIs(record["gaze"]["viewport_changed"], True)
+        self.assertEqual(self.service.snapshot()["gaze"]["checked"], 0)  # it can't count towards agreement with the selection
+        self.assertTrue(any("Viewport changed" in text for text, _ in self.bridge.statuses))
+
+    def test_the_mouse_has_no_calibration_so_the_viewport_is_never_checked(self):
+        self.gaze = PointerTracker()
+        self.bridge.view_reply = {"ok": True, "width": 10, "height": 10}
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.gaze.feed(0.5, 0.5, 1002.5)
+        self.gaze.feed(0.5, 0.5, 1002.6)
+        self.assertIsNone(self.gaze.view)
+        record = self.speak()
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertNotIn("gaze_view", self.bridge.calls)
+        self.assertNotIn("viewport_changed", record["gaze"])
+
+    def test_if_blender_cant_say_the_size_gaze_goes_ahead_and_copes_as_before(self):
+        self.saved_for(1500, 1100)
+        for reply in ({"ok": False, "error": "unknown command"}, {"ok": False, "error": "no 3D viewport"}, {}, None):
+            self.bridge.view_reply = reply
+            self.bridge.picks.clear()
+            self.stt = FakeStt(["add blue color there"], words=THERE_WORDS)
+            self.refiner = FakeSession([TurnResult(THERE_REFINED, False)])
+            self.editor = FakeSession([TurnResult("Made the wing blue.", False, ["execute_blender_code"])])
+            record = self.run_gaze("on", source="camera")
+            self.assertNotIn("viewport_changed", record["gaze"], reply)
+            self.assertTrue(self.bridge.picks, reply)
+            self.service.stop()
+
+    def test_a_command_with_no_pointing_word_is_checked_too_and_says_so_when_the_viewport_changed(self):
+        self.stt = FakeStt(["add a cube"], words=[{"text": "add", "start": 0.1, "end": 0.3},
+                                                  {"text": "cube", "start": 0.4, "end": 0.7}])
+        self.saved_for(1500, 1100)
+        record = self.run_gaze("on", source="camera")
+        self.assertIs(record["gaze"]["viewport_changed"], True)
+        self.assertEqual(self.asked_gaze(), [])
+        self.assertTrue(any("Viewport changed" in text for text, _ in self.bridge.statuses))
+
+    def test_a_command_with_no_pointing_word_leaves_no_gaze_record_when_the_viewport_is_the_same(self):
+        self.stt = FakeStt(["add a cube"], words=[{"text": "add", "start": 0.1, "end": 0.3},
+                                                  {"text": "cube", "start": 0.4, "end": 0.7}])
+        self.saved_for(1840, 1100)
+        record = self.run_gaze("on", source="camera")
+        self.assertIsNone(record["gaze"])
+        self.assertEqual(self.bridge.calls.count("gaze_view"), 1)
+        self.assertEqual(self.asked_gaze(), [])
 
     # --- commands that never use it -----------------------------------------------------------------
     def test_stop_and_undo_never_touch_gaze(self):

@@ -1,6 +1,6 @@
 """Gaze from the camera as a long-lived worker: the face model loads once, then positions stream in.
 
-A gaze part for the voice loop (`.start()`, `.stop()`, `.alive`, `.track`, `.radius`), built like SpeechService.
+A gaze part for the voice loop (`.start()`, `.stop()`, `.alive`, `.track`, `.radius`, `.view`), built like SpeechService.
 The worker owns the camera, so the camera is open exactly as long as this tracker is started.
 """
 
@@ -18,10 +18,11 @@ import time
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from .gaze import DEFAULT_RADIUS, GazeSample, GazeTrack
+from .gaze import DEFAULT_RADIUS, GazeSample, GazeTrack, viewport_size
 
 START_SECONDS = 60.0  # model load, and the camera's first picture, which can wait for the person to say yes
 STOP_SECONDS = 4.0  # how long a worker gets to let go of the camera after its stdin closes
+LOOKING_AWAY_MARGIN = 0.1  # a reading this far or less outside the viewport is noise; further out is looking away
 
 
 class GazeError(Exception):
@@ -40,12 +41,21 @@ def radius_of(calibration: dict | None) -> tuple[float, float]:
     return (ru, rv) if all(math.isfinite(x) and x > 0 for x in (ru, rv)) else DEFAULT_RADIUS
 
 
+def view_of(calibration: dict | None) -> tuple[int, int] | None:
+    """The viewport size (width, height) a calibration was made on, or None if it doesn't say."""
+    try:
+        return viewport_size(calibration["view"])  # type: ignore[index]
+    except (TypeError, KeyError):
+        return None
+
+
 class GazeTracker:
     """The gaze worker: samples go into `.track`, and calibration goes through `.collect`, `.stop_collect` and `.fit`.
 
-    `calibration` is a saved one, `{"model", "check", …}`, or None before the first. Its model is loaded when
-    the worker starts, and its check sets `.radius`. `model_file` is MediaPipe's face model, which the worker
-    needs unless `extra_args` has "--fake".
+    `calibration` is a saved one, `{"model", "check", "view", …}`, or None before the first. Its model is loaded
+    when the worker starts, its check sets `.radius`, and its view is `.view`: the viewport size it was made
+    for, which the voice loop compares with Blender's now. `model_file` is MediaPipe's face model, which the
+    worker needs unless `extra_args` has "--fake".
     """
 
     def __init__(
@@ -66,6 +76,7 @@ class GazeTracker:
         self.env = dict(os.environ, **(env or {}))
         self.calibration = calibration
         self.radius = radius_of(calibration)
+        self.view = view_of(calibration)
         self.track = GazeTrack()
         self.proc: subprocess.Popen | None = None
         self._replies: queue.Queue[dict] = queue.Queue()
@@ -133,6 +144,8 @@ class GazeTracker:
         except (KeyError, TypeError, ValueError):
             return
         if all(math.isfinite(x) for x in (t, u, v, confidence)):  # one NaN would spoil every median after it
+            if not all(-LOOKING_AWAY_MARGIN <= x <= 1 + LOOKING_AWAY_MARGIN for x in (u, v)):
+                confidence = 0.0  # looking away from the screen: ignored, rather than clamped to the nearest edge
             self.track.add(GazeSample(t, u, v, confidence))
 
     def _read_stderr(self) -> None:
@@ -182,10 +195,11 @@ class GazeTracker:
             raise
 
     def load(self, calibration: dict, timeout: float = 10.0) -> None:
-        """Start (or change) what the stream is calibrated with, and take `.radius` from its check."""
+        """Start (or change) what the stream is calibrated with, and take `.radius` and `.view` from it."""
         self._load_model(calibration["model"], time.monotonic() + timeout)
         self.calibration = calibration
         self.radius = radius_of(calibration)
+        self.view = view_of(calibration)
 
     def collect(self, uv: tuple[float, float], check: bool = False) -> None:
         """From now on keep a row of the face for each frame, as looking at `uv`.

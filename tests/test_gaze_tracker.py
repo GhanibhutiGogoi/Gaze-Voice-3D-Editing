@@ -11,8 +11,8 @@ from types import SimpleNamespace
 
 from gazevoice import gaze_model, gaze_worker
 from gazevoice.components.microphone import parse_video_devices, pick_camera
-from gazevoice.voice.gaze import DEFAULT_RADIUS, GazeTrack
-from gazevoice.voice.gaze_tracker import GazeError, GazeTracker
+from gazevoice.voice.gaze import DEFAULT_RADIUS, GazeTrack, fixate
+from gazevoice.voice.gaze_tracker import LOOKING_AWAY_MARGIN, GazeError, GazeTracker, view_of
 
 from .test_gaze_model import face
 
@@ -350,6 +350,43 @@ class GazeTrackerTest(unittest.TestCase):
         self.assertEqual(self.make(calibration={"model": {}}).radius, DEFAULT_RADIUS)
         for bad in ([0.1], "wide", [None, 0.1], [0.1, float("nan")], [0.0, 0.1], [-0.2, 0.1]):
             self.assertEqual(self.make(calibration={"check": {"radius": bad}}).radius, DEFAULT_RADIUS, bad)
+
+    def test_the_viewport_it_was_calibrated_on_comes_from_the_calibration(self):
+        saved = {**a_calibration(), "view": {"width": 1840, "height": 1100}}
+        self.assertEqual(self.make(calibration=saved).view, (1840, 1100))
+        self.assertIsNone(self.make(calibration=None).view)  # nothing to compare with
+        self.assertIsNone(self.make().view)  # a calibration that doesn't say
+        for bad in ({"width": 1840}, {"width": 0, "height": 5}, "big", None, [1840, 1100]):
+            self.assertIsNone(self.make(calibration={**a_calibration(), "view": bad}).view, bad)
+        self.assertEqual(view_of(saved), (1840, 1100))
+        self.assertIsNone(view_of("not a calibration"))
+
+    def test_loading_a_new_calibration_changes_the_viewport_too(self):
+        tracker = self.make(calibration=None)
+        tracker.start(timeout=20)
+        tracker.load({**a_calibration(), "view": {"width": 1500, "height": 900}})
+        self.assertEqual(tracker.view, (1500, 900))
+
+    def test_looking_far_off_the_viewport_is_looking_away_and_is_ignored(self):
+        self.assertEqual(LOOKING_AWAY_MARGIN, 0.1)
+        tracker = self.make()
+
+        def keep(u, v, confidence=0.9):
+            tracker.track = GazeTrack()
+            tracker._keep({"t": 5.0, "uv": [u, v], "confidence": confidence})
+            return [s.confidence for s in tracker.track.between(0, math.inf)]
+
+        self.assertEqual(keep(0.5, 0.5), [0.9])
+        self.assertEqual(keep(0.0, 1.0), [0.9])  # the edges of the viewport
+        self.assertEqual(keep(-0.1, 1.1), [0.9])  # and a little past them, which is just noise in the estimate
+        for u, v in ((1.2, 0.5), (-0.2, 0.5), (0.5, 1.5), (0.5, -0.11), (3.0, 3.0)):
+            self.assertEqual(keep(u, v), [0.0], (u, v))  # kept as a sample, but with no confidence: not clamped to an edge
+
+    def test_a_reading_that_is_off_the_viewport_cannot_become_a_fixation(self):
+        tracker = self.make()
+        for i in range(10):
+            tracker._keep({"t": 5.0 + i * 0.03, "uv": [2.0, 0.5], "confidence": 0.9})
+        self.assertIsNone(fixate(tracker.track.between(0, math.inf)))  # no edge pick comes from looking away
 
     def test_a_dead_worker_reads_as_not_alive(self):
         tracker = self.make()

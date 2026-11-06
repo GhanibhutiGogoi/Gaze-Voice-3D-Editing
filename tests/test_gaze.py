@@ -21,6 +21,7 @@ from gazevoice.voice.gaze import (
     pointing_words,
     ray_points,
     score_hits,
+    viewport_size,
 )
 
 CHAIR = {"uid": 11, "name": "Chair", "faces": 900, "point": [1.0, 1.0, 1.0]}
@@ -508,6 +509,18 @@ class ToDictTest(unittest.TestCase):
         grounding = self.grounding()
         grounding.targets[0].picture = "a wing tip"
         self.assertEqual(grounding.to_dict()["targets"][0]["picture"], "a wing tip")
+
+
+class ViewportSizeTest(unittest.TestCase):
+    def test_a_width_and_height_in_pixels_make_a_size(self):
+        self.assertEqual(viewport_size({"width": 1840, "height": 1100}), (1840, 1100))
+        self.assertEqual(viewport_size({"ok": True, "width": 1840, "height": 1100}), (1840, 1100))  # a gaze_view reply
+
+    def test_anything_else_is_no_size_at_all(self):
+        for report in (None, {}, [], "1840x1100", {"width": 1840}, {"width": 0, "height": 1100},
+                       {"width": -5, "height": 10}, {"width": 18.4, "height": 1100}, {"width": True, "height": 1},
+                       {"width": "1840", "height": "1100"}, {"width": None, "height": None}):
+            self.assertIsNone(viewport_size(report), report)
 
 
 if __name__ == "__main__":

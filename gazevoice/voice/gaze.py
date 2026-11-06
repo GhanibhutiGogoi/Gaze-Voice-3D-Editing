@@ -30,6 +30,22 @@ _EDGE_PUNCTUATION = re.compile(r"^\W+|\W+$")
 _SLACK = 1e-9  # 13/24 - 7/24 is 0.24999999999999994, and still a lead of exactly 0.25
 
 
+def viewport_size(report: object) -> tuple[int, int] | None:
+    """The (width, height) in pixels that `report` says, or None if it isn't two positive whole numbers.
+
+    `report` is a `gaze_view` reply or a calibration's "view". Gaze is calibrated for one viewport size: if
+    Blender's is a different size now, the same look lands somewhere else.
+    """
+    try:
+        width, height = report["width"], report["height"]  # type: ignore[index]
+    except (TypeError, KeyError):
+        return None
+    sizes = (width, height)
+    if all(isinstance(x, int) and not isinstance(x, bool) and x > 0 for x in sizes):
+        return width, height
+    return None
+
+
 @dataclass(frozen=True)
 class GazeSample:
     """Where the eyes were at time `t` (`time.time()`). `u, v` run 0 to 1 across the viewport from the top left."""

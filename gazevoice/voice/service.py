@@ -43,7 +43,17 @@ from ..events import EventBus
 from .audio import SILENCE_HELP, MicError, is_digital_silence, write_wav
 from .brains import BrainError
 from .commands import choice_number, editor_message, meta_command, parse_refined, refiner_message, vocabulary_prompt
-from .gaze import MAX_CANDIDATES, Candidate, GazeSample, GazeTrack, Grounding, ground, is_clear, pointing_words
+from .gaze import (
+    MAX_CANDIDATES,
+    Candidate,
+    GazeSample,
+    GazeTrack,
+    Grounding,
+    ground,
+    is_clear,
+    pointing_words,
+    viewport_size,
+)
 from .stt import SpeechError
 
 PREROLL = 0.35  # seconds of audio kept from before the key went down
@@ -64,6 +74,8 @@ EDITOR_WARMUP = "Warm-up, not a command: don't use any tools and don't change an
 READ_ONLY_TOOLS = ("get_", "search_", "render_viewport_to_path")
 POINTER_RADIUS = (0.02, 0.03)  # a mouse is nearly exact: the rays cover this share of the viewport's width and height
 GAZE_LOST = "Gaze lost, using your selection"
+VIEW_CHANGED = "Viewport changed, calibrate gaze again. Using your selection"
+CAMERA_BUSY = "Gaze is using the camera to calibrate or test. Wait for it to finish, then turn voice on."
 CHOICE_SECONDS = 8.0  # how long numbers stay on screen waiting to be answered
 WHICH_ONE = "Which one? Say the number."
 NO_ANSWER = "No answer, using your selection"
@@ -103,7 +115,8 @@ class Factories:
     stt: Callable[[], Any]
     refiner: Callable[[], Any]
     editor: Callable[[], Any]
-    # Builds a gaze part: .start(), .stop(), .alive, .track (a GazeTrack) and .radius. None means no gaze.
+    # Builds a gaze part: .start(), .stop(), .alive, .track (a GazeTrack), .radius and .view (the viewport size it was
+    # calibrated for, or None when it needs no calibration). None means no gaze.
     gaze: Callable[[], Any] | None = None
 
 
@@ -114,6 +127,7 @@ class PointerTracker:
     """
 
     radius = POINTER_RADIUS
+    view = None  # nothing was calibrated, so there is no viewport size to go out of date
 
     def __init__(self):
         self.track = GazeTrack()
@@ -172,6 +186,7 @@ class VoiceService:
         host: str = "blender",
         gaze_mode: str = "off",
         gaze_source: str = "camera",
+        camera=None,
     ):
         self.logs_dir = Path(logs_dir)
         self.bus = bus
@@ -181,6 +196,7 @@ class VoiceService:
         self.host = host
         self.gaze_mode = gaze_mode  # "off", "shadow" (record only) or "on" (tell the brains)
         self.gaze_source = gaze_source
+        self.camera = camera  # a CameraClaim shared with gaze calibration: voice holds it from start to stop
         self.host_label = "Unity" if host == "unity" else "Blender"
         self.busy_wait = UNITY_BUSY_WAIT if host == "unity" else BUSY_WAIT
         self.choice_seconds = CHOICE_SECONDS
@@ -311,6 +327,8 @@ class VoiceService:
         with self._lock:
             if self.state not in ("off", "error"):
                 raise VoiceError("Voice is already on.")
+            if self.camera is not None and self.camera.take("voice"):
+                raise VoiceError(CAMERA_BUSY)
             run = self._run = _Run()
             self._reset_pending = False
             self._conversation_since = self.clock()
@@ -435,9 +453,14 @@ class VoiceService:
         if errors:
             raise errors[0] if isinstance(errors[0], BrainError) else BrainError(str(errors[0]))
 
+    def _give_back_camera(self) -> None:
+        if self.camera is not None:
+            self.camera.release("voice")
+
     def _abort_start(self, run: _Run, exc: Exception) -> NoReturn:
         self._teardown_parts()
         self._close_bridge()
+        self._give_back_camera()  # the gaze worker, if there was one, has let go of it by now
         with self._lock:
             if self._run is run:
                 self._run = None
@@ -490,6 +513,7 @@ class VoiceService:
             thread.join(timeout=JOIN_SECONDS)
         self._status("Voice is off", "idle")
         self._close_bridge()
+        self._give_back_camera()  # teardown stopped the gaze worker above
         with self._lock:
             if self._run is run:
                 self._run = None
@@ -1079,16 +1103,35 @@ class VoiceService:
             return None
         return gaze["targets"][0]["candidates"][0]["name"] in selected
 
+    def _viewport_changed(self, gaze) -> bool:
+        """Whether Blender's viewport is a different size now from the one the camera was calibrated on.
+
+        Asked again for each command, because the person can resize the viewport at any time. False when there is
+        nothing to compare (the mouse), or when Blender can't say: ground() copes with that the way it always has.
+        """
+        saved = getattr(gaze, "view", None)
+        if saved is None:
+            return False
+        reply = self._bridge_call({"cmd": "gaze_view"})
+        live = viewport_size(reply) if reply and reply.get("ok") else None
+        return live is not None and live != saved
+
     def _ground(self, record: dict, run: _Run) -> bool:
         """Work out what the pointing words in a spoken command refer to, from where the person was looking.
 
         The answer goes in record["gaze"]. In "on" mode it also joins the focus the brains read, and guesses too close
         to call are put to the person first (see _ask_which). Nothing here can stop a command: if gaze is lost or
         breaks, or nobody says which one, the command runs on the selection. The one exception is that last case with
-        nothing selected. There is nothing to run it on, so the command fails and this returns False.
+        nothing selected. There is nothing to run it on, so the command fails and this returns False. A camera that was
+        calibrated on a differently sized viewport is treated like lost gaze, and the status line says to calibrate again.
         """
         gaze = self._gaze  # there is none when gaze is off, can't start, or has no camera part yet
         if gaze is None:
+            return True
+        if self._viewport_changed(gaze):  # for every command: the person can resize the viewport at any moment
+            record["gaze"] = {"status": "none", "targets": [], "radius": [], "matched_selection": None, "asked": False,
+                              "viewport_changed": True}
+            record["_gaze_note"] = VIEW_CHANGED
             return True
         words, clip_start = record["words"], record["_t0"] - PREROLL  # the clip _transcribe cut starts here
         if not pointing_words(words, clip_start):

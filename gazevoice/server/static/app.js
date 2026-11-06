@@ -287,6 +287,8 @@ function resultLine(job) {
   }
   if (r.project) return `Project: ${r.project.split("/").pop()}`;
   if (r.launched) return "Launched";
+  if (r.calibrated) return typeof r.median === "number" ? `Typically off by ${Math.round(r.median * 100)}% of the viewport` : "Calibrated";
+  if (r.tested) return typeof r.followed === "number" ? `The ring found you ${Math.round(r.followed * 100)}% of the time` : "Tested";
   if (r.installed) return "Installed";
   return "Done";
 }
@@ -808,6 +810,8 @@ function renderVoice() {
     if (v.needs_restart) {
       box.append(h("p", { class: "voice-note", "data-tone": "warn", text: "Settings changed. Stop and start voice to use them." }));
     }
+    const agreement = gazeAgreement(v);
+    if (agreement) box.append(h("p", { class: "voice-note", text: agreement }));
 
     if (on) {
       const input = h("input", {
@@ -852,6 +856,15 @@ function renderVoice() {
           : "Commands you speak show up here: what was heard, what was understood, and what changed.",
       }));
   });
+}
+
+// With gaze on or watching, your selection is the right answer to "this", so how often gaze picked the same
+// thing needs no labelling. Only commands with a pointing word and something selected are counted.
+function gazeAgreement(v) {
+  const gaze = v.gaze;
+  if (!gaze || gaze.mode === "off" || !gaze.checked) return null;
+  const share = Math.round((100 * gaze.matched) / gaze.checked);
+  return `Gaze picked what you had selected on ${gaze.matched} of ${plural(gaze.checked, "command")} (${share}%).`;
 }
 
 function providerNames() {
@@ -1036,7 +1049,7 @@ function gazeRows(settings) {
   return [
     routeRow("Gaze", "gaze_mode", settings.gaze_mode, [["off", "Off"], ["shadow", "Watch only"], ["on", "On"]]),
     routeRow("Gaze source", "gaze_source", settings.gaze_source, [["camera", "Camera"], ["mouse", "Mouse"]]),
-    h("p", { class: "route-note", text: "Gaze tells the editor what you were looking at when you say this, that or there. Watch only records it and compares it with your selection, but changes nothing. Mouse uses the pointer over Blender's 3D viewport while you hold the key. Camera uses the Gaze unit in the rack: it has to be installed and calibrated, and until then voice uses your selection. The camera is only on while voice is on, and no picture is kept." }),
+    h("p", { class: "route-note", text: "Gaze tells the editor what you were looking at when you say this, that or there. Watch only records it and compares it with your selection, but changes nothing. Mouse uses the pointer over Blender's 3D viewport while you hold the key. Camera uses the Gaze unit in the rack: it has to be installed and calibrated, and until then voice uses your selection. The camera is only on while voice is on, or while you calibrate or test it, and no picture is kept." }),
   ];
 }
 

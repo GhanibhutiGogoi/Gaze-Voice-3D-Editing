@@ -218,6 +218,16 @@ class BuildVoiceTest(unittest.TestCase):
         with self.assertRaises(ProbeTimedOut):  # the service turns this into "voice uses your selection"
             voice.factories.gaze()
 
+    def test_the_viewport_a_camera_was_calibrated_on_goes_with_the_gaze_part(self):
+        self.set_up_gaze({**a_calibration(), "view": {"width": 1840, "height": 1100}, "when": 1.0})
+        voice = self.gaze_voice(gaze_mode="on", gaze_source="camera")
+        self.assertEqual(voice.factories.gaze().view, (1840, 1100))  # the voice loop compares it with Blender's, per command
+        self.assertIsNone(self.gaze_voice(gaze_mode="on", gaze_source="mouse").factories.gaze().view)
+
+    def test_voice_and_gaze_calibration_share_one_claim_on_the_camera(self):
+        voice = self.gaze_voice(gaze_mode="on", gaze_source="camera")
+        self.assertIs(voice.camera, self.t.ctx.camera)  # the same object the Gaze unit takes before it opens the camera
+
     def test_the_mouse_needs_no_calibration_camera_or_install(self):
         voice = self.gaze_voice(gaze_mode="on", gaze_source="mouse")
         self.assertIsInstance(voice.factories.gaze(), PointerTracker)
