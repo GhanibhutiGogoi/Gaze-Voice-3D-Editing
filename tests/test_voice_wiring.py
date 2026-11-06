@@ -188,6 +188,16 @@ class BuildVoiceTest(unittest.TestCase):
         self.assertEqual(describer.command, ("claude",))
         self.assertFalse(describer.ready())  # nothing has been checked yet
 
+    def test_pictures_left_on_with_gaze_not_on_build_no_describer_and_ask_claude_nothing(self):
+        for mode in ("off", "shadow"):
+            with self.subTest(mode):
+                leftover = self.leftover_image()
+                self.t.runner.calls.clear()
+                voice = self.gaze_voice(gaze_mode=mode, gaze_source="mouse", gaze_pictures=True)
+                self.assertIsNone(voice.factories.pictures())
+                self.assertFalse(any(call[0] == "claude" for call in self.t.runner.calls))
+                self.assertFalse(leftover.exists())  # what a crash left still goes
+
     def test_unity_never_builds_a_picture_part(self):
         voice = self.gaze_voice(host="unity", gaze_pictures=True)
         self.assertIsNone(voice.factories.pictures)

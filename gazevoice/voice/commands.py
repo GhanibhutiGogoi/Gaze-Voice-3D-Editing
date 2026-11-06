@@ -29,6 +29,7 @@ _META = {
     ),
 }
 _NUMBER_WORDS = {w: n for n, w in enumerate("one two three four five six seven eight nine ten".split(), 1)}
+_NUMBER_WORDS |= {"won": 1, "to": 2, "too": 2, "for": 4}  # what speech-to-text writes for a number said on its own
 _CHOICE = re.compile(rf"^(?:number\s+)?(\d{{1,2}}|{'|'.join(_NUMBER_WORDS)})$")
 _BLENDER_TERMS = (
     "Blender, bevel, extrude, inset, subdivide, loop cut, knife, bridge edge loops, boolean, union, difference, "
@@ -63,7 +64,7 @@ def meta_command(text: str) -> str | None:
 
 
 def choice_number(text: str) -> int | None:
-    """The number when the whole utterance is just one ("two", "number two", "2"); None otherwise.
+    """The number when the whole utterance is just one ("two", "number two", "2", or "to" for "two"); None otherwise.
 
     Voice only listens for it while numbers are on screen. "Undo" and "stop" are not numbers.
     """

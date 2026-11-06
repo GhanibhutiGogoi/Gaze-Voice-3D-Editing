@@ -74,6 +74,7 @@ JOIN_SECONDS = 10.0  # how long stop() waits for each loop (and for an interrupt
 BUSY_WAIT = 10.0  # how long an undo operation waits for the host to finish an edit
 UNITY_BUSY_WAIT = 60.0  # Unity may have to finish compiling, then reload
 DEFAULT_KEY = "⌥ Space"
+STATUS_CHARS = 200  # the most of a status that is sent to the host
 UNDO_NAME_BYTES = 63  # Blender keeps 64 bytes of an undo step's name, the closing NUL included
 EDIT_SECONDS = 600.0  # a detailed build can take minutes; "stop" still ends it at once
 REFINE_SECONDS = 90.0
@@ -332,7 +333,7 @@ class VoiceService:
         with self._lock:
             self._status_seq += 1
             seq = self._status_seq
-        self._bridge_call({"cmd": "status", "text": text[:200], "state": state})
+        self._bridge_call({"cmd": "status", "text": text[:STATUS_CHARS], "state": state})
         if revert:
             timer = threading.Timer(IDLE_AFTER, self._revert_status, args=(seq,))
             timer.daemon = True
@@ -1476,4 +1477,5 @@ class VoiceService:
         if failed:
             self._fail(record, turn.text or "The edit didn't finish.")
             return
-        self._done(record, f"✓ {turn.text or 'Done'}")
+        hint = self._gaze_hint(record)  # the tools' statuses have replaced it by now, and it mustn't be cut off here
+        self._done(record, f"✓ {(turn.text or 'Done')[:STATUS_CHARS - len('✓ ') - len(hint)]}{hint}")

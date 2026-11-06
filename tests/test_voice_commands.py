@@ -316,5 +316,18 @@ class PromptsTest(unittest.TestCase):
         self.assertLess(len(prompt.split()), 220)
 
 
+class ChoiceNumberSoundsLikeTest(unittest.TestCase):
+    def test_words_that_sound_like_a_number_count_as_it(self):
+        for said, number in {"to": 2, "too": 2, "won": 1, "for": 4, "To.": 2, "Too!": 2, "number to": 2, "Won": 1,
+                             "for please": 4}.items():
+            with self.subTest(said):
+                self.assertEqual(choice_number(said), number)
+
+    def test_only_when_that_is_all_that_was_said(self):
+        for said in ("to the left", "too big", "we won", "for the wing", "move it to", "for each"):
+            with self.subTest(said):
+                self.assertIsNone(choice_number(said))
+
+
 if __name__ == "__main__":
     unittest.main()

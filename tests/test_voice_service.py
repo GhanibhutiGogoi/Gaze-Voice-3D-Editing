@@ -1333,6 +1333,25 @@ class GazeVoiceTest(VoiceTestBase):
                             for t in texts), texts)
         self.assertTrue(any("Gaze lost" in t and t.startswith("Working:") for t in texts), texts)
 
+    def test_lost_gaze_is_still_on_the_status_line_when_the_edit_is_done(self):
+        self.bridge.selected = ["Chair"]
+        self.editor = FakeSession([TurnResult("Made Chair blue.", False, ["execute_blender_code"])])
+        self.run_gaze("on", look=False)
+        self.assertEqual(self.bridge.statuses[-1], ("✓ Made Chair blue. · Gaze lost, using your selection", "done"))
+
+    def test_a_long_reply_doesnt_push_the_note_off_the_status_line(self):
+        self.bridge.selected = ["Chair"]
+        self.editor = FakeSession([TurnResult("Made " + "very " * 60 + "blue.", False, ["execute_blender_code"])])
+        self.run_gaze("on", look=False)
+        text = self.bridge.statuses[-1][0]
+        self.assertLessEqual(len(text), 200)
+        self.assertTrue(text.endswith(" · Gaze lost, using your selection"), text)
+
+    def test_the_done_line_is_as_it_was_when_gaze_was_fine(self):
+        self.editor = FakeSession([TurnResult("Made the wing blue.", False, ["execute_blender_code"])])
+        self.run_gaze("on")
+        self.assertEqual(self.bridge.statuses[-1], ("✓ Made the wing blue.", "done"))
+
     def test_lost_tracking_in_shadow_mode_says_nothing(self):
         record = self.run_gaze("shadow", look=False)
         self.assertEqual(record["gaze"]["status"], "none")
@@ -2073,6 +2092,39 @@ class GazeChoiceTest(VoiceTestBase):
         self.hold(1006.0, 1007.0)
         wait_for(lambda: spoken["stage"] == "done")
         self.assertEqual(spoken["gaze"]["targets"][0]["candidates"][0]["name"], "Eagle")
+
+    def test_a_word_that_sounds_like_a_number_is_an_answer_while_numbers_are_up(self):
+        for heard, picked in (("to", "Perch"), ("Too.", "Perch"), ("won", "Eagle")):
+            with self.subTest(heard):
+                self.stt = FakeStt(["add blue color there", heard], words=THERE_WORDS)
+                self.refiner = FakeSession([TurnResult(THERE_REFINED, False)])
+                self.editor = FakeSession([TurnResult("Made it blue.", False, ["execute_blender_code"])])
+                self.editors_made = 0
+                self.start()
+                spoken = self.hold()
+                self.wait_for_labels(1)
+                answer = self.hold(1004.0, 1005.0)
+                wait_for(lambda: spoken["stage"] == "done")
+                self.assertEqual(answer["reply"], f"Picked {picked}.")
+                self.assertEqual(len(self.refiner.sent), 1)
+                self.service.stop()
+                self.bridge.shows.clear()
+
+    def test_for_is_a_number_too_and_is_told_it_isnt_on_screen(self):
+        self.stt = FakeStt(["add blue color there", "for"], words=THERE_WORDS)
+        self.start(seconds=0.5)
+        self.hold()
+        self.wait_for_labels()
+        answer = self.hold(1004.0, 1005.0)
+        wait_for(lambda: answer["stage"] == "done")
+        self.assertEqual(answer["reply"], "Say a number from 1 to 2.")
+
+    def test_a_word_that_sounds_like_a_number_with_nothing_waiting_is_an_ordinary_command(self):
+        self.stt = FakeStt(["to"])
+        self.start()
+        record = self.speak()
+        self.assertEqual(record["kind"], "command")
+        self.assertEqual(len(self.refiner.sent), 1)
 
     def test_a_number_with_nothing_waiting_is_an_ordinary_command(self):
         self.stt = FakeStt(["two"], words=[])
