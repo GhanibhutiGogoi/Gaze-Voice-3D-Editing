@@ -26,6 +26,8 @@ _META = {
         r"|wait|hold on|hang on)$"
     ),
 }
+_NUMBER_WORDS = {w: n for n, w in enumerate("one two three four five six seven eight nine ten".split(), 1)}
+_CHOICE = re.compile(rf"^(?:number\s+)?(\d{{1,2}}|{'|'.join(_NUMBER_WORDS)})$")
 _BLENDER_TERMS = (
     "Blender, bevel, extrude, inset, subdivide, loop cut, knife, bridge edge loops, boolean, union, difference, "
     "modifier, array, mirror, solidify, shrinkwrap, decimate, remesh, smooth, shade smooth, shade flat, "
@@ -56,6 +58,18 @@ def meta_command(text: str) -> str | None:
         if said and pattern.match(said):
             return kind
     return None
+
+
+def choice_number(text: str) -> int | None:
+    """The number when the whole utterance is just one ("two", "number two", "2"); None otherwise.
+
+    Voice only listens for it while numbers are on screen. "Undo" and "stop" are not numbers.
+    """
+    match = _CHOICE.match(_normalize(text))
+    if match is None:
+        return None
+    word = match.group(1)
+    return _NUMBER_WORDS[word] if word in _NUMBER_WORDS else int(word)
 
 
 @dataclass(frozen=True)

@@ -15,8 +15,10 @@ outlives its run can never pick up the next run's commands.
 
 A fourth part is optional: gaze (the camera, or the mouse standing in for it). It only keeps a short track of
 where the person looked. When a spoken command has a pointing word like "there", the edit thread asks the host
-what was under that spot and, in "on" mode, tells the brains in the focus. Gaze never edits anything, and
-whatever goes wrong with it, the command runs on the selection.
+what was under that spot and, in "on" mode, tells the brains in the focus. When two guesses are too close to
+call, the edit thread puts numbers on them in the viewport and waits for the person to say one; the stt thread
+keeps running, so the answer is heard. Gaze never edits anything, and whatever goes wrong with it, the command
+runs on the selection.
 
 Everything a command did is kept in a record (shown on the dashboard, saved to
 logs/commands/<time>-<n>/record.json next to its audio).
@@ -40,8 +42,8 @@ from typing import Any, Callable, NoReturn
 from ..events import EventBus
 from .audio import SILENCE_HELP, MicError, is_digital_silence, write_wav
 from .brains import BrainError
-from .commands import editor_message, meta_command, parse_refined, refiner_message, vocabulary_prompt
-from .gaze import GazeSample, GazeTrack, ground, pointing_words
+from .commands import choice_number, editor_message, meta_command, parse_refined, refiner_message, vocabulary_prompt
+from .gaze import MAX_CANDIDATES, Candidate, GazeSample, GazeTrack, Grounding, ground, is_clear, pointing_words
 from .stt import SpeechError
 
 PREROLL = 0.35  # seconds of audio kept from before the key went down
@@ -62,6 +64,10 @@ EDITOR_WARMUP = "Warm-up, not a command: don't use any tools and don't change an
 READ_ONLY_TOOLS = ("get_", "search_", "render_viewport_to_path")
 POINTER_RADIUS = (0.02, 0.03)  # a mouse is nearly exact: the rays cover this share of the viewport's width and height
 GAZE_LOST = "Gaze lost, using your selection"
+CHOICE_SECONDS = 8.0  # how long numbers stay on screen waiting to be answered
+WHICH_ONE = "Which one? Say the number."
+NO_ANSWER = "No answer, using your selection"
+COULDNT_TELL = "Couldn't tell what you meant. Select it or say its name."
 _COULDNT = re.compile(r"(?:could(?:n['’]t| not)|can(?:['’]t|not))\b", re.IGNORECASE)  # the editor saying it failed
 
 
@@ -134,6 +140,15 @@ class _Run:
     threads: list[threading.Thread] = field(default_factory=list)
 
 
+@dataclass
+class _Choice:
+    """Numbers on screen, and the command waiting for the person to say one."""
+
+    names: list[str]  # what each number stands for, number 1 first
+    answered: threading.Event = field(default_factory=threading.Event)  # a number was said, or the wait was ended
+    number: int | None = None  # the number that was said; None if the wait ended without one
+
+
 def _end(part) -> None:
     """Close or stop a part, whichever it has. Safe to call twice."""
     for method in ("close", "stop"):
@@ -168,6 +183,7 @@ class VoiceService:
         self.gaze_source = gaze_source
         self.host_label = "Unity" if host == "unity" else "Blender"
         self.busy_wait = UNITY_BUSY_WAIT if host == "unity" else BUSY_WAIT
+        self.choice_seconds = CHOICE_SECONDS
         self.clock = clock
         self.state = "off"
         self.reason = ""
@@ -181,6 +197,7 @@ class VoiceService:
         self._stt_busy = False
         self._edit_stage: str | None = None
         self._current: dict | None = None  # the command being understood or edited
+        self._choice: _Choice | None = None  # set while numbers are on screen
         self._reset_pending = False
         self._conversation_since = 0.0
         self._bridge = self._mic = self._stt = self._refiner = self._editor = self._gaze = None
@@ -353,7 +370,7 @@ class VoiceService:
         if mic.heard_only_silence():
             raise MicError(SILENCE_HELP)
         if self.host == "blender":
-            self._bridge_call({"cmd": "gaze_show", "dot": None, "ring": None, "marks": []})  # nothing stale on screen
+            self._hide_gaze()  # nothing stale on screen
             self._start_gaze(run)
         self._bridge_call({"cmd": "poll"})  # drop key presses (and mouse positions) Blender queued while voice was off
 
@@ -849,9 +866,39 @@ class VoiceService:
             return
         if meta:  # undo and redo wait their turn behind the commands before them
             record["kind"] = record["refined"] = meta
+        elif self._answer_choice(record):  # a number only means something while numbers are on screen
+            return
         record["stage"] = "queued"
         self._update(record)
         run.edit_q.put(record)
+
+    def _answer_choice(self, record: dict) -> bool:
+        """Give a spoken number to the command waiting for one. False when none is waiting: it's an ordinary command."""
+        number = choice_number(record["heard"])
+        if number is None:
+            return False
+        with self._lock:
+            choice = self._choice
+            if choice is None or choice.answered.is_set():
+                return False
+            count = len(choice.names)
+            picked = 1 <= number <= count
+            record["refined"] = f"Number {number}"
+            record["reply"] = f"Picked {choice.names[number - 1]}." if picked else f"Say a number from 1 to {count}."
+            if picked:
+                choice.number = number
+                choice.answered.set()
+        if not picked:  # numbers stay on screen until the wait runs out
+            self._status(record["reply"], "working")
+        self._finish(record, "done")
+        return True
+
+    def _end_choice(self) -> None:
+        """Stop waiting for a number: whoever is waiting goes on without one."""
+        with self._lock:
+            choice = self._choice
+        if choice is not None:
+            choice.answered.set()
 
     def _interrupt_current(self, skip: dict | None = None) -> dict | None:
         """Stop the command being understood or edited. Returns it, or None if nothing was running."""
@@ -860,6 +907,7 @@ class VoiceService:
         if current is None or current is skip:
             return None
         current["_stop"] = True
+        self._end_choice()  # after _stop is set, so a command about to ask sees it
         for session in (self._refiner, self._editor):
             if session is not None:
                 session.interrupt()
@@ -973,6 +1021,56 @@ class VoiceService:
             return None
         return {k: v for k, v in reply.items() if k != "ok"}
 
+    def _hide_gaze(self) -> None:
+        """Take everything gaze drew (the dot, the ring and the numbers) off the viewport."""
+        self._bridge_call({"cmd": "gaze_show", "dot": None, "ring": None, "marks": []})
+
+    def _ask_which(self, record: dict, grounding: Grounding, run: _Run) -> Candidate | None:
+        """Number the first target's guesses in the viewport and wait for the person to say which one.
+
+        Returns the guess they picked. Returns None when they didn't: nothing said within `choice_seconds`, "stop",
+        voice turning off, or Blender unable to draw the numbers. The numbers always come down again.
+        """
+        candidates = grounding.targets[0].candidates[:MAX_CANDIDATES]
+        marks = [{"n": n, "u": c.u, "v": c.v, "name": c.name} for n, c in enumerate(candidates, 1)]
+        choice = _Choice([c.name for c in candidates])
+        self._stage("refining", record)  # the command is still being understood
+        with self._lock:
+            self._choice = choice
+        try:
+            if record["_stop"] or run.stop.is_set():  # looked at after the choice is open, so a stop can't slip between
+                return None
+            shown = self._bridge_call({"cmd": "gaze_show", "dot": None, "ring": None, "marks": marks})
+            if not (shown and shown.get("ok")):
+                return None  # nobody can answer numbers they can't see
+            self._status(WHICH_ONE, "working")
+            choice.answered.wait(self.choice_seconds)
+            if choice.number is None or record["_stop"] or run.stop.is_set():
+                return None
+            return candidates[choice.number - 1]
+        finally:
+            with self._lock:
+                self._choice = None
+            self._hide_gaze()
+
+    def _settle(self, record: dict, grounding: Grounding, run: _Run) -> bool:
+        """Ask which one for each target that isn't clear, in order. False if one went unanswered.
+
+        The guess the person picked moves to the front of its target, with the part of the model looked at closer.
+        """
+        for target in grounding.targets:
+            if is_clear(target):
+                continue
+            picked = self._ask_which(record, Grounding("clarify", [target], grounding.radius), run)
+            if picked is None:
+                return False
+            if target.candidates[0] is not picked:  # the first guess has been looked at already
+                target.candidates.remove(picked)
+                target.candidates.insert(0, picked)
+                target.piece = self._piece(picked)
+        grounding.status = "resolved"
+        return True
+
     @staticmethod
     def _matches_selection(gaze: dict, focus: dict | None) -> bool | None:
         """Whether the first pointing word's best guess is selected. None when there is nothing to compare."""
@@ -981,37 +1079,52 @@ class VoiceService:
             return None
         return gaze["targets"][0]["candidates"][0]["name"] in selected
 
-    def _ground(self, record: dict, run: _Run) -> None:
+    def _ground(self, record: dict, run: _Run) -> bool:
         """Work out what the pointing words in a spoken command refer to, from where the person was looking.
 
-        The answer goes in record["gaze"]. In "on" mode it also joins the focus the brains read. Nothing here can
-        stop a command: if gaze is lost or breaks, the command runs on the selection.
+        The answer goes in record["gaze"]. In "on" mode it also joins the focus the brains read, and guesses too close
+        to call are put to the person first (see _ask_which). Nothing here can stop a command: if gaze is lost or
+        breaks, or nobody says which one, the command runs on the selection. The one exception is that last case with
+        nothing selected. There is nothing to run it on, so the command fails and this returns False.
         """
         gaze = self._gaze  # there is none when gaze is off, can't start, or has no camera part yet
         if gaze is None:
-            return
+            return True
         words, clip_start = record["words"], record["_t0"] - PREROLL  # the clip _transcribe cut starts here
         if not pointing_words(words, clip_start):
-            return
+            return True
+        asked = settled = False
         try:
-            found = ground(words, clip_start, gaze.track, gaze.radius, self._pick, self._piece).to_dict()
+            grounding = ground(words, clip_start, gaze.track, gaze.radius, self._pick, self._piece)
+            if self.gaze_mode == "on" and grounding.status == "clarify":
+                asked, settled = True, self._settle(record, grounding, run)
+            found = grounding.to_dict()
         except Exception as exc:  # noqa: BLE001 - a dead socket or odd data from the host must not stop voice
             print(f"GazeVoice: gaze failed: {exc!r}", file=sys.stderr)
             found = {"status": "none", "targets": [], "radius": [], "error": repr(exc)}
         matched = self._matches_selection(found, record["focus"])
-        record["gaze"] = {**found, "matched_selection": matched}
+        record["gaze"] = {**found, "matched_selection": matched, "asked": asked}
         if matched is not None:
             with self._lock:
                 self._gaze_checked += 1
                 self._gaze_matched += matched
         if self.gaze_mode != "on":
-            return
+            return True
         if not found["targets"]:
             record["_gaze_note"] = GAZE_LOST
-            return
+            return True
+        if record["_stop"] or run.stop.is_set():  # "stop" was said while asking; _edit ends the command
+            return True
+        if asked and not settled:
+            if not (record["focus"] or {}).get("selected"):
+                self._fail(record, COULDNT_TELL)
+                return False
+            record["_gaze_note"] = NO_ANSWER
+            return True
         # The brains read how long into the command each word was said, not the clock time.
         targets = [{**t, "at": t["at"] - clip_start} for t in found["targets"]]
         record["focus"] = {**(record["focus"] or {}), "gaze": {**found, "targets": targets}}
+        return True
 
     def _refine(self, record: dict, run: _Run):
         with self._lock:
@@ -1044,7 +1157,8 @@ class VoiceService:
             self._meta(record["kind"], record, run)
             return
         if record["source"] == "voice":
-            self._ground(record, run)
+            if not self._ground(record, run):  # it asked which one, got no answer, and had no selection to fall back on
+                return
             if record["_stop"] or run.stop.is_set():  # "stop" was said while Blender was being asked
                 self._stopped(record, "Stopped.", run)
                 return

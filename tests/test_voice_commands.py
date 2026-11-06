@@ -4,6 +4,7 @@ import unittest
 from gazevoice.voice.commands import (
     EDITOR_PROMPT,
     REFINER_PROMPT,
+    choice_number,
     describe_focus,
     editor_message,
     meta_command,
@@ -38,6 +39,21 @@ class MetaCommandTest(unittest.TestCase):
         for spoken in ("undo the bevel on the left leg", "stop the animation at frame ten", "make it bigger", "",
                        "no wait make it blue", "don't stop", "wait for it", "no", "stop the playback now"):
             self.assertIsNone(meta_command(spoken), spoken)
+
+
+class ChoiceNumberTest(unittest.TestCase):
+    def test_choice_number_reads_words_and_digits(self):
+        cases = {
+            "two": 2, "Two.": 2, "number two": 2, "Number 2": 2, "2": 2, "2.": 2, "one": 1, "Three!": 3,
+            "okay two": 2, "two please": 2, "no, two": 2, "uh, number three": 3, "ten": 10, "12": 12,
+        }
+        for spoken, number in cases.items():
+            self.assertEqual(choice_number(spoken), number, spoken)
+
+    def test_anything_else_is_not_a_number(self):
+        for spoken in ("", "make it blue", "undo", "redo", "stop", "two cubes", "move it two units", "number",
+                       "number two three", "twenty", "2024", "the second one", "1 2"):
+            self.assertIsNone(choice_number(spoken), spoken)
 
 
 class RefinerTest(unittest.TestCase):

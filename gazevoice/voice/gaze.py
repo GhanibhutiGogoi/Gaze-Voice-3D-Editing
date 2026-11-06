@@ -218,7 +218,8 @@ class Grounding:
         return {"status": self.status, "targets": [t.to_dict() for t in self.targets], "radius": list(self.radius)}
 
 
-def _is_clear(target: Target) -> bool:
+def is_clear(target: Target) -> bool:
+    """Whether the top guess wins by enough that nobody needs to be asked which one was meant."""
     best = target.candidates[0].score
     runner_up = target.candidates[1].score if len(target.candidates) > 1 else 0.0
     return best >= CONFIDENT_SCORE - _SLACK and best - runner_up >= CONFIDENT_GAP - _SLACK
@@ -260,4 +261,4 @@ def ground(
         targets.append(Target(word.text, word.start, candidates, fixation, piece=looked_closer))
     if not targets:
         return Grounding("none", [], radius)
-    return Grounding("resolved" if all(_is_clear(t) for t in targets) else "clarify", targets, radius)
+    return Grounding("resolved" if all(is_clear(t) for t in targets) else "clarify", targets, radius)

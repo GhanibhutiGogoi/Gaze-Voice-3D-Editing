@@ -1321,5 +1321,264 @@ class GazeVoiceTest(VoiceTestBase):
         wait_for(lambda: self.service.recent and self.last_record()["stage"] == "done")
 
 
+CLEARED = {"cmd": "gaze_show", "dot": None, "ring": None, "marks": []}
+WHICH = ("Which one? Say the number.", "working")
+COULDNT_TELL = "Couldn't tell what you meant. Select it or say its name."
+# 11 rays on the Eagle and 10 on the Perch: 46% against 42%, too close to call.
+CLOSE = lambda points: [EAGLE] * 11 + [PERCH] * 10 + [None] * 3  # noqa: E731
+THIS_AND_THERE = [
+    {"text": "move", "start": 0.1, "end": 0.3},
+    {"text": "this", "start": 0.5, "end": 0.7},
+    {"text": "there", "start": 1.0, "end": 1.2},
+]
+
+
+class NoLabelsBridge(FakeBridge):
+    """A Blender that can't draw the numbers (an old add-on, or no 3D viewport)."""
+
+    def gaze(self, cmd, req):
+        if cmd == "gaze_show" and req["marks"]:
+            self.shows.append(req)
+            return {"ok": False, "error": "no 3D viewport"}
+        return super().gaze(cmd, req)
+
+
+class GazeChoiceTest(VoiceTestBase):
+    """When two guesses are close, numbers appear in the viewport and the person says which one."""
+
+    def setUp(self):
+        super().setUp()
+        self.stt = FakeStt(["add blue color there"], words=THERE_WORDS)
+        self.refiner = FakeSession([TurnResult(THERE_REFINED, False)])
+        self.editor = FakeSession([TurnResult("Made the perch blue.", False, ["execute_blender_code"])])
+        self.gaze = FakeGaze()
+        self.bridge.selected = []
+        self.bridge.pick_reply = CLOSE
+
+    def start(self, mode="on", seconds=5.0, look=True):
+        service = self.build(gaze_mode=mode, gaze_source="mouse")
+        service.choice_seconds = seconds
+        service.start()
+        if look:
+            self.gaze.look(0.5, 0.5, start=1001.6, count=30)
+
+    def hold(self, down=1002.0, up=1003.0):
+        """Speak without waiting for the command to finish."""
+        self.service.ptt("down", down)
+        self.service.ptt("up", up)
+        return self.last_record()
+
+    def labelled(self):
+        return [show for show in self.bridge.shows if show["marks"]]
+
+    def wait_for_labels(self, count=1):
+        wait_for(lambda: len(self.labelled()) >= count)
+
+    def statuses(self):
+        return [text for text, _ in self.bridge.statuses]
+
+    # --- asking ------------------------------------------------------------------------------------
+    def test_close_guesses_show_numbered_labels_and_wait(self):
+        self.start()
+        spoken = self.hold()
+        self.wait_for_labels()
+        wait_for(lambda: WHICH in self.bridge.statuses)
+        shown = self.labelled()[0]
+        self.assertEqual((shown["cmd"], shown["dot"], shown["ring"]), ("gaze_show", None, None))
+        self.assertEqual([(m["n"], m["name"]) for m in shown["marks"]], [(1, "Eagle"), (2, "Perch")])
+        self.assertTrue(all(0 < m["u"] < 1 and 0 < m["v"] < 1 for m in shown["marks"]))
+        self.assertNotEqual((shown["marks"][0]["u"], shown["marks"][0]["v"]),
+                            (shown["marks"][1]["u"], shown["marks"][1]["v"]))  # each sits where its own rays hit
+        time.sleep(0.2)  # it is waiting, not working: the brains haven't heard a thing
+        self.assertEqual((self.refiner.sent, self.editor.sent), ([], []))
+        self.assertNotIn(spoken["stage"], ("done", "failed", "stopped"))
+        self.assertEqual(self.service.snapshot()["state"], "refining")
+
+    def test_saying_a_number_picks_that_one(self):
+        self.stt = FakeStt(["add blue color there", "Two."], words=THERE_WORDS)
+        self.start()
+        spoken = self.hold()
+        self.wait_for_labels()
+        answer = self.hold(1004.0, 1005.0)
+        wait_for(lambda: spoken["stage"] == "done" and answer["stage"] == "done")
+        self.assertEqual(answer["reply"], "Picked Perch.")
+        self.assertEqual(self.bridge.pieces[-1]["uid"], 117)  # the Perch was looked at closer, as the Eagle had been
+        self.assertEqual(self.bridge.pieces[-1]["point"], PERCH["point"])
+        lines = self.editor.sent[0].splitlines()
+        self.assertEqual(lines[2], 'Focus (gaze): "there" at 1.0 s → Perch (42%), Eagle (46%)')
+        self.assertIn("point (0.50, 0.10, 0.20)", lines[3])
+        self.assertEqual(spoken["gaze"]["status"], "resolved")
+        self.assertTrue(spoken["gaze"]["asked"])
+        self.assertEqual(spoken["gaze"]["targets"][0]["candidates"][0]["name"], "Perch")
+        self.assertEqual(spoken["gaze"]["targets"][0]["piece"], WING_PIECE)
+        self.assertEqual(spoken["kind"], "command")  # the answer was never a command of its own
+        self.assertEqual(answer["kind"], "")
+        self.assertEqual(len(self.refiner.sent), 1)
+
+    def test_picking_the_first_one_keeps_the_guess_it_already_looked_at(self):
+        self.stt = FakeStt(["add blue color there", "number 1"], words=THERE_WORDS)
+        self.start()
+        spoken = self.hold()
+        self.wait_for_labels()
+        self.hold(1004.0, 1005.0)
+        wait_for(lambda: spoken["stage"] == "done")
+        self.assertEqual([p["uid"] for p in self.bridge.pieces], [116])
+        self.assertEqual(self.editor.sent[0].splitlines()[2],
+                         'Focus (gaze): "there" at 1.0 s → Eagle (46%), Perch (42%)')
+
+    def test_a_number_that_isnt_on_screen_keeps_waiting(self):
+        self.stt = FakeStt(["add blue color there", "five", "one"], words=THERE_WORDS)
+        self.start()
+        spoken = self.hold()
+        self.wait_for_labels()
+        wrong = self.hold(1004.0, 1005.0)
+        wait_for(lambda: "Say a number from 1 to 2." in self.statuses())
+        wait_for(lambda: wrong["stage"] == "done")
+        self.assertEqual(wrong["reply"], "Say a number from 1 to 2.")
+        self.assertEqual((self.refiner.sent, spoken["stage"] == "done"), ([], False))
+        self.hold(1006.0, 1007.0)
+        wait_for(lambda: spoken["stage"] == "done")
+        self.assertEqual(spoken["gaze"]["targets"][0]["candidates"][0]["name"], "Eagle")
+
+    def test_a_number_with_nothing_waiting_is_an_ordinary_command(self):
+        self.stt = FakeStt(["two"], words=[])
+        self.start()
+        record = self.speak()
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertEqual(record["kind"], "command")
+        self.assertEqual(json.loads(self.refiner.sent[0])["heard"], "two")
+        self.assertEqual(self.labelled(), [])
+
+    def test_undo_and_stop_are_never_taken_for_a_number(self):
+        self.stt = FakeStt(["add blue color there", "two"], words=THERE_WORDS)
+        self.start()
+        spoken = self.hold()
+        self.wait_for_labels()
+        undone = self.service.say("undo")  # it takes its turn behind the command that is waiting
+        time.sleep(0.2)
+        self.assertEqual((self.bridge.undos, spoken["stage"] == "done"), (0, False))
+        self.hold(1004.0, 1005.0)
+        wait_for(lambda: spoken["stage"] == "done" and self.record(undone)["stage"] == "done")
+        self.assertEqual(self.bridge.undos, 1)
+        self.assertEqual(spoken["gaze"]["targets"][0]["candidates"][0]["name"], "Perch")
+
+    def test_each_unclear_word_is_asked_in_order(self):
+        self.stt = FakeStt(["move this there", "two", "one"], words=THIS_AND_THERE)
+        self.start()
+        spoken = self.hold()
+        self.wait_for_labels(1)
+        self.hold(1004.0, 1005.0)
+        self.wait_for_labels(2)
+        self.assertEqual(len(self.labelled()), 2)  # the second question came only after the first answer
+        self.hold(1006.0, 1007.0)
+        wait_for(lambda: spoken["stage"] == "done")
+        picked = [t["candidates"][0]["name"] for t in spoken["gaze"]["targets"]]
+        self.assertEqual(picked, ["Perch", "Eagle"])
+        self.assertEqual(spoken["gaze"]["status"], "resolved")
+
+    def test_a_clear_word_isnt_asked_about(self):
+        self.bridge.pick_reply = lambda points: [EAGLE] * 19 + [PERCH] * 4 + [None]
+        self.start()
+        record = self.speak()
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertEqual(self.labelled(), [])
+        self.assertFalse(record["gaze"]["asked"])
+
+    # --- no answer -----------------------------------------------------------------------------------
+    def test_no_answer_falls_back_to_the_selection(self):
+        self.bridge.selected = ["Chair"]
+        self.start(seconds=0.3)
+        record = self.speak()
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertIn("Focus: selected Chair (active: Chair)", self.editor.sent[0])
+        self.assertNotIn("(gaze)", self.editor.sent[0])
+        self.assertEqual(record["gaze"]["status"], "clarify")
+        self.assertTrue(record["gaze"]["asked"])
+        self.assertNotIn("gaze", record["focus"])
+        self.assertTrue(any(t.startswith("Understanding") and "using your selection" in t for t in self.statuses()))
+        self.assertEqual(self.bridge.shows[-1], CLEARED)
+
+    def test_no_answer_and_no_selection_says_so(self):
+        self.start(seconds=0.3)
+        record = self.speak()
+        self.assertEqual((record["stage"], record["error"]), ("failed", COULDNT_TELL))
+        self.assertEqual((self.refiner.sent, self.editor.sent), ([], []))
+        self.assertIn(f"✗ {COULDNT_TELL}", self.statuses())
+        self.assertEqual(self.bridge.shows[-1], CLEARED)
+        wait_for(lambda: self.service.snapshot()["state"] == "ready")
+
+    def test_labels_that_cant_be_drawn_mean_no_question(self):
+        self.bridge = NoLabelsBridge()
+        self.bridge.pick_reply, self.bridge.selected = CLOSE, ["Chair"]
+        self.start(seconds=30)
+        record = self.speak()  # it doesn't sit out the 30 seconds
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertIn("Focus: selected Chair", self.editor.sent[0])
+        self.assertEqual(self.bridge.shows[-1], CLEARED)
+
+    # --- stop, and the other ways out ------------------------------------------------------------------
+    def test_stop_ends_the_wait_for_a_number(self):
+        self.stt = FakeStt(["add blue color there", "Stop!"], words=THERE_WORDS)
+        self.start(seconds=30)
+        spoken = self.hold()
+        self.wait_for_labels()
+        stopper = self.hold(1004.0, 1005.0)
+        wait_for(lambda: spoken["stage"] == "stopped")  # at once, not after 30 seconds
+        wait_for(lambda: stopper["stage"] == "done")
+        self.assertEqual(stopper["reply"], "Stopped.")
+        self.assertEqual((self.refiner.sent, self.editor.sent), ([], []))
+        self.assertEqual(self.bridge.shows[-1], CLEARED)
+        wait_for(lambda: self.service.snapshot()["state"] == "ready")
+
+    def test_stop_just_before_the_question_still_stops_the_command(self):
+        asking, release = threading.Event(), threading.Event()
+
+        def slow_pick(points):
+            asking.set()
+            release.wait(5)
+            return CLOSE(points)
+
+        self.bridge.pick_reply = slow_pick
+        self.start(seconds=30)
+        spoken = self.hold()
+        self.assertTrue(asking.wait(5))
+        self.service.say("stop")
+        release.set()
+        wait_for(lambda: spoken["stage"] == "stopped")
+        self.assertEqual(self.labelled(), [])
+
+    def test_turning_voice_off_ends_the_wait(self):
+        self.start(seconds=30)
+        spoken = self.hold()
+        self.wait_for_labels()
+        began = time.monotonic()
+        self.service.stop()
+        self.assertLess(time.monotonic() - began, 5)
+        self.assertEqual(spoken["stage"], "stopped")
+        self.assertEqual(self.bridge.shows[-1], CLEARED)
+
+    def test_the_labels_are_cleared_afterward(self):
+        self.stt = FakeStt(["add blue color there", "two"], words=THERE_WORDS)
+        self.start()
+        spoken = self.hold()
+        self.wait_for_labels()
+        self.assertEqual(self.bridge.shows[-1]["marks"][0]["n"], 1)
+        self.hold(1004.0, 1005.0)
+        wait_for(lambda: spoken["stage"] == "done")
+        self.assertEqual(self.bridge.shows[-1], CLEARED)
+        self.assertEqual(len(self.labelled()), 1)
+
+    # --- watching only -----------------------------------------------------------------------------------
+    def test_shadow_mode_never_asks(self):
+        self.bridge.selected = ["Chair"]
+        self.start("shadow", seconds=30)
+        record = self.speak()  # it doesn't wait for a number
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertEqual(self.labelled(), [])
+        self.assertNotIn(WHICH[0], self.statuses())
+        self.assertIn("Focus: selected Chair", self.editor.sent[0])
+        self.assertEqual((record["gaze"]["status"], record["gaze"]["asked"]), ("clarify", False))
+
+
 if __name__ == "__main__":
     unittest.main()
