@@ -38,13 +38,13 @@ from .microphone import Microphone, face_cameras, pick_camera
 WORKER = Path(__file__).resolve().parents[1] / "gaze_worker.py"
 VENV_PYTHON = "3.12"
 MEDIAPIPE = "mediapipe==1.2.2"
-MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/"
+MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/"
              "face_landmarker.task")
 MODEL_SIZE = 3_758_596
 MODEL_SHA256 = "64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff"
 INSTALL_CONFIRM = (
     "Install gaze tracking? This sets up its own Python environment and downloads about 340 MB "
-    "(MediaPipe and its face model). Nothing you look at ever leaves this Mac."
+    "(MediaPipe and its face model). No picture from your camera ever leaves this Mac."
 )
 CALIBRATE_CONFIRM = "Opens the camera for about 40 seconds. Look at each dot in Blender."
 TEST_CONFIRM = "Opens the camera for about 15 seconds. A ring in Blender follows where you look."

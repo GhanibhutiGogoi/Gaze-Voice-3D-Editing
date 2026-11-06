@@ -13,6 +13,7 @@ from gazevoice.components.gaze import (
     CALIBRATION_DOTS,
     CHECK_DOTS,
     DOT_SECONDS,
+    INSTALL_CONFIRM,
     MAX_MEDIAN_MISS,
     MEDIAPIPE,
     MODEL_SHA256,
@@ -550,7 +551,7 @@ class GazeUnitTest(GazeCase):
         self.assertEqual(MODEL_SIZE, 3_758_596)
         self.assertEqual(MODEL_SHA256, "64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff")
         self.assertEqual(MODEL_URL, "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/"
-                                    "float16/latest/face_landmarker.task")
+                                    "float16/1/face_landmarker.task")
 
 
 class SavedCalibrationTest(unittest.TestCase):
@@ -576,6 +577,12 @@ class SavedCalibrationTest(unittest.TestCase):
 
 
 DOTS = list(CALIBRATION_DOTS) + list(CHECK_DOTS)
+
+
+class WhatTheInstallSaysTest(unittest.TestCase):
+    def test_the_install_promises_only_what_is_true(self):
+        self.assertIn("No picture from your camera ever leaves this Mac.", INSTALL_CONFIRM)
+        self.assertNotIn("Nothing you look at", INSTALL_CONFIRM)
 
 
 class CalibrateTest(GazeCase):
