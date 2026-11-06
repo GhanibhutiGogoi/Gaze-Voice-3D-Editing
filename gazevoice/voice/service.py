@@ -85,6 +85,7 @@ GAZE_LOST = "Gaze lost, using your selection"
 VIEW_CHANGED = "Viewport changed, calibrate gaze again. Using your selection"
 CAMERA_BUSY = "Gaze is using the camera to calibrate or test. Wait for it to finish, then turn voice on."
 CHOICE_SECONDS = 8.0  # how long numbers stay on screen waiting to be answered
+CHOICE_LIMIT_SECONDS = 20.0  # and the most they stay, in all, for an answer that is still being said or heard
 WHICH_ONE = "Which one? Say the number."
 NO_ANSWER = "No answer, using your selection"
 LOOKING_CLOSER = "Looking closer…"
@@ -223,6 +224,7 @@ class VoiceService:
         self.host_label = "Unity" if host == "unity" else "Blender"
         self.busy_wait = UNITY_BUSY_WAIT if host == "unity" else BUSY_WAIT
         self.choice_seconds = CHOICE_SECONDS
+        self.choice_limit = CHOICE_LIMIT_SECONDS
         self.clock = clock
         self.state = "off"
         self.reason = ""
@@ -234,6 +236,7 @@ class VoiceService:
         self._listening = False
         self._down_t = 0.0
         self._stt_busy = False
+        self._clips_coming = 0  # held long enough to be a command, and not heard to the end yet
         self._edit_stage: str | None = None
         self._current: dict | None = None  # the command being understood or edited
         self._choice: _Choice | None = None  # set while numbers are on screen
@@ -362,6 +365,7 @@ class VoiceService:
             run = self._run = _Run()
             self._reset_pending = False
             self._conversation_since = self.clock()
+            self._clips_coming = 0
             self._gaze_problem = ""
             self._gaze_checked = self._gaze_matched = 0
             self.state, self.reason = "starting", f"Connecting to {self.host_label}…"
@@ -625,6 +629,8 @@ class VoiceService:
                 self._listening = False
                 held = t - self._down_t
                 t0, t1 = self._down_t, min(t, self._down_t + MAX_HOLD)
+                if held >= MIN_HOLD:  # counted here, so that from the key coming up there is no moment it's unaccounted for
+                    self._clips_coming += 1
             else:
                 return
         self._publish_state()
@@ -895,6 +901,7 @@ class VoiceService:
                 with self._lock:
                     if self._run is run:
                         self._stt_busy = False
+                        self._clips_coming -= 1
                 self._publish_state()
 
     def _transcribe(self, record: dict, run: _Run) -> None:
@@ -1174,7 +1181,7 @@ class VoiceService:
             if not (shown and shown.get("ok")):
                 return None  # nobody can answer numbers they can't see
             self._status(WHICH_ONE, "working")
-            choice.answered.wait(self.choice_seconds)
+            self._wait_for_answer(choice)
             if choice.number is None or record["_stop"] or run.stop.is_set():
                 return None
             return candidates[choice.number - 1]
@@ -1182,6 +1189,24 @@ class VoiceService:
             with self._lock:
                 self._choice = None
             self._hide_gaze()
+
+    def _wait_for_answer(self, choice: _Choice) -> None:
+        """Wait `choice_seconds` for a number, and past that while one may be on its way, up to `choice_limit` in all.
+
+        A number said at the last moment is heard after the wait would have ended. By then the command has gone on
+        without it, and the number would go to the brains as a new command. So the key being held, or a clip that
+        hasn't been heard to the end, keeps the wait open.
+        """
+        began = time.monotonic()
+        if choice.answered.wait(self.choice_seconds):
+            return
+        while self._answer_coming() and time.monotonic() - began < self.choice_limit:
+            if choice.answered.wait(POLL_SECONDS):
+                return
+
+    def _answer_coming(self) -> bool:
+        with self._lock:
+            return self._listening or self._clips_coming > 0
 
     def _settle(self, record: dict, grounding: Grounding, run: _Run) -> bool:
         """Ask which one for each target that isn't clear, in order. False if one went unanswered.

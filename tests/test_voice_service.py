@@ -24,7 +24,14 @@ from gazevoice.voice.gaze import GazeSample, GazeTrack
 from gazevoice.voice.gaze_tracker import GazeTracker
 from gazevoice.voice.leftovers import make_noise_picture
 from gazevoice.voice.picture import Describer, clear_leftover_images, write_picture_check
-from gazevoice.voice.service import Factories, PointerTracker, VoiceError, VoiceService
+from gazevoice.voice.service import (
+    CHOICE_LIMIT_SECONDS,
+    CHOICE_SECONDS,
+    Factories,
+    PointerTracker,
+    VoiceError,
+    VoiceService,
+)
 from gazevoice.voice.stt import SpeechError
 
 
@@ -1923,6 +1930,135 @@ class GazeChoiceTest(VoiceTestBase):
         self.assertEqual([p["uid"] for p in self.bridge.pieces], [116])
         self.assertEqual(self.editor.sent[0].splitlines()[2],
                          'Focus (gaze): "there" at 1.0 s → Eagle (46%), Perch (42%)')
+
+    # --- the wait running out while the answer is on its way ------------------------------------------------
+    def asked(self, seconds=0.3):
+        """Numbers are up, on a wait short enough to run out during the test, with nothing selected to fall back on."""
+        self.stt = FakeStt(["add blue color there", "two"], words=THERE_WORDS)
+        self.start(seconds=seconds)
+        self.spoken = self.hold()
+        self.wait_for_labels()
+
+    def perch_was_picked(self, answer):
+        wait_for(lambda: self.spoken["stage"] == "done")
+        self.assertEqual(answer["reply"], "Picked Perch.")
+        self.assertEqual(self.spoken["gaze"]["targets"][0]["candidates"][0]["name"], "Perch")
+        self.assertNotIn('"heard": "two"', " ".join(self.refiner.sent))  # the answer, not a new command
+
+    def test_a_key_held_as_the_wait_runs_out_is_an_answer_coming(self):
+        self.asked()
+        self.service.ptt("down", 1004.0)
+        time.sleep(0.5)  # well past the wait, and still speaking
+        self.assertNotIn(self.spoken["stage"], ("done", "failed"))
+        self.assertTrue(self.labelled())
+        self.assertNotEqual(self.bridge.shows[-1], CLEARED)
+        self.service.ptt("up", 1005.0)
+        wait_for(lambda: self.last_record()["reply"] == "Picked Perch.")
+        self.perch_was_picked(self.last_record())
+
+    def test_an_answer_being_written_down_as_the_wait_runs_out_still_counts(self):
+        self.asked()
+        heard, release = threading.Event(), threading.Event()
+        real = self.stt.transcribe
+
+        def slow(audio, prompt=None):
+            heard.set()
+            release.wait(5)
+            return real(audio, prompt)
+
+        self.stt.transcribe = slow
+        answer = self.hold(1004.0, 1005.0)
+        self.assertTrue(heard.wait(5))
+        time.sleep(0.5)
+        release.set()
+        self.perch_was_picked(answer)
+
+    def test_an_answer_queued_behind_a_transcript_still_counts(self):
+        self.asked()
+        heard, release = threading.Event(), threading.Event()
+        real = self.stt.transcribe
+
+        def slow(audio, prompt=None):
+            heard.set()
+            release.wait(5)
+            return real(audio, prompt)
+
+        self.stt.texts.insert(0, "add red color")
+        self.stt.transcribe = slow
+        self.hold(1004.0, 1005.0)  # says something else
+        self.assertTrue(heard.wait(5))
+        answer = self.hold(1006.0, 1007.0)  # then the number, which waits for the speech worker
+        time.sleep(0.5)
+        self.stt.transcribe = real
+        release.set()
+        self.perch_was_picked(answer)
+
+    def test_a_key_let_go_as_the_wait_runs_out_is_not_lost_while_blender_is_asked_about_the_scene(self):
+        self.asked()
+        reading, release = threading.Event(), threading.Event()
+        real = self.bridge.request
+
+        def slow_selection(req, timeout=None):
+            if req["cmd"] == "selection":
+                reading.set()
+                release.wait(5)
+            return real(req, timeout)
+
+        self.bridge.request = slow_selection
+        self.service.ptt("down", 1004.0)
+        letting_go = threading.Thread(target=lambda: self.service.ptt("up", 1005.0))
+        letting_go.start()  # not listening any more, and nothing queued yet: the clip is on its way
+        self.assertTrue(reading.wait(5))
+        time.sleep(0.5)
+        self.assertNotIn(self.spoken["stage"], ("done", "failed"))
+        release.set()
+        letting_go.join(5)
+        answer = self.last_record()
+        self.perch_was_picked(answer)
+
+    def test_nothing_on_its_way_means_the_wait_ends_on_time(self):
+        self.asked()
+        began = time.monotonic()
+        wait_for(lambda: self.spoken["stage"] == "failed")
+        self.assertLess(time.monotonic() - began, 1.5)
+
+    def test_a_too_short_press_is_not_an_answer_coming(self):
+        self.asked(seconds=0.5)
+        self.service.ptt("down", 1004.0)
+        self.service.ptt("up", 1004.1)  # dropped, so nothing is coming
+        began = time.monotonic()
+        wait_for(lambda: self.spoken["stage"] == "failed")
+        self.assertLess(time.monotonic() - began, 1.5)
+        self.service.ptt("down", 1005.0)  # and the wait isn't held open by it next time
+        self.service.ptt("cancel", 1005.5)
+
+    def test_the_wait_has_a_limit_however_long_the_key_is_held(self):
+        self.stt = FakeStt(["add blue color there"], words=THERE_WORDS)
+        service = self.build(gaze_mode="on", gaze_source="mouse")
+        service.choice_seconds, service.choice_limit = 0.2, 0.6
+        service.start()
+        self.gaze.look(0.5, 0.5, start=1001.6, count=30)
+        spoken = self.hold()
+        self.wait_for_labels()
+        began = time.monotonic()
+        service.ptt("down", 1004.0)
+        wait_for(lambda: spoken["stage"] == "failed")  # with the key still down
+        self.assertLess(time.monotonic() - began, 2.0)
+        self.assertGreaterEqual(time.monotonic() - began, 0.3)
+        self.assertEqual(self.bridge.shows[-1], CLEARED)
+        service.ptt("cancel", 1005.0)
+
+    def test_the_limit_is_a_named_number_past_the_wait(self):
+        self.assertGreater(CHOICE_LIMIT_SECONDS, CHOICE_SECONDS)
+        self.assertEqual(self.build().choice_limit, CHOICE_LIMIT_SECONDS)
+
+    def test_stop_ends_a_wait_held_open_by_an_answer(self):
+        self.asked()
+        self.service.ptt("down", 1004.0)
+        time.sleep(0.5)
+        self.service.say("stop")
+        wait_for(lambda: self.spoken["stage"] == "stopped")
+        self.service.ptt("cancel", 1005.0)
 
     def test_a_number_that_isnt_on_screen_keeps_waiting(self):
         self.stt = FakeStt(["add blue color there", "five", "one"], words=THERE_WORDS)
