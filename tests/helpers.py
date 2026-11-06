@@ -1,5 +1,6 @@
 """Shared test helpers."""
 
+import plistlib
 import tempfile
 from pathlib import Path
 
@@ -44,3 +45,25 @@ def with_blender(t: TempCtx, version_line="Blender 5.2.2 LTS", running=False) ->
     t.runner.add([str(binary), "--version"], stdout=f"{version_line}\n")
     t.runner.add(["pgrep", "-x", "Blender"], returncode=0 if running else 1)
     return binary
+
+
+def fake_unity_editor(root: Path, version="6000.3.7f1") -> Path:
+    """A fake Unity.app under an editors folder; returns the app."""
+    app = root / version / "Unity.app"
+    (app / "Contents" / "MacOS").mkdir(parents=True, exist_ok=True)
+    (app / "Contents" / "MacOS" / "Unity").write_text("#!/bin/sh\n")
+    with (app / "Contents" / "Info.plist").open("wb") as handle:
+        plistlib.dump({"CFBundleVersion": version}, handle)
+    return app
+
+
+def fake_unity_project(path: Path, version="6000.3.7f1") -> Path:
+    """The files that make a folder a Unity project."""
+    (path / "Assets").mkdir(parents=True, exist_ok=True)
+    (path / "ProjectSettings").mkdir(exist_ok=True)
+    (path / "Packages").mkdir(exist_ok=True)
+    (path / "ProjectSettings" / "ProjectVersion.txt").write_text(
+        f"m_EditorVersion: {version}\nm_EditorVersionWithRevision: {version} (abc123)\n")
+    (path / "Packages" / "manifest.json").write_text(
+        '{\n  "dependencies": {\n    "com.unity.ugui": "2.0.0",\n    "com.unity.modules.physics": "1.0.0"\n  }\n}\n')
+    return path

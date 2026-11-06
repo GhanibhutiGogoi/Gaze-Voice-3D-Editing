@@ -2,7 +2,7 @@ import dataclasses
 import json
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from gazevoice.providers import KeyStore, preset
 from gazevoice.settings import update_settings
@@ -111,6 +111,17 @@ class BuildVoiceTest(unittest.TestCase):
         editor = voice.factories.editor()
         self.assertEqual(editor.host, "Unity")
         self.assertIsNotNone(editor.mcp_factory)
+
+    def test_unity_api_editor_waits_as_long_as_a_csharp_run_can_take(self):
+        self.t.ctx.settings = update_settings(self.t.ctx.settings, {
+            "voice_host": "unity", "editor_api_model": "deepseek-v4-pro",
+            "providers": [preset("deepseek").to_dict()], "editor_source": "deepseek"})
+        keys = MagicMock()
+        keys.get.return_value = "sk-test"
+        voice = build_voice(self.t.ctx, EventBus(), {"refiner": "claude", "editor": "deepseek"}, keys=keys)
+        with patch("gazevoice.voice.wiring.host_mcp") as host_mcp:
+            voice.factories.editor()
+        self.assertGreaterEqual(host_mcp.call_args.kwargs["timeout"], 300)
 
     def test_unity_readiness_uses_unity_requirements_not_blender_units(self):
         settings = update_settings(self.t.ctx.settings, {"voice_host": "unity"})

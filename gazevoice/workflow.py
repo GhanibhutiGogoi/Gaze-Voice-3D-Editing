@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Mapping
 
 from .components.base import ActionSpec, Component, ComponentState, Health
@@ -39,19 +38,13 @@ def workflow_stages(
     marker = {REFINER: "refiner", EDITOR: "editor"}
     parts_by_stage = list(STAGES)
     if settings is not None and getattr(settings, "voice_host", "blender") == "unity":
-        parts_by_stage[-2] = ("edit", "Editor", (EDITOR, "@unity"))
-        parts_by_stage[-1] = ("unity", "Unity", ("@unity",))
+        parts_by_stage[-2] = ("edit", "Editor", (EDITOR, "unity_mcp"))
+        parts_by_stage[-1] = ("unity", "Unity", ("unity", "unity_project", "unity_bridge"))
     stages = []
     for stage_id, label, parts in parts_by_stage:
-        resolved = ["unity" if part == "@unity" else sources[marker[part]] if part in marker else part for part in parts]
+        resolved = [sources[marker[part]] if part in marker else part for part in parts]
         healths = []
         for part, cid in zip(parts, resolved):
-            if part == "@unity":
-                from .blender_socket import port_open
-
-                ready = port_open("127.0.0.1", 9878)
-                healths.append(Health.READY if ready else Health.MISSING)
-                continue
             if cid is None:
                 healths.append(Health.MISSING)
                 continue
@@ -177,16 +170,12 @@ class WorkflowCheck(Component):
             raise JobError(f"Unity Editor bridge test failed: {exc}") from exc
         job.log(f"✓ unity.bridge: Unity {hello.get('unity', '')}")
 
-        import sys
+        from .unity_mcp import server_command
 
-        command = self.settings.unity_mcp_command or sys.executable
-        args = self.settings.unity_mcp_args if self.settings.unity_mcp_command else ("-m", "gazevoice.unity_mcp")
-        env = None if self.settings.unity_mcp_command else {
-            "PYTHONPATH": str(Path(__file__).resolve().parent.parent)
-        }
+        command = server_command(self.settings)
         job.log("▶ unity.mcp")
         try:
-            client = StdioMcpClient([command, *args], env=env, timeout=15.0)
+            client = StdioMcpClient([command["command"], *command["args"]], env=command.get("env"), timeout=15.0)
             with client:
                 client.initialize()
                 tools = client.list_tools()

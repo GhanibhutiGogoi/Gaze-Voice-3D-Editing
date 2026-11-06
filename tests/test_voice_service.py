@@ -204,6 +204,20 @@ class FakeSession:
 REFINED = json.dumps({"kind": "command", "text": "Make this twice as tall."})
 
 
+class ReloadingBridge(FakeBridge):
+    """Turns away the first undo_push attempts, the way Unity does while it reloads scripts."""
+
+    def __init__(self):
+        super().__init__()
+        self.refusals = 3
+
+    def request(self, req, timeout=None):
+        if req["cmd"] == "undo_push" and self.refusals:
+            self.refusals -= 1
+            raise ConnectionRefusedError("reloading")
+        return super().request(req, timeout)
+
+
 class VoiceTestBase(unittest.TestCase):
     """A service wired to fakes; tests swap in different fakes before build()."""
 
@@ -249,6 +263,26 @@ class VoiceTestBase(unittest.TestCase):
 
     def record(self, public):
         return next(r for r in self.service.recent if r["id"] == public["id"])
+
+
+class UnityReloadTest(VoiceTestBase):
+    def test_unity_reloading_scripts_still_leaves_one_undo_step(self):
+        self.bridge = ReloadingBridge()
+        self.build(host="unity").start()
+        record = self.speak()
+        self.assertEqual(record["stage"], "done")
+        self.assertTrue(record["undo_step"])
+        self.assertEqual(len(self.bridge.pushed), 1)
+
+    def test_blender_going_away_doesnt_make_it_wait(self):
+        self.bridge = ReloadingBridge()
+        self.build().start()
+        record = self.speak()
+        self.assertFalse(record["undo_step"])
+        self.assertEqual(self.bridge.refusals, 2)
+
+    def test_unity_gets_longer_to_finish_compiling(self):
+        self.assertGreater(self.build(host="unity").busy_wait, self.build().busy_wait)
 
 
 class VoiceServiceTest(VoiceTestBase):

@@ -12,6 +12,10 @@ const NAMES = {
   mcp_addon: "MCP add-on",
   mcp_server: "MCP server",
   bridge: "Bridge",
+  unity: "Unity",
+  unity_project: "Project",
+  unity_mcp: "MCP server",
+  unity_bridge: "Bridge",
   brain: "no brain logged in",
   workflow: "Workflow check",
 };
@@ -20,6 +24,7 @@ const GROUPS = [
   { label: "Input", hint: "Hears you and writes down what you said", ids: ["microphone", "speech"] },
   { label: "Brain", hint: "Cleans up what you said, then edits the scene", ids: ["claude", "codex"], providers: true },
   { label: "Blender", hint: "Where the edits land", ids: ["blender", "mcp_addon", "mcp_server", "bridge"] },
+  { label: "Unity", hint: "Where the edits land", ids: ["unity", "unity_project", "unity_mcp", "unity_bridge"] },
 ];
 
 const HEALTH = {
@@ -38,6 +43,8 @@ const STEP_STAGES = {
   codex: ["refine", "edit"],
   mcp_server: ["edit"],
   bridge: ["blender"],
+  unity_mcp: ["edit"],
+  unity_bridge: ["unity"],
 };
 
 // A brain or provider proves the stages of the steps that use it.
@@ -272,11 +279,12 @@ function resultLine(job) {
   if (typeof r.reply === "string") return `Replied “${r.reply}” in ${r.seconds} s`;
   if (typeof r.text === "string") return `Heard “${r.text}” in ${r.seconds} s`;
   if (typeof r.level_dbfs === "number") return `Input level ${r.level_dbfs.toFixed(1)} dBFS`;
-  if (typeof r.tools === "number") return `${plural(r.tools, "tool")} · Blender ${r.blender}`;
+  if (typeof r.tools === "number") return `${plural(r.tools, "tool")} · ${r.unity ? `Unity ${r.unity}` : `Blender ${r.blender}`}`;
   if (r.selection && typeof r.selection === "object") {
     const selected = r.selection.selected || [];
     return selected.length ? `Connected · selected: ${selected.join(", ")}` : "Connected · nothing selected";
   }
+  if (r.project) return `Project: ${r.project.split("/").pop()}`;
   if (r.launched) return "Launched";
   if (r.installed) return "Installed";
   return "Done";
@@ -439,16 +447,16 @@ function renderRack() {
     return;
   }
   const placed = new Set();
-  const host = S.state.settings && S.state.settings.voice_host;
-  for (const group of GROUPS.filter((item) => !(host === "unity" && item.label === "Blender"))) {
+  const offShelf = S.state.settings && S.state.settings.voice_host === "unity" ? "Blender" : "Unity";
+  for (const group of GROUPS.filter((item) => item.label !== offShelf)) {
     const ids = group.providers ? [...group.ids, ...components().filter((c) => c.provider).map((c) => c.id)] : group.ids;
     const units = ids.map(component).filter(Boolean);
     if (!units.length) continue;
     units.forEach((c) => placed.add(c.id));
     rack.append(shelf(group.label, group.hint, units));
   }
-  const hiddenBlenderIds = host === "unity" ? new Set(["blender", "mcp_addon", "mcp_server", "bridge"]) : new Set();
-  const others = components().filter((c) => !placed.has(c.id) && c.id !== "workflow" && !hiddenBlenderIds.has(c.id));
+  const hidden = new Set(GROUPS.find((item) => item.label === offShelf).ids);
+  const others = components().filter((c) => !placed.has(c.id) && c.id !== "workflow" && !hidden.has(c.id));
   if (others.length) rack.append(shelf("Other", "", others));
 }
 
@@ -542,7 +550,7 @@ function keys(comp, busy, armed) {
   const running = runningJob(comp.id);
   for (const action of comp.actions) {
     usesPlan = usesPlan || action.uses_plan;
-    const primary = action.id === "install";
+    const primary = action.id === "install" || action.id === "setup";
     wrap.append(h("button", {
       class: primary ? "key key-primary" : "key",
       type: "button",
@@ -1053,7 +1061,7 @@ function unityMcpRows(settings) {
           }
         },
       })),
-    h("p", { class: "route-note", text: "Unity needs the GazeVoice package open in the Editor. Leave the MCP command blank for the built-in scene tools, or provide another stdio MCP server." }),
+    h("p", { class: "route-note", text: "Unity needs the GazeVoice package open in the Editor. Leave the MCP command blank for the built-in tools, which can run any C#, or provide another stdio MCP server." }),
   ];
 }
 

@@ -25,6 +25,7 @@ class Settings:
     voice_host: str = "blender"
     unity_mcp_command: str = ""
     unity_mcp_args: tuple = ()
+    unity_project: str = ""  # "" = none yet; otherwise the absolute path of a Unity project
     stt_engine: str = "parakeet"
     mic_device: str = ""  # "" = auto (prefer the built-in mic); otherwise an AVFoundation index
     # Each step has a source (a built-in brain or a provider id) and remembers its choices for both kinds.
@@ -67,6 +68,10 @@ def _check(key: str, value: Any) -> None:
         and all(isinstance(item, str) and len(item) <= 1000 and item.isprintable() for item in value)
     ):
         raise ValueError("unity_mcp_args must be a list of command arguments")
+    if key == "unity_project" and not (
+        isinstance(value, str) and len(value) <= 1024 and value.isprintable() and (value == "" or value.startswith("/"))
+    ):
+        raise ValueError("unity_project must be an absolute folder path")
     if key in ("editor_source", "refiner_source") and not (isinstance(value, str) and value):
         raise ValueError(f"{key} must be a source name")
     if key in ("editor_api_model", "refiner_api_model") and not (

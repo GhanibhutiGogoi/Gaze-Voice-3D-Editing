@@ -65,8 +65,14 @@ class WorkflowStagesTest(unittest.TestCase):
         stages = workflow_stages({}, "claude", settings)
         self.assertEqual(stages[-1]["id"], "unity")
         self.assertEqual(stages[-1]["label"], "Unity")
-        self.assertEqual(stages[-1]["parts"], ["unity"])
-        self.assertEqual(stages[-2]["parts"], ["claude", "unity"])
+        self.assertEqual(stages[-1]["parts"], ["unity", "unity_project", "unity_bridge"])
+        self.assertEqual(stages[-2]["parts"], ["claude", "unity_mcp"])
+
+    def test_the_unity_stage_is_as_healthy_as_its_units(self):
+        settings = update_settings(Settings(), {"voice_host": "unity"})
+        states = {"unity": st("unity", Health.READY), "unity_project": st("unity_project", Health.READY),
+                  "unity_bridge": st("unity_bridge", Health.INSTALLED)}
+        self.assertEqual(workflow_stages(states, "claude", settings)[-1]["health"], "installed")
 
 
 if __name__ == "__main__":

@@ -45,6 +45,7 @@ POLL_SECONDS = 0.05
 IDLE_AFTER = 5.0  # seconds a result stays on the status line
 JOIN_SECONDS = 10.0  # how long stop() waits for each loop (and for an interrupted start) to finish
 BUSY_WAIT = 10.0  # how long an undo operation waits for the host to finish an edit
+UNITY_BUSY_WAIT = 60.0  # Unity may have to finish compiling, then reload
 DEFAULT_KEY = "⌥ Space"
 UNDO_NAME_BYTES = 63  # Blender keeps 64 bytes of an undo step's name, the closing NUL included
 EDIT_SECONDS = 600.0  # a detailed build can take minutes; "stop" still ends it at once
@@ -129,6 +130,7 @@ class VoiceService:
         self.brain = brain
         self.host = host
         self.host_label = "Unity" if host == "unity" else "Blender"
+        self.busy_wait = UNITY_BUSY_WAIT if host == "unity" else BUSY_WAIT
         self.clock = clock
         self.state = "off"
         self.reason = ""
@@ -200,13 +202,14 @@ class VoiceService:
         except (OSError, ValueError):
             return None
 
-    def _host_op(self, request: dict, run: _Run, wait: float = BUSY_WAIT) -> dict | None:
+    def _host_op(self, request: dict, run: _Run) -> dict | None:
         """An undo operation. Retry while the host reports that an edit is in progress."""
-        deadline = time.monotonic() + wait
+        deadline = time.monotonic() + self.busy_wait
         while True:
-            reply = self._bridge_call(request, timeout=wait)
+            reply = self._bridge_call(request, timeout=self.busy_wait)
             busy = bool(reply) and reply.get("error") == "busy"
-            if not busy or time.monotonic() > deadline or run.stop.wait(0.25):
+            reloading = reply is None and self.host == "unity"  # its socket is down while it reloads scripts
+            if not (busy or reloading) or time.monotonic() > deadline or run.stop.wait(0.25):
                 return reply
 
     def _idle_hint(self) -> str:

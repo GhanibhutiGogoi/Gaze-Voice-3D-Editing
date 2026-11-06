@@ -21,6 +21,7 @@ class SettingsTest(unittest.TestCase):
     def test_defaults(self):
         s = Settings()
         self.assertEqual((s.voice_host, s.unity_mcp_command, s.unity_mcp_args), ("blender", "", ()))
+        self.assertEqual(s.unity_project, "")
         self.assertEqual((s.editor_source, s.refiner_source, s.stt_engine, s.mic_device),
                          ("auto", "auto", "parakeet", ""))
         self.assertEqual((s.editor_api_model, s.editor_api_thinking, s.providers), ("", "default", ()))
@@ -121,6 +122,15 @@ class SettingsTest(unittest.TestCase):
     def test_update_rejects_non_digit_mic(self):
         with self.assertRaises(ValueError):
             update_settings(Settings(), {"mic_device": "built-in"})
+
+
+class UnityProjectSettingTest(unittest.TestCase):
+    def test_a_project_must_be_an_absolute_folder(self):
+        self.assertEqual(update_settings(Settings(), {"unity_project": "/Users/me/Game"}).unity_project, "/Users/me/Game")
+        self.assertEqual(update_settings(Settings(), {"unity_project": ""}).unity_project, "")
+        for bad in ("Game", "~/Game", 7, "/bad\npath"):
+            with self.assertRaises(ValueError):
+                update_settings(Settings(), {"unity_project": bad})
 
 
 if __name__ == "__main__":

@@ -66,14 +66,38 @@ Every unit shows its real state on this Mac. Nothing installs, records audio or 
 
 ## Talk to Unity
 
-The Unity target reuses the microphone, speech-to-text, cleanup, command queue and dashboard. It includes a fixed scene-editing MCP adapter and a local GazeVoice Editor bridge.
+The Unity target reuses the microphone, speech-to-text, cleanup, command queue and dashboard. It includes its own MCP server and a local GazeVoice Editor bridge.
 
-1. In Unity Package Manager, choose **Add package from disk** and select `unity_package/package.json`.
-2. Open **Window › GazeVoice** in the Unity Editor. The package listens on `127.0.0.1:9878` and reports the current Unity selection and scene object names.
-3. In the control center's Routing unit, choose **Unity**. The built-in MCP adapter is selected automatically. To use another stdio Unity MCP server, set **Unity MCP command** and **Unity MCP arguments** (a JSON string array). The external server must provide its own Unity scene tools and implement the standard MCP stdio protocol.
-4. Start voice, then hold the **Talk** control in the GazeVoice window while speaking. Unity selection supplies the current focus; typed commands in the dashboard remain available.
+1. In the control center's Routing unit, choose **Unity**. The rack then shows the Unity units.
+2. Press **Set up Unity** on the Unity unit. It asks first, listing what it's about to do, then does whatever is still missing:
+   - installs Unity Hub and the Unity CLI with Homebrew;
+   - downloads the latest Unity LTS for Apple silicon (several GB);
+   - makes a new project at `~/Unity/GazeVoice`, or keeps the one you picked;
+   - copies the GazeVoice package into the project's `Packages` folder;
+   - opens the project in Unity.
 
-The built-in adapter offers scene inspection, selection, color, transform, duplicate, delete and primitive creation through a fixed API. The bridge groups recorded changes into one undo action and exposes voice undo/redo. External MCP tools that mutate scenes without using Unity's Undo API cannot be made undoable by the bridge.
+   **You sign in once.** Unity's free Personal license can only be activated by signing in to Unity Hub, so GazeVoice can't do that step. Setup opens Unity Hub as soon as it's installed, so you can sign in and add the Personal license while Unity downloads. If Unity still has no license when it's time to make the project, setup stops and says so. Sign in, press **Set up Unity** again, and it carries on from where it stopped.
+3. Start voice. Then, in Unity, select what you mean, hold **⌥ Space**, say it, and let go. Your selection is the focus. Typed commands in the dashboard work too.
+
+The key works anywhere in the Editor, except in text fields, which type it instead. To change it, look for "GazeVoice" in Edit › Shortcuts. **Window › GazeVoice** has a Talk control and shows the status line. Switching away from Unity cancels a hold. The package listens on `127.0.0.1:9878`.
+
+Prefer your own project? **Choose…** on the Unity project unit picks it, and **New project** makes another one. Nothing goes into a project until you press **Set up Unity** or **Add to project**, and **Remove from project** takes the package out again. After you update GazeVoice, the bridge unit offers **Update** if the package changed.
+
+The MCP server is built into GazeVoice, so there's nothing separate to download. To use another stdio Unity MCP server, set **Unity MCP command** and **Unity MCP arguments** (a JSON string array) in Routing. The external server must provide its own Unity scene tools and implement the standard MCP stdio protocol.
+
+**What the editor can do.** Nothing in the Unity Editor is out of reach:
+
+- **`execute_csharp`** runs any C# right away, with no recompile, the way Blender's MCP server runs Python. It uses the compiler inside your Unity editor, so there's nothing extra to install.
+- **`write_script`** writes a real script into the project, waits while Unity compiles and reloads, and hands back any compile errors so the editor can fix them.
+- **`add_package`** adds what a job needs, such as ProBuilder.
+- **`read_console`**, **`get_compile_status`** and **`capture_scene_view`** let the editor check its own work.
+- Everyday edits have their own tools: inspecting, selecting, color, transform, duplicate, delete and creating primitives.
+
+For animals, people and other organic shapes, the editor can build the model in Blender, if it's installed, and import it into Unity. *Test* on the bridge unit proves C# really runs in your Unity.
+
+**Undo.** Each command is one undo step, even if scripts recompile partway through. A few things can't be undone by voice: files (scripts, imported models, added packages) stay in the project, and a change made in C# without Unity's Undo calls can't be taken back. External MCP tools that change scenes without Unity's Undo API can't be made undoable either.
+
+**Save often.** Like Blender's MCP server, this runs AI-written code inside Unity without guards. C# can reach your files and the network, and an endless loop hangs Unity, so "stop" can't end it.
 
 **More ways to talk in Blender:**
 

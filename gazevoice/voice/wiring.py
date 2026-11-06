@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 from typing import Mapping
 
 from ..blender_socket import BridgeClient
@@ -32,6 +30,7 @@ _BLENDER_NEEDED = (
 )
 
 
+MCP_SECONDS = {"blender": 180.0, "unity": 330.0}  # how long one tool call may take; Unity's C# can run for 300 s
 STEP_LABELS = (("refiner", "Cleanup"), ("editor", "Editing"))
 EDITOR_STEPS = 150  # model and tool turns per editing command; detailed builds take many
 
@@ -69,7 +68,7 @@ def voice_readiness(
         from ..blender_socket import port_open
 
         if not port_open("127.0.0.1", 9878):
-            missing.append("Unity Editor bridge isn't connected. Open a Unity project with the GazeVoice package installed.")
+            missing.append("Unity Editor bridge isn't connected. Press Set up Unity in the rack, or open your project in Unity.")
     for cid, good, label in needed:
         state = states.get(cid)
         if state is None:
@@ -115,10 +114,9 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
         server_cmd = server_command(paths, find_blender(ctx.runner))
         bridge_factory = BridgeClient
     else:
-        server_cmd = ({"command": settings.unity_mcp_command, "args": list(settings.unity_mcp_args)}
-                      if settings.unity_mcp_command else
-                      {"command": sys.executable, "args": ["-m", "gazevoice.unity_mcp"],
-                       "env": {"PYTHONPATH": str(Path(__file__).resolve().parents[2])}})
+        from ..unity_mcp import server_command
+
+        server_cmd = server_command(settings)
         bridge_factory = lambda: BridgeClient(port=9878)
     mcp_config = write_mcp_config(paths, server_cmd, mcp_server)
     editor_prompt = EDITOR_PROMPT if host == "blender" else UNITY_EDITOR_PROMPT
@@ -146,7 +144,7 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
             ChatClient(config, key), getattr(settings, f"{step}_api_model"),
             (editor_prompt if editing else refiner_prompt).read_text(), kind=config.kind,
             thinking=getattr(settings, f"{step}_api_thinking"),
-            mcp_factory=host_mcp(server_cmd) if editing else None, provider=config.name,
+            mcp_factory=host_mcp(server_cmd, timeout=MCP_SECONDS[host]) if editing else None, provider=config.name,
             max_steps=EDITOR_STEPS if editing else 1, host="Unity" if host == "unity" else "Blender",
         )
 
