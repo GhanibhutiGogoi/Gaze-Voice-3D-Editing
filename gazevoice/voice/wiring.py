@@ -8,12 +8,14 @@ from ..blender_socket import BridgeClient
 from ..components.base import ComponentState, Context, Health
 from ..components.brains import BRAIN_ORDER, brain_pending
 from ..events import EventBus
+from ..probes import ProbeTimedOut
 from ..providers import ChatClient, KeyStore
 from ..settings import Settings
 from .api_brain import ApiSession, host_mcp
 from .audio import MicError, MicStream, mic_argv
 from .brains import BrainError, ClaudeSession, CodexSession, claude_session_argv
 from .commands import EDITOR_PROMPT, REFINER_PROMPT, UNITY_EDITOR_PROMPT, UNITY_REFINER_PROMPT
+from .gaze_tracker import GazeError, GazeTracker
 from .service import EDITOR_WARMUP, REFINER_WARMUP, Factories, PointerTracker, VoiceService
 from .stt import SpeechService
 
@@ -90,7 +92,8 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
     from ..components.providers import config_for
 
     from ..components.brains import write_mcp_config
-    from ..components.microphone import Microphone, pick_device
+    from ..components.gaze import WORKER as GAZE_WORKER, Gaze, camera_gaze_installed, load_calibration
+    from ..components.microphone import Microphone, pick_camera, pick_device
     from ..components.speech import ENGINES, WORKER, Speech
 
     paths, settings = ctx.paths, ctx.settings
@@ -166,9 +169,28 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
                           warmup=REFINER_WARMUP, timeout=90)
         return provider("refiner", source)
 
-    # Gaze is for Blender. The mouse needs no setup; the camera has no part yet, so voice uses the selection.
+    def camera_gaze() -> GazeTracker:
+        # Picked at each start, like the mic: the camera's number moves when a phone or a webcam is plugged in.
+        picked = pick_camera(microphone.cameras(), settings.camera_device)
+        if picked is None:
+            raise GazeError("That camera isn't connected. Pick another one in Routing.")
+        calibration = load_calibration(paths.gaze_calibration)
+        if calibration is None:
+            raise GazeError("The saved gaze calibration is out of date. Calibrate gaze again.")
+        return GazeTracker(Gaze(ctx).python, GAZE_WORKER, picked[0], calibration, model_file=paths.gaze_model_file)
+
+    # Gaze is for Blender. The mouse needs no setup. The camera needs gaze installed, calibrated and a camera to
+    # watch with; without those there is no gaze part, and voice uses the selection.
     gaze_mode = settings.gaze_mode if host == "blender" else "off"
-    gaze = PointerTracker if gaze_mode != "off" and settings.gaze_source == "mouse" else None
+    gaze = None
+    if gaze_mode != "off":
+        if settings.gaze_source == "mouse":
+            gaze = PointerTracker
+        elif camera_gaze_installed(paths):
+            try:
+                gaze = camera_gaze if pick_camera(microphone.cameras(), settings.camera_device) else None
+            except ProbeTimedOut:  # can't tell yet, which is no reason to leave gaze out: starting voice asks again
+                gaze = camera_gaze
 
     factories = Factories(
         bridge=bridge_factory,

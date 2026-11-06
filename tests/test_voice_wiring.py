@@ -1,26 +1,31 @@
 import dataclasses
 import json
+import shutil
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from gazevoice.probes import ProbeTimedOut
 from gazevoice.providers import KeyStore, preset
 from gazevoice.settings import update_settings
 from gazevoice.voice.api_brain import ApiSession
 
+from gazevoice.components.gaze import MODEL_SIZE, WORKER as GAZE_WORKER
 from gazevoice.components.microphone import LIST_DEVICES
 from gazevoice.events import EventBus
 from gazevoice.voice.audio import MicError
+from gazevoice.voice.gaze_tracker import GazeError, GazeTracker
 from gazevoice.voice.service import PointerTracker
 from gazevoice.voice.wiring import build_voice, voice_readiness
 
 from .helpers import TempCtx
+from .test_gaze_tracker import a_calibration
 
 
-def listing(*names):
-    lines = ["[AVFoundation indev @ 0x1] AVFoundation video devices:",
-             "[AVFoundation indev @ 0x1] [0] FaceTime HD Camera",
-             "[AVFoundation indev @ 0x1] AVFoundation audio devices:"]
+def listing(*names, cameras=("FaceTime HD Camera",)):
+    lines = ["[AVFoundation indev @ 0x1] AVFoundation video devices:"]
+    lines += [f"[AVFoundation indev @ 0x1] [{i}] {camera}" for i, camera in enumerate(cameras)]
+    lines += ["[AVFoundation indev @ 0x1] AVFoundation audio devices:"]
     lines += [f"[AVFoundation indev @ 0x1] [{i}] {name}" for i, name in enumerate(names)]
     return "\n".join(lines) + "\n"
 
@@ -150,6 +155,103 @@ class BuildVoiceTest(unittest.TestCase):
         voice = self.gaze_voice(gaze_mode="on", gaze_source="camera")
         self.assertIsNone(voice.factories.gaze)  # voice runs on the selection
         self.assertEqual((voice.gaze_mode, voice.gaze_source), ("on", "camera"))
+
+    # --- camera gaze: only once it is installed, calibrated and has a camera ------------------------
+    def set_up_gaze(self, calibration="default", model=True, venv=True):
+        """What the Gaze unit leaves behind: its venv, the face model, and a saved calibration."""
+        paths = self.t.paths
+        if venv:
+            python = paths.venvs / "gaze" / "bin" / "python"
+            python.parent.mkdir(parents=True, exist_ok=True)
+            python.write_text("")
+        paths.gaze_model_file.parent.mkdir(parents=True, exist_ok=True)
+        if model:
+            with open(paths.gaze_model_file, "wb") as handle:
+                handle.truncate(MODEL_SIZE)
+        if calibration == "default":
+            calibration = a_calibration()
+        if calibration is not None:
+            paths.gaze_calibration.write_text(json.dumps(calibration))
+
+    def new_camera_listing(self, *cameras):
+        self.t.runner.add(LIST_DEVICES, stderr=listing("MacBook Air Microphone", cameras=cameras))
+        self.t.ctx.probes.clear()
+
+    def test_build_voice_only_adds_gaze_when_its_on_and_calibrated(self):
+        self.set_up_gaze()
+        for mode in ("shadow", "on"):
+            voice = self.gaze_voice(gaze_mode=mode, gaze_source="camera")
+            tracker = voice.factories.gaze()
+            self.assertIsInstance(tracker, GazeTracker)
+            self.assertEqual((voice.gaze_mode, voice.gaze_source), (mode, "camera"))
+        gaze_python = self.t.paths.venvs / "gaze" / "bin" / "python"
+        self.assertEqual(tracker.argv, [str(gaze_python), str(GAZE_WORKER), "--serve", "--camera", "0",
+                                        "--model-file", str(self.t.paths.gaze_model_file)])
+        self.assertEqual(tracker.calibration, a_calibration())
+        self.assertEqual(tracker.radius, (0.07, 0.11))  # what the calibration's check measured
+        self.assertFalse(tracker.alive)  # built, not started: the camera opens when voice starts
+
+        self.assertIsNone(self.gaze_voice(gaze_mode="off", gaze_source="camera").factories.gaze)
+        self.assertIsNone(self.gaze_voice(host="unity", gaze_mode="on", gaze_source="camera").factories.gaze)
+
+    def test_without_each_piece_gaze_is_not_built_and_voice_uses_the_selection(self):
+        for name, missing in {"no venv": dict(venv=False), "no face model": dict(model=False),
+                              "no calibration": dict(calibration=None)}.items():
+            with self.subTest(name):
+                shutil.rmtree(self.t.paths.venvs, ignore_errors=True)
+                shutil.rmtree(self.t.paths.gaze_model_file.parent, ignore_errors=True)
+                self.set_up_gaze(**missing)
+                self.assertIsNone(self.gaze_voice(gaze_mode="on", gaze_source="camera").factories.gaze)
+
+    def test_without_a_camera_gaze_is_not_built(self):
+        self.set_up_gaze()
+        for name, cameras in {"no camera": (), "only a phone": ("Nokia Unbreakable V Camera", "Capture screen 0")}.items():
+            with self.subTest(name):
+                self.new_camera_listing(*cameras)
+                self.assertIsNone(self.gaze_voice(gaze_mode="on", gaze_source="camera").factories.gaze)
+
+    def test_a_slow_camera_listing_does_not_decide_it_gaze_is_asked_again_at_start(self):
+        self.set_up_gaze()
+        self.t.runner.add(LIST_DEVICES, returncode=124, stderr="ffmpeg: timed out after 10s")
+        voice = self.gaze_voice(gaze_mode="on", gaze_source="camera")
+        self.assertIsNotNone(voice.factories.gaze)
+        with self.assertRaises(ProbeTimedOut):  # the service turns this into "voice uses your selection"
+            voice.factories.gaze()
+
+    def test_the_mouse_needs_no_calibration_camera_or_install(self):
+        voice = self.gaze_voice(gaze_mode="on", gaze_source="mouse")
+        self.assertIsInstance(voice.factories.gaze(), PointerTracker)
+
+    def test_the_camera_is_picked_again_each_time_voice_starts(self):
+        self.set_up_gaze()
+        self.new_camera_listing("MacBook Air Camera", "Capture screen 0")
+        voice = self.gaze_voice(gaze_mode="on", gaze_source="camera")
+        self.assertEqual(voice.factories.gaze().argv[4], "0")
+        # A phone plugged in since: the built-in camera's number moved.
+        self.new_camera_listing("Nokia Unbreakable V Camera", "MacBook Air Camera", "Capture screen 0")
+        self.assertEqual(voice.factories.gaze().argv[4], "1")
+
+    def test_a_chosen_camera_is_found_by_name(self):
+        self.set_up_gaze()
+        self.new_camera_listing("MacBook Air Camera", "Logitech BRIO")
+        voice = self.gaze_voice(gaze_mode="on", gaze_source="camera", camera_device="Logitech BRIO")
+        self.assertEqual(voice.factories.gaze().argv[4], "1")
+        self.new_camera_listing("Logitech BRIO", "MacBook Air Camera")
+        self.assertEqual(voice.factories.gaze().argv[4], "0")  # it moved, and gaze followed it
+
+    def test_a_camera_that_went_away_since_the_build_stops_gaze_not_voice(self):
+        self.set_up_gaze()
+        voice = self.gaze_voice(gaze_mode="on", gaze_source="camera")
+        self.new_camera_listing("Nokia Unbreakable V Camera")
+        with self.assertRaisesRegex(GazeError, "Routing"):  # the service turns this into "voice uses your selection"
+            voice.factories.gaze()
+
+    def test_a_calibration_that_went_out_of_date_since_the_build_stops_gaze_not_voice(self):
+        self.set_up_gaze()
+        voice = self.gaze_voice(gaze_mode="on", gaze_source="camera")
+        self.t.paths.gaze_calibration.write_text(json.dumps({"model": {"kind": "ridge", "features": 3}}))
+        with self.assertRaisesRegex(GazeError, "[Cc]alibrate"):
+            voice.factories.gaze()
 
     def test_unity_never_gets_gaze(self):
         voice = self.gaze_voice(host="unity", gaze_mode="on", gaze_source="mouse")

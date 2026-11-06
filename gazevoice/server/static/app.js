@@ -6,6 +6,7 @@
 const NAMES = {
   microphone: "Microphone",
   speech: "Speech-to-text",
+  gaze: "Gaze",
   claude: "Claude Code",
   codex: "Codex",
   blender: "Blender",
@@ -21,7 +22,7 @@ const NAMES = {
 };
 
 const GROUPS = [
-  { label: "Input", hint: "Hears you and writes down what you said", ids: ["microphone", "speech"] },
+  { label: "Input", hint: "Hears you and writes down what you said", ids: ["microphone", "speech", "gaze"] },
   { label: "Brain", hint: "Cleans up what you said, then edits the scene", ids: ["claude", "codex"], providers: true },
   { label: "Blender", hint: "Where the edits land", ids: ["blender", "mcp_addon", "mcp_server", "bridge"] },
   { label: "Unity", hint: "Where the edits land", ids: ["unity", "unity_project", "unity_mcp", "unity_bridge"] },
@@ -65,7 +66,7 @@ const THINKING_WORDS = {
 const ARM_MS = 8000;
 const REFRESH_MS = 45000;
 const MAX_LINES = 400;
-const HIDDEN_DETAILS = new Set(["Devices"]);
+const HIDDEN_DETAILS = new Set(["Devices", "Cameras"]);  // lists the Routing menus are built from
 // `?snapshot` renders once with no live stream or timers (headless screenshots, a static view).
 const SNAPSHOT = new URLSearchParams(location.search).has("snapshot");
 
@@ -1024,7 +1025,7 @@ function renderRouting() {
     routeRow("Speech engine", "stt_engine", settings.stt_engine, [["parakeet", "Parakeet"], ["whisper", "Whisper"]]),
     ...(settings.voice_host === "unity" ? unityMcpRows(settings) : []),
     inputRow(settings.mic_device),
-    ...(settings.voice_host === "blender" ? gazeRows(settings) : []),
+    ...(settings.voice_host === "blender" ? [cameraRow(settings.camera_device), ...gazeRows(settings)] : []),
     stepRow("editor", settings),
     stepRow("refiner", settings),
     h("p", { class: "route-note", text: "Auto uses Claude Code when it's logged in, otherwise Codex. More thinking can make big builds better, but each command takes longer." }),
@@ -1035,7 +1036,7 @@ function gazeRows(settings) {
   return [
     routeRow("Gaze", "gaze_mode", settings.gaze_mode, [["off", "Off"], ["shadow", "Watch only"], ["on", "On"]]),
     routeRow("Gaze source", "gaze_source", settings.gaze_source, [["camera", "Camera"], ["mouse", "Mouse"]]),
-    h("p", { class: "route-note", text: "Gaze tells the editor what you were looking at when you say this, that or there. Watch only records it and compares it with your selection, but changes nothing. Mouse uses the pointer over Blender's 3D viewport while you hold the key. Camera isn't ready yet, so for now it uses your selection." }),
+    h("p", { class: "route-note", text: "Gaze tells the editor what you were looking at when you say this, that or there. Watch only records it and compares it with your selection, but changes nothing. Mouse uses the pointer over Blender's 3D viewport while you hold the key. Camera uses the Gaze unit in the rack: it has to be installed and calibrated, and until then voice uses your selection. The camera is only on while voice is on, and no picture is kept." }),
   ];
 }
 
@@ -1197,6 +1198,28 @@ function inputRow(current) {
     },
       h("option", { value: "", selected: current === "" || null, text: autoLabel }),
       devices.map(([index, name]) => h("option", { value: index, selected: index === current || null, text: `${index} · ${name}` }))));
+}
+
+function cameraRow(current) {
+  const gaze = component("gaze");
+  const detail = (key) => (gaze ? (gaze.details.find(([k]) => k === key) || [])[1] : null);
+  const listed = detail("Cameras");
+  const cameras = listed ? listed.split(" | ") : [];
+  const using = detail("Using");
+  const autoLabel = current === "" && using ? `Auto · ${using.replace(/ \(auto\)$/, "")}` : "Auto · the Mac's own camera";
+  return h("label", { class: "route-row" },
+    h("span", { class: "route-label", text: "Camera" }),
+    h("select", {
+      class: "select",
+      "data-focus-key": "route-camera",
+      title: "The camera is remembered by name, so plugging in a phone doesn't change it. Auto never uses a phone.",
+      onchange: (e) => saveSetting("camera_device", e.target.value),
+    },
+      h("option", { value: "", selected: current === "" || null, text: autoLabel }),
+      current && !cameras.includes(current)
+        ? h("option", { value: current, selected: true, text: `${current} · not connected` })
+        : null,
+      cameras.map((name) => h("option", { value: name, selected: name === current || null, text: name }))));
 }
 
 async function saveSetting(key, value) {

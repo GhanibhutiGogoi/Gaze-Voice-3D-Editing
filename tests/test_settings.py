@@ -31,6 +31,17 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(update_settings(Settings(), {"mic_device": "2"}).mic_device, "2")
         self.assertEqual(update_settings(Settings(mic_device="2"), {"mic_device": ""}).mic_device, "")
 
+    def test_the_camera_is_chosen_by_name_and_empty_means_auto(self):
+        self.assertEqual(Settings().camera_device, "")
+        named = update_settings(Settings(), {"camera_device": "MacBook Air Camera"})
+        self.assertEqual(named.camera_device, "MacBook Air Camera")
+        self.assertEqual(update_settings(named, {"camera_device": ""}).camera_device, "")
+        for bad in (2, None, "x" * 201, "two\nlines"):
+            with self.assertRaises(ValueError, msg=bad):
+                update_settings(Settings(), {"camera_device": bad})
+        save_settings(self.path, named)
+        self.assertEqual(load_settings(self.path), named)
+
     def test_settings_check_the_gaze_values(self):
         self.assertEqual((Settings().gaze_mode, Settings().gaze_source), ("off", "camera"))
         for mode in ("off", "shadow", "on"):

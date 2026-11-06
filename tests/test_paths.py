@@ -32,6 +32,8 @@ class PathsTest(unittest.TestCase):
         paths = AppPaths(Path("/x"))
         self.assertEqual(paths.settings_file, Path("/x/settings.json"))
         self.assertEqual(paths.mcp_server_dir, Path("/x/blender-mcp"))
+        self.assertEqual(paths.gaze_model_file, Path("/x/state/face_landmarker.task"))
+        self.assertEqual(paths.gaze_calibration, Path("/x/state/gaze-calibration.json"))
 
 
 if __name__ == "__main__":

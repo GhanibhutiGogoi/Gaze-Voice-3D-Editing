@@ -23,6 +23,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from .. import __version__
 from ..components.base import Component, ComponentState, Context, Health
 from ..components.brains import resolve_sources, sources_pending
+from ..components.gaze import camera_gaze_installed
 from ..events import EventBus
 from ..jobs import Job, JobAlreadyRunning, JobError, JobManager
 from ..probes import ProbeTimedOut
@@ -156,6 +157,7 @@ class ControlCenter:
         s = self.ctx.settings
         return (s.voice_host, s.unity_mcp_command, s.unity_mcp_args,
                 sources["refiner"], sources["editor"], s.stt_engine, s.mic_device, s.gaze_mode, s.gaze_source,
+                s.camera_device, camera_gaze_installed(self.ctx.paths),
                 s.editor_model, s.editor_effort, s.editor_api_model, s.editor_api_thinking,
                 s.refiner_model, s.refiner_effort, s.refiner_api_model, s.refiner_api_thinking,
                 json.dumps(s.providers, sort_keys=True))

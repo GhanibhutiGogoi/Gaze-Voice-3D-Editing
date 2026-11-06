@@ -30,6 +30,7 @@ class Settings:
     unity_project: str = ""  # "" = none yet; otherwise the absolute path of a Unity project
     stt_engine: str = "parakeet"
     mic_device: str = ""  # "" = auto (prefer the built-in mic); otherwise an AVFoundation index
+    camera_device: str = ""  # "" = auto (the Mac's own camera); otherwise the camera's name, since its number moves
     gaze_mode: str = "off"
     gaze_source: str = "camera"
     # Each step has a source (a built-in brain or a provider id) and remembers its choices for both kinds.
@@ -92,6 +93,8 @@ def _check(key: str, value: Any) -> None:
         raise ValueError(f"gaze_source must be one of {', '.join(GAZE_SOURCES)}")
     if key == "mic_device" and not (isinstance(value, str) and (value == "" or value.isdigit())):
         raise ValueError('mic_device must be "" (auto) or a device number such as "2"')
+    if key == "camera_device" and not (isinstance(value, str) and len(value) <= 200 and value.isprintable()):
+        raise ValueError('camera_device must be "" (auto) or a camera name')
     if key in ("editor_model", "refiner_model") and value not in CLAUDE_MODELS:
         raise ValueError(f"{key} must be one of {', '.join(CLAUDE_MODELS)}")
     if key in ("editor_effort", "refiner_effort") and value not in EFFORTS:

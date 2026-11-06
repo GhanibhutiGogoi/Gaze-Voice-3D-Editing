@@ -38,6 +38,21 @@ class AppPaths:
     def mcp_server_dir(self) -> Path:
         return self.root / "blender-mcp"
 
+    @property
+    def state(self) -> Path:
+        """Small facts the units remember between runs."""
+        return self.root / "state"
+
+    @property
+    def gaze_model_file(self) -> Path:
+        """MediaPipe's face model, which the Gaze unit downloads."""
+        return self.state / "face_landmarker.task"
+
+    @property
+    def gaze_calibration(self) -> Path:
+        """The saved gaze calibration. Numbers only: no pictures of your face are ever kept."""
+        return self.state / "gaze-calibration.json"
+
     def ensure(self) -> None:
         for directory in (self.root, self.downloads, self.venvs, self.logs, self.work):
             directory.mkdir(parents=True, exist_ok=True)

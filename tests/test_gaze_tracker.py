@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import signal
 import sys
 import tempfile
 import time
@@ -95,22 +96,38 @@ class CameraListTest(unittest.TestCase):
         devices = [("0", "MacBook Air Camera"), ("1", "Nokia Unbreakable V Camera")]
         self.assertEqual(pick_camera(devices, ""), ("0", "MacBook Air Camera"))
 
-    def test_without_a_built_in_camera_the_first_real_one_wins(self):
-        devices = [("0", "Capture screen 0"), ("1", "Logitech BRIO"), ("2", "Logitech BRIO Desk View Camera")]
-        self.assertEqual(pick_camera(devices, ""), ("1", "Logitech BRIO"))
+    def test_auto_takes_a_facetime_camera_too(self):
+        self.assertEqual(pick_camera([("0", "FaceTime HD Camera")], ""), ("0", "FaceTime HD Camera"))
+
+    def test_auto_never_falls_back_to_a_phone_or_any_other_camera(self):
+        phone = [("0", "Nokia Unbreakable V Camera")]
+        self.assertIsNone(pick_camera(phone, ""))
+        self.assertIsNone(pick_camera([("0", "iPhone Camera"), ("1", "Logitech BRIO")], ""))
+        self.assertIsNone(pick_camera([("0", "Capture screen 0"), ("1", "Logitech BRIO")], ""))
 
     def test_desk_view_and_screens_are_never_picked(self):
         only_bad = [("0", "MacBook Air Desk View Camera"), ("1", "Capture screen 0"), ("2", "Capture screen 1")]
         self.assertIsNone(pick_camera(only_bad, ""))
         self.assertIsNone(pick_camera([], ""))
-        self.assertEqual(pick_camera(only_bad + [("3", "USB Webcam")], ""), ("3", "USB Webcam"))
+        self.assertEqual(pick_camera(only_bad + [("3", "MacBook Air Camera")], ""), ("3", "MacBook Air Camera"))
+        self.assertIsNone(pick_camera(only_bad + [("3", "USB Webcam")], ""))
 
-    def test_a_chosen_camera_is_used_if_it_is_still_there(self):
-        self.assertEqual(pick_camera(DEVICES, "0"), ("0", "Nokia Unbreakable V Camera"))
+    def test_a_chosen_camera_is_matched_by_name(self):
+        self.assertEqual(pick_camera(DEVICES, "Nokia Unbreakable V Camera"), ("0", "Nokia Unbreakable V Camera"))
 
-    def test_a_chosen_camera_thats_gone_returns_none(self):
-        self.assertIsNone(pick_camera(DEVICES, "7"))
-        self.assertIsNone(pick_camera([], "1"))
+    def test_a_chosen_camera_is_found_at_its_new_number_when_things_are_plugged_in(self):
+        before = [("0", "MacBook Air Camera"), ("1", "Logitech BRIO")]
+        after = [("0", "Nokia Unbreakable V Camera"), ("1", "MacBook Air Camera"), ("2", "Logitech BRIO")]
+        self.assertEqual(pick_camera(before, "Logitech BRIO"), ("1", "Logitech BRIO"))
+        self.assertEqual(pick_camera(after, "Logitech BRIO"), ("2", "Logitech BRIO"))
+
+    def test_a_chosen_camera_thats_gone_returns_none_and_is_not_swapped_for_another(self):
+        self.assertIsNone(pick_camera(DEVICES, "Logitech BRIO"))
+        self.assertIsNone(pick_camera(DEVICES, "1"))  # a number is no longer a way to name a camera
+        self.assertIsNone(pick_camera([], "MacBook Air Camera"))
+
+    def test_a_chosen_camera_cannot_be_a_screen(self):
+        self.assertIsNone(pick_camera(DEVICES, "Capture screen 0"))
 
 
 class CameraCommandTest(unittest.TestCase):
@@ -212,6 +229,71 @@ class FrameSourceTest(unittest.TestCase):
         with self.assertRaises(gaze_worker.CameraError) as caught:
             gaze_worker.FrameSource(["/no/such/ffmpeg", "-i", "x"], 4, 3)
         self.assertIn("ffmpeg", str(caught.exception))
+
+
+# The worker with a face model that takes a second to load, and a spy where the camera would be opened.
+SLOW_LOAD = """\
+import sys, time
+from gazevoice import gaze_worker
+
+class SlowFake(gaze_worker.FakeDetector):
+    def __init__(self):
+        time.sleep(float(sys.argv[2]))
+        super().__init__()
+
+class OpenedSpy(gaze_worker.FrameSource):
+    def __init__(self, *args):
+        open(sys.argv[1], "w").write("the camera was opened")
+        super().__init__(*args)
+
+gaze_worker.FakeDetector, gaze_worker.FrameSource = SlowFake, OpenedSpy
+sys.exit(gaze_worker.main(["--serve", "--fake", "--source-argv", sys.argv[3]]))
+"""
+
+
+class StopDuringLoadTest(unittest.TestCase):
+    """A stop that arrives while the face model is still loading must not open the camera, not even briefly."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.opened = Path(self.tmp.name) / "opened"
+        one_frame = "import sys, time; sys.stdout.buffer.write(bytes(960 * 540 * 3)); sys.stdout.buffer.flush(); time.sleep(60)"
+        self.camera = json.dumps([sys.executable, "-c", one_frame])
+
+    def worker(self, load_seconds: float):
+        import subprocess
+
+        env = dict(os.environ, PYTHONPATH=str(WORKER.parents[1]))
+        proc = subprocess.Popen(
+            [sys.executable, "-c", SLOW_LOAD, str(self.opened), str(load_seconds), self.camera],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+            start_new_session=True,
+        )
+        self.addCleanup(self.reap, proc)
+        return proc
+
+    @staticmethod
+    def reap(proc):
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)  # the worker leads its own group, and the stand-in camera is in it
+        proc.wait()
+        proc.stdout.close()
+        proc.stderr.close()
+
+    def test_closing_stdin_while_the_model_loads_never_opens_the_camera(self):
+        proc = self.worker(1.0)
+        proc.stdin.close()
+        self.assertEqual(proc.wait(timeout=15), 0)
+        self.assertFalse(self.opened.exists())
+        self.assertEqual(proc.stdout.read(), "")  # it never got as far as saying ready
+
+    def test_without_a_stop_the_camera_is_opened_after_the_model_loads(self):
+        proc = self.worker(0.3)
+        self.assertEqual(json.loads(proc.stdout.readline())["ready"], True)
+        self.assertTrue(self.opened.exists())
+        proc.stdin.close()
+        self.assertEqual(proc.wait(timeout=15), 0)
 
 
 class GazeTrackerTest(unittest.TestCase):

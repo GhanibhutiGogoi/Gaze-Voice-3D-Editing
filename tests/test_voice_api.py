@@ -224,6 +224,24 @@ class VoiceApiTest(unittest.TestCase):
     def test_changing_the_gaze_source_while_voice_is_on_asks_for_a_restart(self):
         self.asks_for_a_restart_after({"gaze_source": "mouse"})
 
+    def test_changing_the_camera_while_voice_is_on_asks_for_a_restart(self):
+        self.asks_for_a_restart_after({"camera_device": "MacBook Air Camera"})
+
+    def test_gaze_becoming_usable_while_voice_is_on_asks_for_a_restart(self):
+        self.start_server()
+        _, body = self.post("/api/voice/start")
+        self.center.jobs.wait(body["job"]["id"], 5)
+        self.assertFalse(self.get("/api/state")[1]["voice"]["needs_restart"])
+        paths = self.t.paths
+        python = paths.venvs / "gaze" / "bin" / "python"
+        python.parent.mkdir(parents=True)
+        python.write_text("")
+        paths.gaze_model_file.parent.mkdir(parents=True, exist_ok=True)
+        paths.gaze_model_file.write_bytes(b"model")
+        self.assertFalse(self.get("/api/state")[1]["voice"]["needs_restart"])  # not calibrated yet
+        paths.gaze_calibration.write_text("{}")  # installed and calibrated: gaze can join voice now
+        self.assertTrue(self.get("/api/state")[1]["voice"]["needs_restart"])
+
     def test_changing_a_source_asks_for_a_restart(self):
         self.start_server()
         _, body = self.post("/api/voice/start")

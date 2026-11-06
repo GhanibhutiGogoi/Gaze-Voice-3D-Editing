@@ -13,7 +13,8 @@
 The camera is read by ffmpeg, which scales every frame to CAMERA_SIZE whatever modes the camera offers. One
 frame at a time is read, looked at and dropped. Nothing is saved. ffmpeg is this worker's child and stops
 when the worker's stdin closes, when the worker is told to stop, and, since it then has nobody to send
-frames to, when the worker is killed.
+frames to, when the worker is killed. Stdin is listened to before the model loads, so a stop that arrives
+during the load is heard first, and the camera is never opened.
 
 Only what is needed is imported, only when serving for real, so `--help` and the tests work anywhere:
     --fake              no camera, no ffmpeg, no mediapipe: the same walk around the viewport every run
@@ -351,14 +352,8 @@ def serve(args: argparse.Namespace) -> int:
         return 1
 
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # so the finally below runs and ffmpeg is let go
-    try:
-        # The model first: a missing file or library is found before the camera is ever opened.
-        detector = _detector = FakeDetector() if args.fake else FaceDetector(Path(args.model_file or ""))
-        argv = json.loads(args.source_argv) if args.source_argv else camera_argv(args.camera, *CAMERA_SIZE)
-        source = FakeFrameSource(stop) if args.fake and not args.source_argv else FrameSource(argv, *CAMERA_SIZE)
-    except (ModelError, CameraError, ValueError) as exc:
-        return say(str(exc))
     session = Session(emit)
+    opening = threading.Lock()  # a stop and the camera opening never overlap: whichever comes second sees the first
 
     def read_commands() -> None:
         try:
@@ -370,11 +365,25 @@ def serve(args: argparse.Namespace) -> int:
                     session.handle(json.loads(line))
                 except Exception as exc:  # noqa: BLE001 - one bad command mustn't stop the stream
                     print(f"Couldn't handle {line[:80]!r}: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
-        finally:  # the app closed our stdin, or went away: let go of the camera and finish
-            stop.set()
-            source.close()
+        finally:  # the app closed our stdin, or went away: let go of the camera, if it is open yet, and finish
+            with opening:
+                stop.set()
+                opened = source
+            if opened is not None:
+                opened.close()
 
+    # Listening comes first, so a stop that arrives while the model is still loading is heard before the camera opens.
     threading.Thread(target=read_commands, daemon=True, name="gaze-commands").start()
+    try:
+        # The model next: a missing file or library is found before the camera is ever opened.
+        detector = _detector = FakeDetector() if args.fake else FaceDetector(Path(args.model_file or ""))
+        argv = json.loads(args.source_argv) if args.source_argv else camera_argv(args.camera, *CAMERA_SIZE)
+        with opening:
+            if stop.is_set():
+                return 0  # stopped while loading
+            source = FakeFrameSource(stop) if args.fake and not args.source_argv else FrameSource(argv, *CAMERA_SIZE)
+    except (ModelError, CameraError, ValueError) as exc:
+        return say(str(exc))
     ready = False
     complained = ""
     try:

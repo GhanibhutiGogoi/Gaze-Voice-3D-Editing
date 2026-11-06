@@ -20,10 +20,11 @@ def _component_classes() -> list[type[Component]]:
     from .blender_mcp import McpAddon, McpServer
     from .brains import ClaudeCode, Codex
     from .bridge import Bridge
+    from .gaze import Gaze
     from .microphone import Microphone
     from .speech import Speech
     from .unity import Unity, UnityProject
     from .unity_bridge import UnityBridge, UnityMcp
 
-    return [Microphone, Speech, ClaudeCode, Codex, Blender, McpAddon, McpServer, Bridge,
+    return [Microphone, Speech, Gaze, ClaudeCode, Codex, Blender, McpAddon, McpServer, Bridge,
             Unity, UnityProject, UnityMcp, UnityBridge]

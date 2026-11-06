@@ -133,6 +133,12 @@ class MicrophoneTest(unittest.TestCase):
         self.mic.check()
         self.assertEqual(self.t.runner.calls.count(tuple(LIST_DEVICES)), 1)
 
+    def test_cameras_come_from_the_same_cached_listing(self):
+        self.t.runner.add(LIST_DEVICES, returncode=1, stderr=LISTING)
+        self.assertEqual(self.mic.devices()[0], ("0", "MacBook Pro Microphone"))
+        self.assertEqual(self.mic.cameras(), [("0", "FaceTime HD Camera"), ("1", "Capture screen 0")])
+        self.assertEqual(self.t.runner.calls.count(tuple(LIST_DEVICES)), 1)
+
     def test_selected_device_missing(self):
         self.t.ctx.settings = self.t.ctx.settings.__class__(mic_device="7")
         self.t.runner.add(LIST_DEVICES, returncode=1, stderr=LISTING)
