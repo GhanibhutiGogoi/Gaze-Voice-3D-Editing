@@ -42,6 +42,20 @@ top left. Nothing here edits the scene.
      "marks": [{"n": 1, "u": 0.4, "v": 0.3, "name": "Chair"}]}      -> {"ok": true}
         Draws in the target viewport (a null/empty field draws nothing). "ru, rv" are the ring's radii
         as shares of the viewport's width and height.
+    {"cmd": "gaze_crop", "u": 0.4, "v": 0.3,                        -> {"ok": true, "pending": true}
+     "radius": [0.1, 0.15], "size": 512}                              or {"ok": false, "error": "…"}
+    {"cmd": "gaze_crop_result"}    -> {"ok": true, "pending": true}   (keep asking)
+                                      or {"ok": true, "png": "<base64>"}
+                                      or {"ok": false, "error": "…"}
+        A picture of the part of the viewport around a target that has no name, for the app to show a
+        model. "u, v" and "radius" are as in gaze_show's ring. The picture is the box 2.5 radii each way
+        from the point, cut to the viewport, scaled so its long side is "size" pixels (at most
+        MAX_CROP_SIZE), with the ring drawn on it and nothing else. It is a PNG in the reply, as base64 on
+        one line (replies may be long; only requests are limited by MAX_LINE). The viewport only draws
+        when Blender repaints it, so gaze_crop returns at once and the picture follows a moment later;
+        gaze_crop_result answers "pending" until it is ready, then hands it over exactly once: Blender keeps
+        no copy and writes no file. A second gaze_crop while one is pending is refused. If the viewport
+        hasn't drawn within CROP_SECONDS (say the window is hidden), the result is an error.
     While the push-to-talk key is held, "poll" also carries the mouse as a stand-in for gaze, at most
     MAX_POINTER_RATE a second, whether it moves or rests where it is:
         {"seq": 14, "type": "pointer", "u": 0.4, "v": 0.3, "t": …}
@@ -49,10 +63,13 @@ top left. Nothing here edits the scene.
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import secrets
+import struct
 import time
+import zlib
 from typing import Callable, Protocol
 
 BRIDGE_PORT = 9877
@@ -68,6 +85,14 @@ MAX_PIECE_FACES = 200000  # above this many faces, counting a piece is skipped s
 MAX_MARKS = 20
 MAX_MARK_NAME = 40
 MAX_POINTER_RATE = 20  # pointer events a second, at most
+MAX_CROP_SIZE = 1024  # the long side of a gaze_crop picture, in pixels
+CROP_SECONDS = 3.0  # a crop whose viewport hasn't drawn by then is given up
+CROP_MARGIN = 2.5  # a crop reaches this many ring radii out from the target, each way
+RING_COLOR = (90, 190, 255)  # the ring drawn on a crop: one bright colour...
+RING_EDGE_COLOR = (12, 12, 16)  # ...with a dark edge, so it shows on any background
+RING_HALF_WIDTH = 1.5  # pixels either side of the ring's line, bright
+RING_EDGE = 1.5  # more pixels beyond that on each side, dark
+MAX_RING_STEPS = 16384  # points along the ring that get a dab of colour
 STATUS_STATES = ("idle", "listening", "working", "done", "error")
 INVALID = {"cmd": "__invalid__"}
 _KEY_NAMES = {"SPACE": "Space", "RET": "Return", "ESC": "Esc", "TAB": "Tab", "BACK_SPACE": "Delete"}
@@ -111,6 +136,12 @@ class SceneAccess(Protocol):
 
     def gaze_show(self, dot: list | None, ring: list | None, marks: list[dict]) -> None: ...
 
+    def gaze_crop(self, u: float, v: float, radius: list[float], size: int) -> str | None:
+        """Start taking the picture. None once it has started, else why it can't: no 3D viewport, or one is pending."""
+
+    def gaze_crop_result(self) -> dict:
+        """{"pending": True}, {"png": bytes} or {"error": str}. Handing over a picture or an error clears it."""
+
 
 class EventQueue:
     """Hold-to-talk events waiting for the app to poll them."""
@@ -152,6 +183,144 @@ class EventQueue:
     def live(self, within: float = LIVE_SECONDS) -> bool:
         """Whether the app is polling, i.e. its voice loop is on."""
         return self.clock() - self.last_poll < within
+
+
+class CropSlot:
+    """The one viewport picture Blender is making or has made for the app, held in memory and handed over once.
+
+    The picture is made inside a draw callback some time after the request, so there is a short wait in between:
+    idle, pending (asked for, not drawn yet), then ready (a picture) or failed (an error). Reading a picture or an
+    error clears it. A pending crop that isn't done within `timeout` seconds becomes a failure.
+    """
+
+    NOTHING_WAITING = "no picture is waiting"
+    TIMED_OUT = "Blender's viewport didn't draw in time (is its window hidden?)"
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic, timeout: float = CROP_SECONDS):
+        self._clock = clock
+        self._timeout = timeout
+        self._state = "idle"
+        self._started = 0.0
+        self._png: bytes | None = None
+        self._error = ""
+
+    @property
+    def state(self) -> str:
+        """"idle", "pending", "ready" or "failed"."""
+        if self._state == "pending" and self._clock() - self._started > self._timeout:
+            self._state, self._error = "failed", self.TIMED_OUT
+        return self._state
+
+    def begin(self) -> bool:
+        """Start a new picture. False, changing nothing, while one is still pending. A result nobody read is dropped."""
+        if self.state == "pending":
+            return False
+        self._state, self._started, self._png, self._error = "pending", self._clock(), None, ""
+        return True
+
+    def finish(self, png: bytes) -> None:
+        """The picture is made. Ignored unless a crop is pending, so a late one (after giving up) is thrown away."""
+        if self.state == "pending":
+            self._state, self._png = "ready", png
+
+    def fail(self, error: str) -> None:
+        if self.state == "pending":
+            self._state, self._error = "failed", error
+
+    def read(self) -> dict:
+        """{"pending": True}, or {"png": bytes} / {"error": str} once, after which nothing is kept."""
+        state = self.state
+        if state == "pending":
+            return {"pending": True}
+        if state == "ready":
+            png, self._png, self._state = self._png, None, "idle"
+            return {"png": png}
+        if state == "failed":
+            error, self._error, self._state = self._error, "", "idle"
+            return {"error": error}
+        return {"error": self.NOTHING_WAITING}
+
+    def drop(self) -> None:
+        """Forget everything, say when the add-on is switched off."""
+        self._state, self._png, self._error = "idle", None, ""
+
+
+def crop_box(u: float, v: float, radius: list[float], width: int, height: int,
+             margin: float = CROP_MARGIN) -> tuple[int, int, int, int]:
+    """The pixels (left, top, right, bottom) of a width x height image to crop for a ring at (u, v) with radii
+    `radius` (shares of the width and height): `margin` radii out each way, cut off at the image's edges. The right and
+    bottom are exclusive, and the box is never empty."""
+    centre_x, centre_y = u * width, v * height
+    reach_x, reach_y = radius[0] * margin * width, radius[1] * margin * height
+    left = min(max(0, math.floor(centre_x - reach_x)), width - 1)
+    top = min(max(0, math.floor(centre_y - reach_y)), height - 1)
+    right = max(min(width, math.ceil(centre_x + reach_x)), left + 1)
+    bottom = max(min(height, math.ceil(centre_y + reach_y)), top + 1)
+    return left, top, right, bottom
+
+
+def crop_size(box: tuple[int, int, int, int], size: int) -> tuple[int, int]:
+    """(width, height) of the box scaled so that its long side is `size` pixels."""
+    box_width, box_height = box[2] - box[0], box[3] - box[1]
+    scale = size / max(box_width, box_height)
+    return max(1, round(box_width * scale)), max(1, round(box_height * scale))
+
+
+def ring_in_crop(u: float, v: float, radius: list[float], width: int, height: int,
+                 box: tuple[int, int, int, int], out: tuple[int, int]) -> tuple[float, float, float, float]:
+    """Where the ring goes on the cropped, scaled picture: (cx, cy, rx, ry) in its pixels. `width, height` is the
+    image the box was cut from and `out` the picture's size."""
+    scale_x, scale_y = out[0] / (box[2] - box[0]), out[1] / (box[3] - box[1])
+    return (
+        (u * width - box[0]) * scale_x,
+        (v * height - box[1]) * scale_y,
+        radius[0] * width * scale_x,
+        radius[1] * height * scale_y,
+    )
+
+
+def _dab(pixels: bytearray, width: int, height: int, x: float, y: float, radius: float, color: bytes) -> None:
+    """Colour every pixel of a width x height RGB buffer whose centre is within `radius` of (x, y)."""
+    radius_squared = radius * radius
+    for row in range(max(0, math.floor(y - radius)), min(height, math.ceil(y + radius))):
+        dy = row + 0.5 - y
+        for column in range(max(0, math.floor(x - radius)), min(width, math.ceil(x + radius))):
+            dx = column + 0.5 - x
+            if dx * dx + dy * dy <= radius_squared:
+                start = (row * width + column) * 3
+                pixels[start : start + 3] = color
+
+
+def draw_ring(pixels: bytearray, width: int, height: int, cx: float, cy: float, rx: float, ry: float) -> None:
+    """Draw an ellipse outline into a width x height RGB buffer (top row first), in place: RING_COLOR with a dark
+    edge either side. (cx, cy) and the radii are in pixels, a pixel being one unit square. Only the outline is
+    touched, and parts outside the picture are left out."""
+    if not all(math.isfinite(n) for n in (cx, cy, rx, ry)) or rx <= 0 or ry <= 0:
+        return
+    steps = min(MAX_RING_STEPS, max(16, math.ceil(2 * math.pi * max(rx, ry))))
+    angles = [2 * math.pi * i / steps for i in range(steps)]
+    points = [(cx + rx * math.cos(a), cy + ry * math.sin(a)) for a in angles]
+    for radius, color in ((RING_HALF_WIDTH + RING_EDGE, bytes(RING_EDGE_COLOR)), (RING_HALF_WIDTH, bytes(RING_COLOR))):
+        for x, y in points:
+            _dab(pixels, width, height, x, y, radius, color)
+
+
+def _png_chunk(kind: bytes, body: bytes) -> bytes:
+    return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+
+
+def encode_png(width: int, height: int, rgb: bytes) -> bytes:
+    """A PNG file (8-bit RGB) from width x height pixels, top row first, three bytes each."""
+    if width < 1 or height < 1 or len(rgb) != width * height * 3:
+        raise ValueError("rgb must hold exactly width x height pixels of three bytes")
+    stride = width * 3
+    raw = b"".join(b"\x00" + bytes(rgb[y * stride : (y + 1) * stride]) for y in range(height))  # filter type 0 per row
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + _png_chunk(b"IDAT", zlib.compress(raw, 6))
+        + _png_chunk(b"IEND", b"")
+    )
 
 
 def undo_name(message: str, limit: int = MAX_UNDO_NAME) -> str:
@@ -285,6 +454,10 @@ def handle(request: dict, scene: SceneAccess, events: EventQueue) -> dict:
         return _gaze_piece(request.get("uid"), request.get("point"), scene)
     if command == "gaze_show":
         return _gaze_show(request, scene)
+    if command == "gaze_crop":
+        return _gaze_crop(request, scene)
+    if command == "gaze_crop_result":
+        return _gaze_crop_result(scene)
     return {"ok": False, "error": "unknown command"}
 
 
@@ -352,3 +525,26 @@ def _gaze_show(request: dict, scene: SceneAccess) -> dict:
         clean,
     )
     return {"ok": True}
+
+
+def _gaze_crop(request: dict, scene: SceneAccess) -> dict:
+    u, v, radius, size = request.get("u"), request.get("v"), request.get("radius"), request.get("size")
+    if not (_unit(u) and _unit(v)):
+        return {"ok": False, "error": "u and v must be 0 to 1"}
+    if not (isinstance(radius, (list, tuple)) and len(radius) == 2 and all(_real(c) and 0 < c <= 1 for c in radius)):
+        return {"ok": False, "error": "radius must be [ru, rv], each above 0 and at most 1"}
+    if not (isinstance(size, int) and not isinstance(size, bool) and size >= 1):
+        return {"ok": False, "error": "size must be a whole number of pixels, 1 or more"}
+    refused = scene.gaze_crop(float(u), float(v), [float(radius[0]), float(radius[1])], min(size, MAX_CROP_SIZE))
+    if refused:
+        return {"ok": False, "error": refused}
+    return {"ok": True, "pending": True}
+
+
+def _gaze_crop_result(scene: SceneAccess) -> dict:
+    result = scene.gaze_crop_result()
+    if "png" in result:
+        return {"ok": True, "png": base64.b64encode(result["png"]).decode("ascii")}
+    if "error" in result:
+        return {"ok": False, "error": result["error"]}
+    return {"ok": True, "pending": True}

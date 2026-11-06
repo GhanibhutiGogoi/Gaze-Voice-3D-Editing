@@ -1,6 +1,13 @@
+import base64
 import importlib.util
+import io
+import os
+import re
+import struct
 import unittest
+import zlib
 from pathlib import Path
+from unittest import mock
 
 PROTOCOL = Path(__file__).resolve().parents[1] / "blender_addon" / "gazevoice_bridge" / "protocol.py"
 
@@ -29,6 +36,8 @@ class FakeScene:
         self.view = (1840, 1100)
         self.picked = []
         self.shown = []
+        self.crop = protocol.CropSlot()
+        self.crops_asked = []
 
     def version(self):
         return "5.2.2"
@@ -93,6 +102,17 @@ class FakeScene:
 
     def gaze_show(self, dot, ring, marks):
         self.shown.append((dot, ring, marks))
+
+    def gaze_crop(self, u, v, radius, size):
+        if self.view is None:
+            return "no 3D viewport"
+        if not self.crop.begin():
+            return "a picture is already being taken"
+        self.crops_asked.append((u, v, radius, size))
+        return None
+
+    def gaze_crop_result(self):
+        return self.crop.read()
 
 
 class Clock:
@@ -433,6 +453,366 @@ class FaceTest(unittest.TestCase):
     def test_a_group_with_no_weight_is_not_a_part(self):
         self.assertEqual(protocol.face_part({"Wing.L": 0.0}, "Feather", 2), "Feather")
         self.assertIsNone(protocol.face_part({"Wing.L": 0.0}, None, 2))
+
+
+def decode_png(data):
+    """A small PNG reader built on the standard library only: (width, height, rgb bytes, top row first)."""
+    assert data[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG"
+    pos, chunks = 8, []
+    while pos < len(data):
+        length, kind = struct.unpack(">I4s", data[pos : pos + 8])
+        body = data[pos + 8 : pos + 8 + length]
+        (crc,) = struct.unpack(">I", data[pos + 8 + length : pos + 12 + length])
+        assert crc == zlib.crc32(kind + body), f"bad checksum in {kind!r}"
+        chunks.append((kind, body))
+        pos += 12 + length
+    assert [kind for kind, _ in chunks][0] == b"IHDR" and chunks[-1][0] == b"IEND"
+    width, height, depth, colour, compression, filtering, interlace = struct.unpack(">IIBBBBB", chunks[0][1])
+    assert (depth, colour, compression, filtering, interlace) == (8, 2, 0, 0, 0), "expected plain 8-bit RGB"
+    raw = zlib.decompress(b"".join(body for kind, body in chunks if kind == b"IDAT"))
+    stride = width * 3
+    assert len(raw) == height * (stride + 1)
+    rows = []
+    for y in range(height):
+        row = raw[y * (stride + 1) : (y + 1) * (stride + 1)]
+        assert row[0] == 0, "expected filter type 0"
+        rows.append(row[1:])
+    return width, height, b"".join(rows)
+
+
+def blank(width, height, value=(40, 40, 40)):
+    return bytearray(bytes(value) * (width * height))
+
+
+def pixel(pixels, width, x, y):
+    return tuple(pixels[(y * width + x) * 3 : (y * width + x) * 3 + 3])
+
+
+class CropPictureTest(unittest.TestCase):
+    def test_encode_png_makes_a_readable_file(self):
+        width, height = 7, 5
+        rgb = bytes((x * 31 + y * 7 + c * 50) % 256 for y in range(height) for x in range(width) for c in range(3))
+        png = protocol.encode_png(width, height, rgb)
+        self.assertIsInstance(png, bytes)
+        self.assertEqual(decode_png(png), (width, height, rgb))
+
+    def test_encode_png_refuses_pixels_that_do_not_fit_the_size(self):
+        with self.assertRaises(ValueError):
+            protocol.encode_png(4, 4, bytes(4 * 4 * 3 - 1))
+        with self.assertRaises(ValueError):
+            protocol.encode_png(0, 4, b"")
+
+    def test_encode_png_squeezes_a_flat_picture(self):
+        png = protocol.encode_png(512, 512, bytes(512 * 512 * 3))
+        self.assertLess(len(png), 5000)
+        self.assertEqual(decode_png(png)[:2], (512, 512))
+
+    def test_crop_box_is_a_margin_around_the_ring(self):
+        # the ring's radii are 0.1 of the width and 0.1 of the height; the box reaches 2.5 radii each way
+        self.assertEqual(protocol.crop_box(0.5, 0.5, [0.1, 0.1], 1000, 500), (250, 125, 750, 375))
+        self.assertEqual(protocol.crop_box(0.5, 0.5, [0.1, 0.1], 1000, 500, margin=1.0), (400, 200, 600, 300))
+
+    def test_crop_box_stays_inside_the_image(self):
+        for u, v in ((0, 0), (1, 1), (0, 1), (1, 0), (0.5, 0.5), (0.02, 0.97), (0.999, 0.001)):
+            for radius in ([0, 0], [0.0001, 0.0001], [0.05, 0.2], [0.3, 0.1], [1, 1]):
+                for width, height in ((1840, 1100), (3, 2), (1, 1)):
+                    with self.subTest(u=u, v=v, radius=radius, size=(width, height)):
+                        left, top, right, bottom = protocol.crop_box(u, v, radius, width, height)
+                        self.assertTrue(0 <= left < right <= width)
+                        self.assertTrue(0 <= top < bottom <= height)
+                        self.assertTrue(all(isinstance(n, int) for n in (left, top, right, bottom)))
+
+    def test_crop_box_keeps_the_point_it_is_centred_on(self):
+        left, top, right, bottom = protocol.crop_box(0.01, 0.99, [0.05, 0.05], 1000, 1000)
+        self.assertEqual((left, bottom), (0, 1000))  # cut off at the corner, not moved
+        self.assertTrue(left <= 10 < right and top <= 990 < bottom)
+
+    def test_crop_size_puts_the_long_side_at_size(self):
+        self.assertEqual(protocol.crop_size((250, 125, 750, 375), 512), (512, 256))
+        self.assertEqual(protocol.crop_size((0, 0, 100, 300), 600), (200, 600))
+        self.assertEqual(protocol.crop_size((0, 0, 1, 1), 64), (64, 64))
+        self.assertEqual(protocol.crop_size((0, 0, 1000, 1), 100), (100, 1))  # never a zero side
+
+    def test_the_ring_lands_where_the_target_is_in_the_crop(self):
+        box = protocol.crop_box(0.5, 0.5, [0.1, 0.2], 1000, 500)
+        size = protocol.crop_size(box, 512)
+        cx, cy, rx, ry = protocol.ring_in_crop(0.5, 0.5, [0.1, 0.2], 1000, 500, box, size)
+        self.assertAlmostEqual(cx, size[0] / 2)
+        self.assertAlmostEqual(cy, size[1] / 2)
+        self.assertAlmostEqual(rx / size[0], 1 / 2.5 / 2)  # a radius is 1/2.5 of the half-box on each side
+        self.assertAlmostEqual(ry / size[1], 1 / 2.5 / 2)
+
+    def test_the_ring_follows_the_target_when_the_box_is_cut_off(self):
+        box = protocol.crop_box(0.0, 0.0, [0.1, 0.1], 1000, 1000)  # (0, 0, 250, 250)
+        cx, cy, rx, ry = protocol.ring_in_crop(0.0, 0.0, [0.1, 0.1], 1000, 1000, box, (250, 250))
+        self.assertEqual((cx, cy, rx, ry), (0.0, 0.0, 100.0, 100.0))
+
+    def test_the_ring_is_scaled_on_each_axis_on_its_own(self):
+        # a 100 x 100 box shown 200 wide and 100 tall: the ring's centre and radii stretch the same way
+        cx, cy, rx, ry = protocol.ring_in_crop(0.5, 0.25, [0.1, 0.2], 400, 400, (150, 50, 250, 150), (200, 100))
+        self.assertEqual((cx, cy, rx, ry), (100.0, 50.0, 80.0, 80.0))
+
+    def test_draw_ring_marks_only_the_outline(self):
+        width = height = 100
+        pixels = blank(width, height)
+        before = bytes(pixels)
+        protocol.draw_ring(pixels, width, height, 50, 50, 30, 20)
+        self.assertEqual(len(pixels), len(before))
+        self.assertEqual(pixel(pixels, width, 50, 50), (40, 40, 40))  # the centre is left alone
+        self.assertEqual(pixel(pixels, width, 0, 0), (40, 40, 40))
+        self.assertEqual(pixel(pixels, width, 60, 50), (40, 40, 40))  # well inside
+        self.assertEqual(pixel(pixels, width, 99, 99), (40, 40, 40))
+        self.assertEqual(pixel(pixels, width, 80, 50), protocol.RING_COLOR)  # the right end of the ring
+        self.assertEqual(pixel(pixels, width, 20, 50), protocol.RING_COLOR)
+        self.assertEqual(pixel(pixels, width, 50, 30), protocol.RING_COLOR)  # the top
+        self.assertEqual(pixel(pixels, width, 50, 70), protocol.RING_COLOR)
+        # everything it changed sits close to the outline
+        changed = 0
+        for y in range(height):
+            for x in range(width):
+                if pixel(pixels, width, x, y) != (40, 40, 40):
+                    changed += 1
+                    f = (((x + 0.5 - 50) / 30) ** 2 + ((y + 0.5 - 50) / 20) ** 2) ** 0.5
+                    self.assertTrue(0.8 < f < 1.2, (x, y, f))
+        self.assertGreater(changed, 200)
+        self.assertLess(changed, 1500)
+
+    def test_the_ring_has_a_dark_edge_so_it_shows_on_any_background(self):
+        for background in ((0, 0, 0), (255, 255, 255), (128, 128, 128)):
+            with self.subTest(background=background):
+                pixels = blank(100, 100, background)
+                protocol.draw_ring(pixels, 100, 100, 50, 50, 30, 30)
+                colours = {pixel(pixels, 100, x, 50) for x in range(100)}
+                self.assertIn(protocol.RING_COLOR, colours)
+                self.assertIn(protocol.RING_EDGE_COLOR, colours)
+                # the dark edge touches the background on both sides of the bright band
+                row = [pixel(pixels, 100, x, 50) for x in range(100)]
+                bright = [i for i, c in enumerate(row) if c == protocol.RING_COLOR]
+                self.assertEqual(row[bright[0] - 1], protocol.RING_EDGE_COLOR)
+                self.assertEqual(row[bright[-1] + 1], protocol.RING_EDGE_COLOR)
+
+    def test_a_ring_running_off_the_picture_stays_inside_the_buffer(self):
+        pixels = blank(40, 30)
+        protocol.draw_ring(pixels, 40, 30, 0, 0, 100, 100)  # a corner of a big ring
+        protocol.draw_ring(pixels, 40, 30, 20, 15, 500, 400)  # the whole picture inside the ring
+        protocol.draw_ring(pixels, 40, 30, 20, 15, 0, 0)  # no size at all
+        self.assertEqual(len(pixels), 40 * 30 * 3)
+
+    def test_nothing_but_the_ring_is_drawn(self):
+        pixels = blank(60, 60)
+        protocol.draw_ring(pixels, 60, 60, 30, 30, 20, 20)
+        colours = {pixel(pixels, 60, x, y) for y in range(60) for x in range(60)}
+        self.assertEqual(colours, {(40, 40, 40), protocol.RING_COLOR, protocol.RING_EDGE_COLOR})
+
+
+class CropSlotTest(unittest.TestCase):
+    def test_a_picture_is_read_once(self):
+        slot = protocol.CropSlot()
+        self.assertTrue(slot.begin())
+        self.assertEqual(slot.read(), {"pending": True})
+        slot.finish(b"png bytes")
+        self.assertEqual(slot.state, "ready")
+        self.assertEqual(slot.read(), {"png": b"png bytes"})
+        self.assertEqual(slot.state, "idle")
+        self.assertIsNone(slot._png)  # the add-on lets go of the bytes the moment they are read
+        self.assertEqual(slot.read(), {"error": "no picture is waiting"})
+
+    def test_an_error_is_read_once_too(self):
+        slot = protocol.CropSlot()
+        slot.begin()
+        slot.fail("the GPU said no")
+        self.assertEqual(slot.read(), {"error": "the GPU said no"})
+        self.assertEqual(slot.read(), {"error": "no picture is waiting"})
+
+    def test_a_second_crop_is_refused_while_one_is_pending(self):
+        slot = protocol.CropSlot()
+        self.assertTrue(slot.begin())
+        self.assertFalse(slot.begin())
+        self.assertEqual(slot.state, "pending")
+        slot.finish(b"first")
+        self.assertEqual(slot.read(), {"png": b"first"})
+        self.assertTrue(slot.begin())
+
+    def test_a_new_crop_drops_a_picture_nobody_read(self):
+        slot = protocol.CropSlot()
+        slot.begin()
+        slot.finish(b"old")
+        self.assertTrue(slot.begin())
+        self.assertEqual(slot.read(), {"pending": True})
+        slot.finish(b"new")
+        self.assertEqual(slot.read(), {"png": b"new"})
+
+    def test_it_gives_up_when_the_viewport_never_draws(self):
+        clock = Clock(10.0)
+        slot = protocol.CropSlot(clock=clock)
+        slot.begin()
+        clock.now += protocol.CROP_SECONDS - 0.1
+        self.assertEqual(slot.read(), {"pending": True})
+        clock.now += 0.2
+        self.assertEqual(slot.state, "failed")
+        self.assertIn("didn't draw", slot.read()["error"])
+        self.assertEqual(slot.read(), {"error": "no picture is waiting"})
+
+    def test_a_picture_that_comes_after_giving_up_is_thrown_away(self):
+        clock = Clock(10.0)
+        slot = protocol.CropSlot(clock=clock)
+        slot.begin()
+        clock.now += protocol.CROP_SECONDS + 1
+        slot.finish(b"too late")
+        self.assertIn("error", slot.read())
+        self.assertEqual(slot.state, "idle")
+
+    def test_a_timed_out_crop_does_not_block_the_next_one(self):
+        clock = Clock(10.0)
+        slot = protocol.CropSlot(clock=clock)
+        slot.begin()
+        clock.now += protocol.CROP_SECONDS + 1
+        self.assertTrue(slot.begin())
+        self.assertEqual(slot.read(), {"pending": True})
+
+    def test_drop_forgets_everything(self):
+        slot = protocol.CropSlot()
+        slot.begin()
+        slot.finish(b"secret")
+        slot.drop()
+        self.assertIsNone(slot._png)
+        self.assertEqual((slot.state, slot.read()), ("idle", {"error": "no picture is waiting"}))
+        slot.begin()
+        slot.drop()
+        slot.finish(b"after the drop")  # nobody is waiting for it
+        self.assertEqual(slot.read(), {"error": "no picture is waiting"})
+
+    def test_the_timeout_is_a_few_seconds(self):
+        self.assertEqual(protocol.CROP_SECONDS, 3.0)
+        self.assertEqual(protocol.MAX_CROP_SIZE, 1024)
+
+
+class GazeCropTest(unittest.TestCase):
+    ASK = {"cmd": "gaze_crop", "u": 0.4, "v": 0.3, "radius": [0.1, 0.15], "size": 512}
+
+    def test_a_crop_starts_and_answers_pending(self):
+        scene = FakeScene()
+        self.assertEqual(handle(self.ASK, scene), {"ok": True, "pending": True})
+        self.assertEqual(scene.crops_asked, [(0.4, 0.3, [0.1, 0.15], 512)])
+        self.assertEqual(handle({"cmd": "gaze_crop_result"}, scene), {"ok": True, "pending": True})
+
+    def test_a_crop_result_can_only_be_read_once(self):
+        scene = FakeScene()
+        handle(self.ASK, scene)
+        png = protocol.encode_png(4, 4, bytes(range(48)))
+        scene.crop.finish(png)  # the viewport drew and the picture was made
+        reply = handle({"cmd": "gaze_crop_result"}, scene)
+        self.assertEqual(set(reply), {"ok", "png"})
+        self.assertTrue(reply["ok"])
+        self.assertEqual(base64.b64decode(reply["png"], validate=True), png)
+        self.assertNotIn("\n", reply["png"])
+        self.assertEqual(handle({"cmd": "gaze_crop_result"}, scene), {"ok": False, "error": "no picture is waiting"})
+        self.assertEqual(scene.crop.state, "idle")
+
+    def test_the_reply_is_one_line(self):
+        scene = FakeScene()
+        handle(self.ASK, scene)
+        scene.crop.finish(protocol.encode_png(200, 200, os.urandom(200 * 200 * 3)))
+        line = protocol.encode(handle({"cmd": "gaze_crop_result"}, scene))
+        self.assertEqual(line.count(b"\n"), 1)
+        self.assertTrue(line.endswith(b"\n"))
+        self.assertGreater(len(line), protocol.MAX_LINE)  # replies may be longer than a request is allowed to be
+
+    def test_asking_before_any_crop_says_nothing_is_waiting(self):
+        self.assertEqual(handle({"cmd": "gaze_crop_result"}), {"ok": False, "error": "no picture is waiting"})
+
+    def test_a_crop_while_one_is_pending_is_refused(self):
+        scene = FakeScene()
+        handle(self.ASK, scene)
+        self.assertEqual(
+            handle(dict(self.ASK, u=0.9), scene), {"ok": False, "error": "a picture is already being taken"}
+        )
+        self.assertEqual(len(scene.crops_asked), 1)
+        self.assertEqual(handle({"cmd": "gaze_crop_result"}, scene), {"ok": True, "pending": True})
+
+    def test_a_crop_that_never_finishes_ends_in_an_error(self):
+        clock = Clock(10.0)
+        scene = FakeScene()
+        scene.crop = protocol.CropSlot(clock=clock)
+        handle(self.ASK, scene)
+        clock.now += protocol.CROP_SECONDS + 0.5
+        reply = handle({"cmd": "gaze_crop_result"}, scene)
+        self.assertFalse(reply["ok"])
+        self.assertIn("didn't draw", reply["error"])
+        self.assertEqual(handle(self.ASK, scene), {"ok": True, "pending": True})  # and the next one can go ahead
+
+    def test_a_crop_that_failed_says_why(self):
+        scene = FakeScene()
+        handle(self.ASK, scene)
+        scene.crop.fail("couldn't read the viewport")
+        self.assertEqual(handle({"cmd": "gaze_crop_result"}, scene), {"ok": False, "error": "couldn't read the viewport"})
+
+    def test_a_crop_needs_a_viewport(self):
+        scene = FakeScene()
+        scene.view = None
+        self.assertEqual(handle(self.ASK, scene), {"ok": False, "error": "no 3D viewport"})
+        self.assertEqual(scene.crop.state, "idle")
+
+    def test_size_is_capped(self):
+        scene = FakeScene()
+        handle(dict(self.ASK, size=5000), scene)
+        scene.crop.drop()
+        handle(dict(self.ASK, size=protocol.MAX_CROP_SIZE), scene)
+        self.assertEqual([size for *_, size in scene.crops_asked], [protocol.MAX_CROP_SIZE] * 2)
+
+    def test_the_numbers_are_checked(self):
+        scene = FakeScene()
+        bad_where = {"ok": False, "error": "u and v must be 0 to 1"}
+        bad_radius = {"ok": False, "error": "radius must be [ru, rv], each above 0 and at most 1"}
+        bad_size = {"ok": False, "error": "size must be a whole number of pixels, 1 or more"}
+        cases = (
+            (dict(self.ASK, u=1.2), bad_where),
+            (dict(self.ASK, v=-0.1), bad_where),
+            (dict(self.ASK, u="0.4"), bad_where),
+            (dict(self.ASK, v=float("nan")), bad_where),
+            ({k: v for k, v in self.ASK.items() if k != "u"}, bad_where),
+            (dict(self.ASK, radius=[0.1]), bad_radius),
+            (dict(self.ASK, radius=0.1), bad_radius),
+            (dict(self.ASK, radius=[0.1, 0]), bad_radius),
+            (dict(self.ASK, radius=[0.1, 1.5]), bad_radius),
+            (dict(self.ASK, radius=[0.1, "x"]), bad_radius),
+            (dict(self.ASK, radius=[True, 0.1]), bad_radius),
+            (dict(self.ASK, radius=[0.1, float("inf")]), bad_radius),
+            ({k: v for k, v in self.ASK.items() if k != "radius"}, bad_radius),
+            (dict(self.ASK, size=0), bad_size),
+            (dict(self.ASK, size=-5), bad_size),
+            (dict(self.ASK, size=512.5), bad_size),
+            (dict(self.ASK, size="512"), bad_size),
+            (dict(self.ASK, size=True), bad_size),
+            ({k: v for k, v in self.ASK.items() if k != "size"}, bad_size),
+        )
+        for request, expected in cases:
+            with self.subTest(request=request):
+                self.assertEqual(handle(request, scene), expected)
+        self.assertEqual(scene.crops_asked, [])
+        self.assertEqual(scene.crop.state, "idle")
+
+    def test_protocol_never_touches_the_file_system(self):
+        scene = FakeScene()
+
+        def refuse(*args, **kwargs):
+            raise AssertionError(f"tried to open {args[:1]}")
+
+        with mock.patch("builtins.open", refuse), mock.patch("io.open", refuse), mock.patch("os.open", refuse):
+            self.assertEqual(handle(self.ASK, scene), {"ok": True, "pending": True})
+            box = protocol.crop_box(0.4, 0.3, [0.1, 0.15], 1840, 1100)
+            size = protocol.crop_size(box, 128)
+            pixels = blank(*size)
+            protocol.draw_ring(pixels, *size, *protocol.ring_in_crop(0.4, 0.3, [0.1, 0.15], 1840, 1100, box, size))
+            scene.crop.finish(protocol.encode_png(*size, bytes(pixels)))
+            reply = handle({"cmd": "gaze_crop_result"}, scene)
+        self.assertTrue(reply["ok"])
+        self.assertEqual(decode_png(base64.b64decode(reply["png"]))[:2], size)
+
+    def test_protocol_stays_free_of_blender_and_numpy(self):
+        source = PROTOCOL.read_text()
+        self.assertIsNone(re.search(r"^\s*(import|from)\s+(bpy|numpy|gpu|PIL)\b", source, re.MULTILINE))
+        self.assertFalse(hasattr(protocol, "np") or hasattr(protocol, "numpy") or hasattr(protocol, "bpy"))
 
 
 if __name__ == "__main__":

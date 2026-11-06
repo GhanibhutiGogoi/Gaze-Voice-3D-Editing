@@ -10,6 +10,9 @@
 - Answers what is under a point in the largest 3D viewport and what part of the model
   that is, draws the app's gaze dot, ring and numbered marks there, and while the key is
   held reports the mouse as a stand-in for gaze. None of that edits the scene.
+- Can hand the app a picture of the part of the viewport around a target that has no name,
+  with a ring drawn on it. It is taken from the GPU's memory, held in memory until the app reads
+  it once, and never written to a file.
 
 Listens on 127.0.0.1 only. A bpy timer polls a non-blocking socket, so all
 scene access happens on Blender's main thread.
@@ -24,6 +27,7 @@ import time
 import blf
 import bpy
 import gpu
+import numpy as np  # Blender bundles it
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 from mathutils import Matrix, Vector
@@ -58,6 +62,7 @@ DOT_RADIUS = 7  # pixels
 MARK_RADIUS = 12
 RING_WIDTH = 2.5
 CIRCLE_STEPS = 48
+CROP_TICK = 0.05  # seconds between repaint requests while a crop waits for the viewport to draw
 
 _server: socket.socket | None = None
 _clients: dict[socket.socket, bytearray] = {}
@@ -67,6 +72,8 @@ _changed = {"since_mark": True}
 _shown = {"status": False, "live": False}  # what the viewport and sidebar last showed
 _gaze = {"dot": None, "ring": None, "marks": []}  # what the app asked to have drawn
 _draw_handle = None
+_crop = protocol.CropSlot()  # the picture asked for with gaze_crop, until the app reads it
+_crop_job = {"handle": None, "wanted": None}  # its one-off draw handler, and (u, v, radius, size)
 _addon_keymaps: list = []
 
 
@@ -166,6 +173,73 @@ def _mirrored_points(obj, local: Vector) -> list[Vector]:
                 flipped[axis] = -flipped[axis]
                 points.append(back @ flipped)
     return points
+
+
+def _end_crop() -> None:
+    """Remove the pending crop's draw handler, if there is one."""
+    handle, _crop_job["handle"] = _crop_job["handle"], None
+    if handle is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(handle, "WINDOW")
+
+
+def _crop_tick() -> float | None:
+    """A timer: ask the target viewport to repaint (its draw handler runs only then) until the crop is made or
+    given up on, then remove the handler."""
+    if _crop.state == "pending":
+        target = _target()
+        if target is not None:
+            target[1].tag_redraw()
+        return CROP_TICK
+    _end_crop()
+    return None  # unregisters the timer
+
+
+def _crop_png(context, u: float, v: float, radius: list[float], size: int) -> bytes:
+    """Draw the viewport into an offscreen buffer, cut out the box around the ring, scale it so its long side is `size`,
+    draw the ring on it and encode it as PNG. All in memory; call it from a draw handler."""
+    region, region_3d = context.region, context.region_data
+    wanted = protocol.crop_box(u, v, radius, region.width, region.height)
+    # Draw no bigger than the picture needs: a box wider than `size` is drawn smaller, a small one at full size.
+    scale = min(1.0, size / max(wanted[2] - wanted[0], wanted[3] - wanted[1]))
+    width, height = max(1, round(region.width * scale)), max(1, round(region.height * scale))
+    offscreen = gpu.types.GPUOffScreen(width, height)
+    try:
+        offscreen.draw_view3d(
+            context.scene, context.view_layer, context.space_data, region,
+            region_3d.view_matrix, region_3d.window_matrix,
+            do_color_management=True,  # without it the picture comes out far too dark
+            draw_background=True,
+        )
+        with offscreen.bind():
+            buffer = gpu.state.active_framebuffer_get().read_color(0, 0, width, height, 4, 0, "UBYTE")
+        shot = np.frombuffer(bytes(buffer), dtype=np.uint8).reshape(height, width, 4)  # never buffer.to_list(): 300 ms
+    finally:
+        offscreen.free()
+    box = protocol.crop_box(u, v, radius, width, height)
+    left, top, right, bottom = box
+    out_width, out_height = protocol.crop_size(box, size)
+    # The GPU hands back the bottom row first, with alpha; the picture wants the top row first, without.
+    piece = shot[height - bottom : height - top, left:right, :3][::-1]
+    rows = (np.arange(out_height) * 2 + 1) * (bottom - top) // (2 * out_height)  # nearest neighbour
+    columns = (np.arange(out_width) * 2 + 1) * (right - left) // (2 * out_width)
+    pixels = bytearray(piece[rows][:, columns].tobytes())
+    ring = protocol.ring_in_crop(u, v, radius, width, height, box, (out_width, out_height))
+    protocol.draw_ring(pixels, out_width, out_height, *ring)
+    return protocol.encode_png(out_width, out_height, bytes(pixels))
+
+
+def _grab_crop() -> None:
+    """The pending crop's one-off POST_PIXEL draw handler: it runs inside a viewport repaint, the only place the
+    viewport can be drawn into a buffer. It never raises; a failure becomes the crop's error."""
+    if _crop.state != "pending" or _crop_job["wanted"] is None:
+        return
+    target, area = _target(), bpy.context.area
+    if target is None or area is None or target[1].as_pointer() != area.as_pointer():
+        return  # another 3D viewport repainted; wait for the target's
+    try:
+        _crop.finish(_crop_png(bpy.context, *_crop_job["wanted"]))
+    except Exception as exc:  # noqa: BLE001 - a draw handler must not raise
+        _crop.fail(f"couldn't capture the viewport ({exc})")
 
 
 class BpyScene:
@@ -304,6 +378,24 @@ class BpyScene:
     def gaze_show(self, dot: list | None, ring: list | None, marks: list[dict]) -> None:
         _gaze.update(dot=dot, ring=ring, marks=marks)
         _redraw()
+
+    def gaze_crop(self, u: float, v: float, radius: list[float], size: int) -> str | None:
+        if _target() is None:
+            return "no 3D viewport"
+        if not _crop.begin():
+            return "a picture is already being taken"
+        _end_crop()  # the last crop's handler, if its timer hasn't removed it yet
+        _crop_job["wanted"] = (u, v, radius, size)
+        _crop_job["handle"] = bpy.types.SpaceView3D.draw_handler_add(_grab_crop, (), "WINDOW", "POST_PIXEL")
+        if not bpy.app.timers.is_registered(_crop_tick):
+            bpy.app.timers.register(_crop_tick, first_interval=0.0, persistent=True)
+        return None
+
+    def gaze_crop_result(self) -> dict:
+        result = _crop.read()
+        if "pending" not in result:
+            _end_crop()  # done, failed or timed out: nothing is waiting for a draw any more
+        return result
 
 
 # --- socket server ----------------------------------------------------------------
@@ -618,6 +710,11 @@ def register() -> None:
 def unregister() -> None:
     global _draw_handle
     _stop_server()
+    if bpy.app.timers.is_registered(_crop_tick):
+        bpy.app.timers.unregister(_crop_tick)
+    _end_crop()
+    _crop.drop()  # a picture nobody read goes with the add-on
+    _crop_job["wanted"] = None
     _gaze.update(dot=None, ring=None, marks=[])
     _unregister_keymap()
     if _on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
