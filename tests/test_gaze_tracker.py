@@ -319,7 +319,8 @@ class GazeTrackerTest(unittest.TestCase):
         self.assertIsInstance(tracker.track, GazeTrack)
         self.assertTrue(wait_for(lambda: len(tracker.track.between(0, math.inf)) >= 12))
         samples = tracker.track.between(0, math.inf)
-        self.assertTrue(all(before - 1 <= s.t <= time.time() for s in samples))
+        # The worker rounds its stamps to the millisecond, so a brand new one can be just ahead of the clock.
+        self.assertTrue(all(before - 1 <= s.t <= time.time() + 0.001 for s in samples))
         self.assertTrue(all(0 <= s.u <= 1 and 0 <= s.v <= 1 for s in samples))
         self.assertTrue(all(b.t > a.t for a, b in zip(samples, samples[1:])))
         self.assertGreaterEqual(tracker.track.latest_time, samples[0].t)
