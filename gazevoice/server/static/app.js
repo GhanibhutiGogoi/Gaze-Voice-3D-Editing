@@ -22,7 +22,7 @@ const NAMES = {
 };
 
 const GROUPS = [
-  { label: "Input", hint: "Hears you and writes down what you said", ids: ["microphone", "speech", "gaze"] },
+  { label: "Input", hint: "Hears what you say and sees where you look", ids: ["microphone", "speech", "gaze"] },
   { label: "Brain", hint: "Cleans up what you said, then edits the scene", ids: ["claude", "codex"], providers: true },
   { label: "Blender", hint: "Where the edits land", ids: ["blender", "mcp_addon", "mcp_server", "bridge"] },
   { label: "Unity", hint: "Where the edits land", ids: ["unity", "unity_project", "unity_mcp", "unity_bridge"] },
@@ -889,6 +889,18 @@ function privacyNote(v) {
   return note;
 }
 
+// What gaze picked for the command's pointing words. "Would have" covers Watch only, and a question nobody answered:
+// the command ran on the selection then, so a reading of gaze never reached the editor.
+function gazeLine(r) {
+  const gaze = r.gaze;
+  if (!gaze || !gaze.targets || !gaze.targets.length) return null;
+  const said = [...gaze.targets, ...(gaze.misses || [])].sort((a, b) => a.at - b.at).map((word) => {
+    const best = word.candidates ? `${word.candidates[0].name} (${Math.round(word.candidates[0].score * 100)}%)` : "nothing";
+    return `“${word.word}” → ${best}`;
+  });
+  return `${r.focus && r.focus.gaze ? "Gaze picked" : "Gaze would have picked"} ${said.join(" · ")}`;
+}
+
 function commandRow(r) {
   const led = { done: "live", failed: "fault", stopped: "off" }[r.stage] || "busy";
   let understood = (r.kind === "ignore" ? `Not a ${voice().host === "unity" ? "Unity" : "Blender"} command` : KIND_WORDS[r.kind])
@@ -923,6 +935,7 @@ function commandRow(r) {
     h("div", { class: "cmd-main" },
       h("p", { class: "cmd-understood", text: understood }),
       heard ? h("p", { class: "cmd-heard", text: heard }) : null,
+      gazeLine(r) ? h("p", { class: "cmd-heard", text: gazeLine(r) }) : null,
       r.prompt && r.prompt !== r.refined
         ? h("details", { class: "cmd-prompt" }, h("summary", { text: "Prompt sent to the editor" }), h("p", { text: r.prompt }))
         : null,
@@ -1060,7 +1073,7 @@ function gazeRows(settings) {
     h("p", { class: "route-note", text: "Gaze tells the editor what you were looking at when you say this, that or there. Watch only records it and compares it with your selection, but changes nothing. Mouse uses the pointer over Blender's 3D viewport while you hold the key. Camera uses the Gaze unit in the rack: it has to be installed and calibrated, and until then voice uses your selection. The camera is only on while voice is on, or while you calibrate or test it, and no picture from the camera is kept." }),
     routeRow("Pictures · each unnamed target uses a little of your plan", "gaze_pictures", settings.gaze_pictures === true,
       [[false, "Off"], [true, "On"]]),
-    h("p", { class: "route-note", text: "When gaze is On and you look at a big part of a model that has nothing to name it, a picture of just that spot in Blender's viewport (never your camera) goes to a short-lived Claude Code process, which says in a few words what it shows. Only those words reach the editor. Pictures stay off until you turn them on here and press Check pictures get cleaned up on the Gaze unit; a new Claude Code version needs the check again. Pictures are deleted from this Mac right after use. Anthropic keeps what's sent under your account's terms." }),
+    h("p", { class: "route-note", text: "When gaze is On and you look at a big part of a model that has nothing to name it, a picture of just that spot in Blender's viewport (never your camera) goes to a short-lived Claude Code process, which says in a few words what it shows. Only those words reach the editor. Pictures stay off until you turn them on here and press Check pictures get cleaned up on the Gaze unit; a new Claude Code version needs the check again. GazeVoice never saves a picture. Claude Code gets it for one reply, and the check looks for any copy left behind. Anthropic keeps what's sent under your account's terms." }),
   ];
 }
 

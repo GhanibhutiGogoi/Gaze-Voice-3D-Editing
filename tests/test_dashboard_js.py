@@ -1,5 +1,5 @@
-"""The dashboard's script has no test harness of its own, so the one function whose text is shown to the person after a
-job is pulled out of app.js and run with node. Skipped where node isn't installed."""
+"""The dashboard's script has no test harness of its own, so the functions that decide what the person reads are pulled
+out of app.js and run with node. Skipped where node isn't installed."""
 
 import json
 import re
@@ -76,6 +76,50 @@ class GazeProblemTest(unittest.TestCase):
         self.assertRegex(APP_JS.read_text(), r'h\("p", \{ class: "voice-note", "data-tone": "warn", text: gazeProblem\(v\) \}\)')
 
 
+def target(word, name, score):
+    return {"word": word, "at": 1.0, "candidates": [{"name": name, "score": score}, {"name": "Other", "score": 0.1}]}
+
+
+@unittest.skipUnless(NODE, "node isn't installed")
+class GazeLineTest(unittest.TestCase):
+    def line(self, record):
+        return run_function("gazeLine", f"gazeLine({json.dumps(record)})")
+
+    def test_gaze_on_says_what_gaze_picked(self):
+        gaze = {"status": "resolved", "targets": [target("there", "Eagle", 0.79)]}
+        self.assertEqual(self.line({"gaze": gaze, "focus": {"gaze": gaze}}), "Gaze picked “there” → Eagle (79%)")
+
+    def test_watch_only_says_what_gaze_would_have_picked(self):
+        gaze = {"status": "resolved", "targets": [target("there", "Eagle", 0.79)]}
+        self.assertEqual(self.line({"gaze": gaze, "focus": {"selected": ["Chair"]}}),
+                         "Gaze would have picked “there” → Eagle (79%)")
+
+    def test_a_question_nobody_answered_is_what_gaze_would_have_picked(self):
+        gaze = {"status": "clarify", "asked": True, "targets": [target("this", "Eagle", 0.46)]}
+        self.assertEqual(self.line({"gaze": gaze, "focus": None}), "Gaze would have picked “this” → Eagle (46%)")
+
+    def test_every_pointing_word_is_shown_in_order(self):
+        gaze = {"status": "resolved", "targets": [target("this", "Eagle", 0.8), target("there", "Perch", 0.6)]}
+        self.assertEqual(self.line({"gaze": gaze, "focus": {"gaze": gaze}}),
+                         "Gaze picked “this” → Eagle (80%) · “there” → Perch (60%)")
+
+    def test_a_word_that_looked_at_empty_space_says_so_in_its_place(self):
+        gaze = {"status": "resolved", "targets": [{**target("this", "Eagle", 0.8), "at": 0.4}],
+                "misses": [{"word": "there", "at": 1.2}]}
+        self.assertEqual(self.line({"gaze": gaze, "focus": {"gaze": gaze}}),
+                         "Gaze picked “this” → Eagle (80%) · “there” → nothing")
+
+    def test_nothing_to_show_is_no_line(self):
+        for gaze in (None, {"status": "none", "targets": []},
+                     {"status": "none", "targets": [], "radius": [], "viewport_changed": True},
+                     {"status": "none", "targets": [], "misses": [{"word": "there", "at": 1.0}]}):
+            with self.subTest(gaze):
+                self.assertIsNone(self.line({"gaze": gaze, "focus": None}))
+
+    def test_the_command_row_shows_it(self):
+        self.assertIn('gazeLine(r) ? h("p", { class: "cmd-heard", text: gazeLine(r) }) : null', APP_JS.read_text())
+
+
 @unittest.skipUnless(NODE, "node isn't installed")
 class ResultLineTest(unittest.TestCase):
     def test_a_passed_picture_check_says_which_claude_code_it_was_for(self):
@@ -104,8 +148,9 @@ class PicturesRowTest(unittest.TestCase):
     def test_the_pictures_switch_says_what_it_costs_and_the_note_says_how_they_are_kept(self):
         source = APP_JS.read_text()
         self.assertIn('"Pictures · each unnamed target uses a little of your plan", "gaze_pictures"', source)
-        self.assertIn("Pictures are deleted from this Mac right after use. Anthropic keeps what's sent under your "
-                      "account's terms.", source)
+        self.assertIn("GazeVoice never saves a picture. Claude Code gets it for one reply, and the check looks for any "
+                      "copy left behind. Anthropic keeps what's sent under your account's terms.", source)
+        self.assertNotIn("deleted from this Mac", source)
 
 
 if __name__ == "__main__":
