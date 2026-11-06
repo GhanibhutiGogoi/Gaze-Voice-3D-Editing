@@ -1927,8 +1927,49 @@ class GazePictureTest(VoiceTestBase):
     def test_voice_starts_finding_out_whether_pictures_may_be_used_without_waiting_for_it(self):
         self.build(gaze_mode="on", gaze_source="mouse").start()
         self.assertEqual((self.pictures.refreshes, self.pictures.ready_calls), (1, 0))
+        self.gaze.look(0.5, 0.5)
         self.speak()
-        self.assertEqual(self.pictures.refreshes, 1)  # a command only reads the answer
+        self.assertEqual(self.pictures.refreshes, 2)  # the start, and the key press: a command itself only reads
+        self.assertEqual(self.pictures.ready_calls, 1)
+
+    def test_each_key_press_with_pictures_on_asks_again_whether_they_may_be_used(self):
+        self.stt = FakeStt(["add blue color there"] * 3, words=THERE_WORDS)
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.gaze.look(0.5, 0.5)
+        for presses in (1, 2, 3):
+            self.speak()
+            self.assertEqual(self.pictures.refreshes, 1 + presses)
+
+    def test_the_press_refreshes_even_if_it_ends_up_cancelled(self):
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.service.ptt("down", 1002.0)
+        self.service.ptt("cancel")
+        self.assertEqual(self.pictures.refreshes, 2)  # the press itself, whatever came of it
+
+    def test_watching_only_never_looks_up_whether_pictures_may_be_used_on_a_press(self):
+        self.build(gaze_mode="shadow", gaze_source="mouse").start()
+        self.gaze.look(0.5, 0.5)
+        self.speak()
+        self.assertEqual(self.pictures.refreshes, 1)  # only the start
+
+    def test_a_key_press_costs_nothing_when_pictures_are_off(self):
+        self.pictures = None
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        record = self.speak()
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertEqual(self.pictures_made, 0)
+
+    def test_a_refresh_that_fails_or_is_slow_to_start_cant_stop_a_key_press(self):
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.gaze.look(0.5, 0.5)
+
+        def broken():
+            raise OSError("no threads")
+
+        self.pictures.refresh = broken
+        record = self.speak()
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertEqual(len(self.editor.sent), 1)
 
     def test_a_picture_part_that_cant_start_looking_leaves_voice_working_without_pictures(self):
         def broken():
@@ -2184,7 +2225,7 @@ class GazePictureRealRouteTest(VoiceTestBase):
         super().tearDown()
         self.out.cleanup()
 
-    def use_claude(self, reply=None, hung=0.0, **env):
+    def use_claude(self, reply=None, hung=0.0, clock=time.monotonic, **env):
         runner = FakeRunner(which={"claude": "/Users/me/.local/bin/claude"})
         runner.add(["claude", "--version"], stdout="2.1.303 (Claude Code)\n", delay=hung)
         runner.add(["claude", "auth", "status"], stdout=LOGGED_IN)
@@ -2192,7 +2233,7 @@ class GazePictureRealRouteTest(VoiceTestBase):
         if reply is not None:
             environ["FAKE_CLAUDE_PICTURE"] = reply
         self.runner = runner
-        self.pictures = Describer(self.paths, runner, command=FAKE_CLAUDE, env={**environ, **env})
+        self.pictures = Describer(self.paths, runner, command=FAKE_CLAUDE, env={**environ, **env}, clock=clock)
 
     def make_pictures(self):
         clear_leftover_images(self.paths)
@@ -2239,6 +2280,44 @@ class GazePictureRealRouteTest(VoiceTestBase):
         self.assertIn("picture (", self.editor.sent[0])
         self.assertFalse(self.process_gone())  # still tidying up, as the edit goes on
         self.assertTrue(wait_until_true(self.process_gone, 8.0))
+
+    def speak_for_a_moment(self):
+        """Press, hold while any lookup finishes (which is quicker than saying anything), release, wait for the command."""
+        count = len(self.service.recent)
+        self.service.ptt("down", 1002.0)
+        wait_until_true(lambda: not [t for t in threading.enumerate() if t.name == "picture-ready"], 5.0)
+        self.service.ptt("up", 1003.0)
+        wait_for(lambda: len(self.service.recent) > count and self.last_record()["stage"] in ("done", "failed", "stopped"))
+        return self.last_record()
+
+    def test_a_command_after_a_long_quiet_spell_still_gets_its_picture(self):
+        gaps = (30, 90, 170, 185, 200, 600)  # seconds between commands that need a picture; answers are stale after 180
+        clock = FakeClock()
+        self.use_claude(hung=0.3, clock=clock)  # a healthy claude that takes a moment to say its version
+        self.stt = FakeStt(["add blue color there"] * (len(gaps) + 1), words=THERE_WORDS)
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.gaze.look(0.5, 0.5)
+        wait_for(self.pictures.ready)
+        first = self.speak_for_a_moment()
+        self.assertEqual(first["gaze"]["targets"][0]["picture"], "the left wing tip")
+        for gap in gaps:
+            # Minutes pass with nothing running: whatever lookup the last command set going has long since finished.
+            wait_until_true(lambda: not [t for t in threading.enumerate() if t.name == "picture-ready"], 5.0)
+            clock.advance(gap)
+            record = self.speak_for_a_moment()
+            self.assertEqual(record["stage"], "done", record["error"])
+            self.assertEqual(record["gaze"]["targets"][0]["picture"], "the left wing tip", f"after {gap} s")
+        self.assertEqual(len(self.bridge.crops), len(gaps) + 1)  # every one of them took a picture
+
+    def test_ready_still_never_waits_after_a_long_quiet_spell(self):
+        clock = FakeClock()
+        self.use_claude(hung=0.6, clock=clock)
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        wait_for(self.pictures.ready)
+        clock.advance(500)  # everything it knew is stale, and the next lookup takes 0.6 s
+        began = time.monotonic()
+        self.assertFalse(self.pictures.ready())  # starts that lookup, and answers from what it has: no
+        self.assertLess(time.monotonic() - began, 0.2)
 
     def test_voice_asks_about_claude_as_it_starts_and_not_again_per_command(self):
         self.build(gaze_mode="on", gaze_source="mouse").start()
@@ -2356,6 +2435,19 @@ class GazePictureRealRouteTest(VoiceTestBase):
         self.assertIn("the left wing tip", saved)
         self.assertNotIn("iVBOR", saved)
         self.assertNotIn("iVBOR", json.dumps(self.service.snapshot()["recent"]))
+
+
+class FakeClock:
+    """A clock that only moves when told to: time that passes between commands without the test waiting for it."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
 
 
 def saved_record_text(root, record) -> str:

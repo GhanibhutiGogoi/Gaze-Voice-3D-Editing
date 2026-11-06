@@ -1,5 +1,7 @@
 import json
+import os
 import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -160,6 +162,40 @@ class ClaudeSessionTest(unittest.TestCase):
         leaving.join(5)
         self.assertLess(time.monotonic() - began, 2.0)  # not the five seconds it would have been given
         self.assertEqual(s.proc.returncode, -signal.SIGTERM)
+
+    def test_a_describer_that_will_not_leave_does_not_outlive_the_app(self):
+        # The process has a session of its own, so only the thread that asks and then kills can end it. If that were
+        # a daemon thread, the parent here would exit at once and the process would be left sleeping.
+        asked = Path(self.tmp.name) / "asked"
+        parent = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(Path(__file__).resolve().parents[1])!r})\n"
+            "from gazevoice.voice.brains import ClaudeSession\n"
+            f"s = ClaudeSession({[*FAKE_CLAUDE]!r}, cwd={self.tmp.name!r}, env={{'FAKE_CLAUDE_EXIT_DELAY': '60', "
+            f"'FAKE_CLAUDE_IGNORE_TERM': {str(asked)!r}}})\n"
+            "s.start()\n"
+            "s.send('hello')\n"
+            "print(s.proc.pid, flush=True)\n"
+            "s.release(wait=0.3, term_wait=0.3)\n"
+            "# and the program ends here, without waiting for it\n"
+        )
+        began = time.monotonic()
+        done = subprocess.run([sys.executable, "-c", parent], capture_output=True, text=True, timeout=30)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        pid = int(done.stdout.split()[0])
+        self.assertLess(time.monotonic() - began, 10.0)
+        with self.assertRaises(ProcessLookupError):  # the parent has ended and the process is not there
+            os.kill(pid, 0)
+        self.assertEqual(asked.read_text(), "term")  # it was asked first, ignored that, and was killed
+
+    def test_the_exit_thread_is_not_a_daemon_but_the_readers_are(self):
+        s = self.session()
+        s.start()
+        s.send("hello")
+        leaving = s.release()
+        self.assertFalse(leaving.daemon)
+        leaving.join(5)
+        self.assertEqual(s.proc.returncode, 0)
 
     def test_close_still_waits_three_seconds_then_kills_for_the_long_lived_sessions(self):
         s = self.session(env={"FAKE_CLAUDE_NEVER_READS": "1"})

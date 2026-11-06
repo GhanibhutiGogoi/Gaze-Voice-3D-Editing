@@ -601,6 +601,7 @@ class VoiceService:
                 return
         self._publish_state()
         if state == "down":
+            self._refresh_pictures()  # speaking takes longer than finding out, so the answer is ready when it is needed
             if not self._ensure_mic(run):
                 with self._lock:
                     self._listening = False
@@ -620,6 +621,22 @@ class VoiceService:
             record["_t0"], record["_t1"] = t0, t1
             self._capture_context(record)
             run.audio_q.put(record)
+
+    def _refresh_pictures(self) -> None:
+        """At each key press, with pictures on, make sure the answer to "may pictures be used?" isn't going stale.
+
+        The answer is looked up in the background and only read when a command needs a picture, which can be minutes
+        apart, so without this the lookup would only start when it is already needed and that command would go
+        without. The picture part does nothing unless its last answer is older than PROBE_TTL, so this costs a lock.
+        It is not worth a command, so nothing here waits for anything, and nothing can stop the key press.
+        """
+        part = self._pictures
+        if part is None or self.gaze_mode != "on":
+            return
+        try:
+            part.refresh()
+        except Exception:  # noqa: BLE001 - the press is more important than the picture
+            pass
 
     def _ensure_mic(self, run: _Run) -> bool:
         """The mic is streaming, or was just restarted (ffmpeg exits when the device goes away)."""

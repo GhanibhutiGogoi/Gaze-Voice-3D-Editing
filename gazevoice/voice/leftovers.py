@@ -9,9 +9,16 @@ What the search can and can't see, so a pass is not read as more than it is:
 - It finds a copy stored as those bytes, or as that base64 text on one unbroken line. It can't find base64 that was
   wrapped over several lines or had characters escaped (`\\/` for `/`), a compressed copy, or a lossy re-encode such
   as a JPEG or a resized picture.
-- It looks only where `leftover_roots` says, and only at files changed since the picture was sent.
-- It says "couldn't look" instead of "found nothing" when a place that must be searched is missing or can't be read.
-  Some places in `~/Library` can't be read on macOS as a matter of course, and are only counted.
+- It looks only where `leftover_roots` says, and only at files whose contents or place changed since the picture was
+  sent.
+- It says "couldn't look" instead of "found nothing" when it can't read what it has to: a place that must be searched
+  (Claude Code's folder, the temp folder, the app's folder) that is missing or can't be listed, whoever owns it; a file
+  in a strict place that changed since and can't be read, if it belongs to this user or its owner can't be told; and a
+  folder there that belongs to this user, can't be listed, and changed since (it could hold a new file).
+- It only counts, and says how many in the log, what it can't read and can't need to: other users' files, folders
+  macOS itself refuses to list ("Operation not permitted", of which the temp folder holds a few for system services
+  as well as `~/Library`), unreadable folders that haven't changed since, and anything unreadable in the wider places
+  (`~/Library`, `~/.local`, the rest of the per-user temp folder). A copy kept in one of those is not found.
 """
 
 from __future__ import annotations
@@ -32,7 +39,7 @@ from ..jobs import Job, JobError
 from ..paths import AppPaths
 from ..runner import CommandRunner
 from .gaze import clean_description
-from .picture import PROBE_SECONDS, PictureError, ask_about_picture, claude_status, write_picture_check
+from .picture import PROBE_SECONDS, PictureError, ask_about_picture, claude_status, pictures_allowed, write_picture_check
 
 CHECK_QUESTION = "What colors do you see? One short sentence."
 CHECK_SIDE = 256  # the test picture is this many pixels each way, as the one that was proven by hand
@@ -98,61 +105,89 @@ def leftover_roots(paths: AppPaths) -> list[Place]:
     return list(merged.values())
 
 
-def _owned(path: str) -> bool:
+class _Judge:
+    """What the search knows about every place it was asked to look through, however they are nested.
+
+    How strictly a path is judged depends on the places it is in, not on which place's walk happened to find it, so a
+    place that must be searched still counts as one when it sits inside another place that was searched first.
+    """
+
+    def __init__(self, places: Sequence[Place]):
+        self.places: dict[str, tuple[bool, bool]] = {}  # real path -> (strict, required)
+        for place in places:
+            real = os.path.realpath(place.path)
+            strict, required = self.places.get(real, (False, False))
+            self.places[real] = (strict or place.strict or place.required, required or place.required)
+
+    def strict(self, path: str) -> bool:
+        return any(strict and (path == real or path.startswith(real + os.sep)) for real, (strict, _) in self.places.items())
+
+    def required(self, path: str) -> bool:
+        return self.places.get(path, (False, False))[1]
+
+    def is_place(self, path: str) -> bool:
+        return path in self.places
+
+
+def _could_be_mine(path: str) -> bool:
+    """Whether this path belongs to this user. When that can't be told, it might: an unknown is not an "ignore"."""
     try:
         return os.lstat(path).st_uid == os.getuid()
     except OSError:
-        return False
+        return True
 
 
 def _changed_since(path: str, since: float) -> bool:
     try:
         info = os.lstat(path)
     except OSError:
-        return False
+        return True  # can't tell, so it might have
     return max(info.st_mtime, info.st_ctime) >= since
 
 
-def _note(scan: Scan, path: str, exc: OSError, strict: bool, since: float, folder: bool = False, root: bool = False) -> None:
+def _note(scan: Scan, judge: _Judge, path: str, exc: OSError, since: float, folder: bool = False) -> None:
     """Record something that couldn't be read.
 
-    In a strict place it is a failure if it belongs to this user: a file (only files that changed since the picture was
-    sent are ever opened), the place itself, or a folder inside it that changed since, which could hold a new file.
-    A folder macOS itself refuses to list ("Operation not permitted": the temp folder holds a few for system services,
-    closed to their owner too) only counts. So does anything else, anywhere else.
+    It is a failure when it is a place that must be searched (whoever owns it); or, in a strict place, when it belongs
+    to this user or can't be told: a file (only files that changed since the picture was sent are ever opened), a place
+    itself, or a folder inside one that changed since, which could hold a new file. A folder inside that macOS itself
+    refuses to list ("Operation not permitted": the temp folder holds a few for system services, closed to their owner
+    too) only counts. So does anything else, anywhere else.
     """
     if exc.errno in _VANISHED:
         return  # gone by the time we got there: there is nothing in it to read
-    mine = strict and _owned(path)
-    if mine and folder and not root:
-        mine = exc.errno != errno.EPERM and _changed_since(path, since)
-    if mine:
+    failed = judge.required(path)
+    if not failed and judge.strict(path) and _could_be_mine(path):
+        inside = folder and not judge.is_place(path)  # a folder that is not itself one of the places
+        failed = not inside or (exc.errno != errno.EPERM and _changed_since(path, since))
+    if failed:
         scan.failed.setdefault(path, exc.strerror or "couldn't be read")
         scan.skipped.discard(path)
     elif path not in scan.failed:
         scan.skipped.add(path)
 
 
-def _files_since(root: Path, since: float, shortest: int, scan: Scan, strict: bool):
+def _files_since(root: Path, since: float, shortest: int, scan: Scan, judge: _Judge):
     """Regular files under `root` changed at or after `since` and at least `shortest` bytes long, as (path, id).
 
     Symlinks are never followed, so nothing outside the root is read through a link inside it. The root itself may be
     a link (a home folder set up that way) or a single file; it is resolved once, and what is found is named under its
-    real path. Folders that can't be listed are noted in `scan`.
+    real path. What can't be listed or looked at is noted in `scan`: an entry that can't even be looked at (its folder
+    can be listed but not entered) is put down to its folder.
     """
     real = os.path.realpath(root)
-    if os.path.isfile(real):
+    single = os.path.isfile(real)
+    if single:
         walk = [(os.path.dirname(real), [], [os.path.basename(real)])]
     else:
-        walk = os.walk(real, onerror=lambda exc: _note(scan, exc.filename or real, exc, strict, since, True,
-                                                       (exc.filename or real) == real))
+        walk = os.walk(real, onerror=lambda exc: _note(scan, judge, exc.filename or real, exc, since, folder=True))
     for folder, _dirs, names in walk:
         for name in names:
             path = os.path.join(folder, name)
             try:
                 info = os.lstat(path)
             except OSError as exc:
-                _note(scan, path, exc, strict, since)
+                _note(scan, judge, path if single else folder, exc, since, folder=not single)
                 continue
             # A file counts as changed when its contents or its place changed (a rename keeps the old modified time).
             if stat.S_ISREG(info.st_mode) and max(info.st_mtime, info.st_ctime) >= since and info.st_size >= shortest:
@@ -186,7 +221,8 @@ def search(markers: Sequence[bytes], since: float, places: Sequence[Place | Path
     first, so one inside another is searched, and judged, as strictly as it should be.
     """
     places = [place if isinstance(place, Place) else Place(Path(place)) for place in places]
-    places.sort(key=lambda place: not place.strict)
+    places.sort(key=lambda place: not (place.strict or place.required))
+    judge = _Judge(places)
     shortest, keep = min(len(m) for m in markers), max(len(m) for m in markers) - 1
     scan, seen, scanned = Scan(), set(), []
     for place in places:
@@ -198,7 +234,7 @@ def search(markers: Sequence[bytes], since: float, places: Sequence[Place | Path
         if any(real == done or real.startswith(done + os.sep) for done in scanned):  # inside a place already done
             continue
         scanned.append(real)
-        for path, identity in _files_since(place.path, since, shortest, scan, place.strict):
+        for path, identity in _files_since(place.path, since, shortest, scan, judge):
             if identity in seen:
                 continue
             seen.add(identity)
@@ -206,7 +242,7 @@ def search(markers: Sequence[bytes], since: float, places: Sequence[Place | Path
                 if _holds(path, markers, keep):
                     scan.found.append(Path(path))
             except OSError as exc:
-                _note(scan, path, exc, place.strict, since)
+                _note(scan, judge, path, exc, since)
     scan.found.sort()
     return scan
 
@@ -252,6 +288,20 @@ def _listed(items: Sequence[str]) -> str:
     return ", ".join(items[:MAX_LISTED]) + more
 
 
+def _no_pass(paths: AppPaths, version: str, removal_failed: bool = False) -> str:
+    """What to tell the person about pictures after a check that recorded no pass, true of the file as it is now.
+
+    An earlier pass for this version is only taken away when a copy is found, and may be impossible to take away,
+    so "pictures stay off" would not always be true.
+    """
+    if not pictures_allowed(paths, version):
+        return "No pass was recorded, so pictures stay off."
+    if removal_failed:
+        return ("No pass was recorded, but the earlier pass for this Claude Code version couldn't be removed, so pictures "
+                "are still on. Delete state/gaze-picture-check.json yourself to turn them off.")
+    return "No pass was recorded. The earlier pass for this Claude Code version still stands, so pictures are still on."
+
+
 def run_leftover_check(
     job: Job,
     paths: AppPaths,
@@ -287,7 +337,7 @@ def run_leftover_check(
         reply = ask_about_picture(picture.base64, CHECK_QUESTION, paths, timeout=CHECK_SECONDS, command=command,
                                   env=env, wait_for_exit=True)
     except PictureError as exc:
-        raise JobError(f"The test picture didn't go through. {exc} No pass was recorded, so pictures stay off.") from None
+        raise JobError(f"The test picture didn't go through. {exc} {_no_pass(paths, version)}") from None
     seconds = round(time.monotonic() - began, 1)
     job.log(f"Claude Code answered in {seconds} s: {clean_description(reply) or '(nothing to repeat)'}")
     places = list(roots) if roots is not None else leftover_roots(paths)
@@ -299,22 +349,24 @@ def run_leftover_check(
     if scan.found:
         listed = _listed([str(path) for path in scan.found])
         job.log(f"Found a copy: {listed}")  # said before anything else is done, so no later error can lose it
+        removal_failed = False
         try:
             paths.gaze_picture_check.unlink(missing_ok=True)
         except OSError:
+            removal_failed = True
             job.log("The saved check couldn't be removed. Delete state/gaze-picture-check.json yourself.")
         raise JobError(
             f"Claude Code kept a copy of the test picture: {listed}. GazeVoice left it where it is, because it may be "
-            "Claude Code's own file. No pass was recorded, so pictures stay off. Deleting that file won't change the "
+            f"Claude Code's own file. {_no_pass(paths, version, removal_failed)} Deleting that file won't change the "
             "result by itself: every check sends a new picture and passes only if Claude Code keeps no copy of that "
             "one. If a new check still finds a copy, leave pictures off.")
     if scan.failed:
         listed = _listed([f"{path} ({why})" for path, why in scan.failed.items()])
         job.log(f"Couldn't look through: {listed}")
         raise JobError(
-            f"The check couldn't look everywhere it has to, so it can't say the picture was cleaned up: {listed}. No pass "
-            "was recorded, so pictures stay off. Fix what is in the way (a folder that is missing or locked, or a file "
-            "you can't read) and check again.")
+            f"The check couldn't look everywhere it has to, so it can't say the picture was cleaned up: {listed}. "
+            f"{_no_pass(paths, version)} Fix what is in the way (a folder that is missing or locked, or a file you can't "
+            "read) and check again.")
     write_picture_check(paths.gaze_picture_check, version, clock())
     job.log(f"No copy found. Pictures can be used while Claude Code is at {version}.")
     return {"passed": True, "claude": version, "seconds": seconds}

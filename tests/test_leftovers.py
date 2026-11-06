@@ -195,6 +195,118 @@ class SearchTroubleTest(unittest.TestCase):
             scan = self.search(Place(self.scan, strict=True))
         self.assertEqual(list(scan.failed), [str(self.scan / "locked.bin")])
 
+    # --- the places that must be searched are judged as such, whoever owns them, however they are nested ---------------
+    @NOT_ROOT
+    def test_a_required_place_that_cant_be_listed_fails_whoever_owns_it(self):
+        claude = self.root / ".claude"  # as if made by sudo: someone else's, and closed
+        claude.mkdir()
+        (claude / "history.jsonl").write_bytes(self.marker)
+        claude.chmod(0)
+        with patch("gazevoice.voice.leftovers.os.getuid", return_value=os.getuid() + 1):  # so it isn't ours
+            scan = self.search(Place(claude, strict=True, required=True))
+        self.assertEqual(scan.failed, {str(claude): "Permission denied"})
+        with patch("gazevoice.voice.leftovers.os.getuid", return_value=os.getuid() + 1):
+            other = self.search(Place(claude, strict=True))  # a strict place that need not be searched is only counted
+        self.assertEqual((other.failed, other.skipped), ({}, {str(claude)}))
+
+    @NOT_ROOT
+    def test_a_required_place_that_can_be_listed_but_not_entered_fails_instead_of_passing_over_a_copy_inside_it(self):
+        claude = self.root / ".claude"
+        claude.mkdir()
+        (claude / "history.jsonl").write_bytes(b"junk" + self.marker)
+        claude.chmod(0o400)  # its names can be read; nothing in it can be looked at
+        scan = self.search(Place(claude, strict=True, required=True))
+        self.assertEqual((scan.found, list(scan.failed)), ([], [str(claude)]))
+
+    @NOT_ROOT
+    def test_an_unreadable_subfolder_that_can_be_listed_but_not_entered_is_judged_by_whether_it_changed_since(self):
+        sub = self.scan / "sub"
+        sub.mkdir()
+        (sub / "inside.bin").write_bytes(self.marker)
+        sub.chmod(0o400)
+        changed = self.search(Place(self.scan, strict=True))
+        self.assertEqual(list(changed.failed), [str(sub)])  # it changed after `since`, which is a minute ago
+        time.sleep(1.1)
+        unchanged = search([self.marker], time.time(), [Place(self.scan, strict=True)])
+        self.assertEqual((unchanged.failed, unchanged.skipped), ({}, {str(sub)}))
+        wide = self.search(Place(self.scan))
+        self.assertEqual((wide.failed, wide.skipped), ({}, {str(sub)}))
+
+    @NOT_ROOT
+    def test_a_required_place_nested_in_another_is_still_required_whatever_order_they_come_in(self):
+        inner = self.scan / "claude-tmp"
+        inner.mkdir()
+        inner.chmod(0)
+        time.sleep(1.1)  # not changed since the picture was sent: a plain subfolder would only be counted
+        since = time.time()
+        for places in ([Place(self.scan, strict=True), Place(inner, strict=True, required=True)],
+                       [Place(inner, strict=True, required=True), Place(self.scan, strict=True)],
+                       [Place(inner, strict=True, required=True)],
+                       [Place(self.scan), Place(inner, strict=True, required=True)]):
+            scan = search([self.marker], since, places)
+            self.assertEqual(list(scan.failed), [str(inner)], places)
+        plain = search([self.marker], since, [Place(self.scan, strict=True)])  # without it being a place of its own
+        self.assertEqual((plain.failed, plain.skipped), ({}, {str(inner)}))
+
+    def test_a_required_place_nested_in_another_that_macos_refuses_to_list_still_fails(self):
+        inner = self.scan / "claude-tmp"
+        inner.mkdir()
+        real_walk = os.walk
+
+        def walk(top, onerror=None, **kwargs):
+            onerror(PermissionError(errno.EPERM, "Operation not permitted", str(inner)))
+            yield from real_walk(top, **kwargs)
+
+        with patch("gazevoice.voice.leftovers.os.walk", walk):
+            required = self.search(Place(self.scan, strict=True), Place(inner, strict=True, required=True))
+            plain = self.search(Place(self.scan, strict=True))
+        self.assertEqual(list(required.failed), [str(inner)])
+        self.assertEqual((plain.failed, plain.skipped), ({}, {str(inner)}))
+
+    def test_a_file_whose_owner_cant_even_be_looked_up_is_not_ignored(self):
+        target = self.scan / "odd.bin"
+        target.write_bytes(b"junk" + self.marker)
+        real_lstat, looked = os.lstat, []
+
+        def lstat(path, *args, **kwargs):
+            if str(path) == str(target):
+                looked.append(1)
+                if len(looked) > 1:  # the search's own look worked; the look at the owner doesn't
+                    raise PermissionError(errno.EACCES, "Permission denied")
+            return real_lstat(path, *args, **kwargs)
+
+        with patch("gazevoice.voice.leftovers.os.lstat", lstat), \
+                patch("gazevoice.voice.leftovers.os.open", side_effect=PermissionError(errno.EACCES, "Permission denied")):
+            scan = self.search(Place(self.scan, strict=True))
+        self.assertEqual(list(scan.failed), [str(target)])  # an unknown owner might be this user
+
+    def test_a_folder_that_cant_be_listed_or_looked_at_is_taken_to_have_changed(self):
+        sub = self.scan / "sub"
+        sub.mkdir()
+        real_lstat, real_walk = os.lstat, os.walk
+
+        def lstat(path, *args, **kwargs):
+            if str(path) == str(sub):
+                raise PermissionError(errno.EACCES, "Permission denied")
+            return real_lstat(path, *args, **kwargs)
+
+        def walk(top, onerror=None, **kwargs):
+            onerror(PermissionError(errno.EACCES, "Permission denied", str(sub)))
+            yield from real_walk(top, **kwargs)
+
+        time.sleep(1.1)
+        with patch("gazevoice.voice.leftovers.os.lstat", lstat), patch("gazevoice.voice.leftovers.os.walk", walk):
+            scan = search([self.marker], time.time(), [Place(self.scan, strict=True)])
+        self.assertEqual(list(scan.failed), [str(sub)])
+
+    def test_the_real_list_of_places_puts_a_claude_code_tmpdir_after_the_places_it_can_sit_inside(self):
+        with patch.dict(os.environ, {"CLAUDE_CODE_TMPDIR": "/tmp/cc", "CLAUDE_CONFIG_DIR": ""}), \
+                patch("gazevoice.voice.leftovers.tempfile.gettempdir", return_value="/var/folders/ab/cdef123/T"):
+            places = leftover_roots(AppPaths(self.root / "app"))
+        paths = [place.path for place in places]
+        self.assertLess(paths.index(Path("/tmp")), paths.index(Path("/tmp/cc")))  # the case the judge has to get right
+        self.assertEqual(places[paths.index(Path("/tmp/cc"))], Place(Path("/tmp/cc"), strict=True, required=True))
+
     @NOT_ROOT
     def test_a_strict_place_that_cant_itself_be_listed_is_a_failure_however_old_it_is(self):
         time.sleep(1.1)
@@ -395,6 +507,49 @@ class LeftoverCheckTest(DescribeCropBase):
         lines = self.job.lines
         found_at = next(i for i, line in enumerate(lines) if copy in line)
         self.assertTrue(any("couldn't be removed" in line for line in lines[found_at:]))
+
+    def test_a_pass_that_couldnt_be_taken_away_is_not_said_to_be_gone(self):
+        leaks = self.root / "leaks"
+        leaks.mkdir()
+        write_picture_check(self.paths.gaze_picture_check, "2.1.303", 5.0)
+        real_unlink = Path.unlink
+
+        def refusing(path, *args, **kwargs):
+            if path == self.paths.gaze_picture_check:
+                raise PermissionError(1, "Operation not permitted")
+            return real_unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", refusing):
+            with self.assertRaises(JobError) as caught:
+                self.run_check(roots=[leaks], FAKE_CLAUDE_LEAK_BASE64=str(leaks))
+        message = str(caught.exception)
+        self.assertTrue(pictures_allowed(self.paths, "2.1.303"))  # so it is on, and the message says so
+        self.assertIn("pictures are still on", message)
+        self.assertIn("Delete state/gaze-picture-check.json yourself to turn them off", message)
+        self.assertNotIn("stay off", message)
+        self.assertIn(str(next(leaks.iterdir()).resolve()), message)  # and the copy is still what it is about
+
+    def test_a_pass_that_cant_be_removed_but_was_never_valid_still_leaves_pictures_off(self):
+        leaks = self.root / "leaks"
+        leaks.mkdir()
+        self.paths.gaze_picture_check.parent.mkdir(parents=True)
+        self.paths.gaze_picture_check.write_text("{ not a pass")
+        with patch.object(Path, "unlink", side_effect=PermissionError(1, "Operation not permitted")):
+            with self.assertRaises(JobError) as caught:
+                self.run_check(roots=[leaks], FAKE_CLAUDE_LEAK_BASE64=str(leaks))
+        self.assertIn("pictures stay off", str(caught.exception))
+
+    def test_a_check_that_records_nothing_leaves_an_earlier_pass_and_says_pictures_are_still_on(self):
+        write_picture_check(self.paths.gaze_picture_check, "2.1.303", 5.0)
+        with self.assertRaises(JobError) as failed_call:
+            self.run_check(FAKE_CLAUDE_PICTURE="die")
+        with self.assertRaises(JobError) as no_look:
+            self.run_check(roots=[Place(self.root / "nope", strict=True, required=True)])
+        for caught in (failed_call, no_look):
+            self.assertIn("The earlier pass for this Claude Code version still stands, so pictures are still on",
+                          str(caught.exception))
+            self.assertNotIn("stay off", str(caught.exception))
+        self.assertTrue(pictures_allowed(self.paths, "2.1.303"))
 
     def test_a_copy_that_was_there_before_the_run_is_not_blamed_on_it(self):
         old = self.scan / "something-else.log"

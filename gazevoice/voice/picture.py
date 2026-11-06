@@ -252,8 +252,9 @@ class Describer:
 
     `ready` never waits. Whether Claude Code is logged in, and which version it is, come from `claude auth status` and
     `claude --version`, which can take seconds on a busy Mac or hang; a thread asks them (`refresh`, which voice calls
-    when it starts, and `ready` calls again whenever the last answer is older than PROBE_TTL) and `ready` reads only
-    the last answer. One lookup runs at a time, so a hung `claude` costs one thread, not one per command. No answer
+    when it starts and at every key press, so that the answer is up to date by the time a command needs it however long
+    it has been since the last one, and which `ready` calls again whenever the last answer is older than PROBE_TTL)
+    and `ready` reads only the last answer. One lookup runs at a time, so a hung `claude` costs one thread, not one per command. No answer
     yet, or one older than STALE_AFTER times PROBE_TTL, means no pictures for that command, never a delay.
     Whether the check passed is read from its file each time, so a pass counts at once.
     """

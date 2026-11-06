@@ -289,6 +289,9 @@ class ClaudeSession:
         several seconds to do it, so it is given `wait` seconds to leave by itself. A thread waits for that and, if
         the process is still there, asks it to stop (SIGTERM to its whole group), and kills it `term_wait` seconds
         later. Returns that thread: join it to wait until the process is gone and its pipes are closed.
+
+        The thread is not a daemon: the process has a session of its own, so nothing else would end it if the app quit
+        before it left. Quitting waits for it (at most `wait` + `term_wait` + 3 seconds, and nearly always under one).
         """
         proc = self.proc
         try:
@@ -296,7 +299,7 @@ class ClaudeSession:
                 proc.stdin.close()
         except OSError:
             pass
-        thread = threading.Thread(target=self._leave, args=(wait, term_wait), daemon=True, name="brain-exit")
+        thread = threading.Thread(target=self._leave, args=(wait, term_wait), name="brain-exit")
         thread.start()
         return thread
 
