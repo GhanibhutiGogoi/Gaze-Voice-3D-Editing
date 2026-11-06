@@ -1,4 +1,5 @@
 """Gaze on this Mac: the camera, MediaPipe's face model and a calibration, in their own Python environment.
+Its card also holds the check that pictures of the viewport get cleaned up (see voice/picture.py).
 
 The unit never opens the camera to check on it. It lists the cameras through the Microphone unit's cached
 listing, which only reads the names. The camera is opened by the gaze worker, and only while voice runs, or
@@ -9,6 +10,7 @@ the job and give it back whatever happens, and they can't run while voice is on 
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import hashlib
 import json
 import math
@@ -26,6 +28,7 @@ from ..jobs import Job, JobError
 from ..paths import AppPaths
 from ..voice.gaze import MIN_CONFIDENCE, viewport_size
 from ..voice.gaze_tracker import GazeError, GazeTracker, view_of
+from ..voice.picture import CHECK_CONFIRM as PICTURE_CHECK_CONFIRM, read_picture_check, run_leftover_check
 from .base import ActionSpec, Component, ComponentState, Health
 from .microphone import Microphone, face_cameras, pick_camera
 
@@ -162,6 +165,26 @@ class Gaze(Component):
         return viewport_size(reply) if reply.get("ok") else None
 
     def check(self) -> ComponentState:
+        return self._with_pictures(self._check_camera())
+
+    def _with_pictures(self, state: ComponentState) -> ComponentState:
+        """Add what pictures need to whatever state the camera side is in: they go through Claude Code, not the camera."""
+        if not self.runner.which("claude"):
+            return state
+        parts = self.probe(["claude", "--version"], ttl=600).stdout.split()
+        installed = parts[0] if parts else None
+        check = read_picture_check(self.paths.gaze_picture_check)
+        if check is None:
+            where = "Not checked yet"
+        elif check["claude"] == installed:
+            where = f"Cleaned up, checked with Claude Code {installed}"
+        else:
+            now = f"Claude Code is {installed} now" if installed else "Claude Code didn't say which version it is"
+            where = f"{now}, and the check was for {check['claude']}. Check again"
+        action = ActionSpec("check_pictures", "Check pictures get cleaned up", confirm=PICTURE_CHECK_CONFIRM, uses_plan=True)
+        return dataclasses.replace(state, details=(*state.details, ("Pictures", where)), actions=(*state.actions, action))
+
+    def _check_camera(self) -> ComponentState:
         if not self.runner.which("uv"):
             return self.state(Health.ERROR, "uv is needed to set up gaze tracking. Install uv (astral.sh/uv), then refresh.")
         microphone = Microphone(self.ctx)  # its listing is cached, and shared with the Microphone unit
@@ -248,6 +271,10 @@ class Gaze(Component):
         finally:
             fetched.unlink(missing_ok=True)
         job.log("The face model checks out.")
+
+    def action_check_pictures(self, job: Job) -> dict:
+        """Send a random picture through the describer and search this Mac for a copy. A pass turns pictures on."""
+        return run_leftover_check(job, self.paths, runner=self.runner)
 
     # --- calibrating and testing ---------------------------------------------------------------------
     def _make_tracker(self, camera: str, calibration: dict | None) -> GazeTracker:

@@ -53,6 +53,16 @@ class AppPaths:
         """The saved gaze calibration. Numbers only: no pictures of your face are ever kept."""
         return self.state / "gaze-calibration.json"
 
+    @property
+    def gaze_picture_check(self) -> Path:
+        """Whether the leftover check passed, and for which Claude Code. Pictures stay off without it."""
+        return self.state / "gaze-picture-check.json"
+
+    @property
+    def gaze_images(self) -> Path:
+        """Where a temp picture would go. None is ever written; this is only swept for leftovers."""
+        return self.work / "gaze-images"
+
     def ensure(self) -> None:
         for directory in (self.root, self.downloads, self.venvs, self.logs, self.work):
             directory.mkdir(parents=True, exist_ok=True)

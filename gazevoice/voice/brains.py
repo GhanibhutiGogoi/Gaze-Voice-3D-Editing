@@ -171,7 +171,10 @@ class ClaudeSession:
                         _end_process(self.proc)
                     raise BrainError("The brain took too long to answer.") from None
 
-    def send(self, text: str, on_tool: Callable[[str], None] | None = None, timeout: float = 180.0) -> TurnResult:
+    def send(
+        self, text: str | Sequence[dict], on_tool: Callable[[str], None] | None = None, timeout: float = 180.0
+    ) -> TurnResult:
+        """One user turn. `text` is a string, or a list of content blocks (say, an image block and a text block)."""
         with self._lock:
             if not self.alive:
                 raise BrainError(f"The brain isn't running: {self._tail()}")
@@ -251,7 +254,17 @@ class ClaudeSession:
         if proc is not None and self._in_turn and self.turns == turn:
             _end_process(proc)
 
-    def close(self) -> None:
+    def kill(self) -> None:
+        """End the process now, whatever it is doing, and everything it started. Safe from any thread, and twice."""
+        proc = self.proc
+        if proc is not None and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    def close(self, grace: float = 3.0) -> None:
+        """Close its input and give the process `grace` seconds to leave by itself, then kill it."""
         proc = self.proc
         if proc is None:
             return
@@ -261,7 +274,7 @@ class ClaudeSession:
         except OSError:
             pass
         try:
-            proc.wait(timeout=3)
+            proc.wait(timeout=grace)
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)

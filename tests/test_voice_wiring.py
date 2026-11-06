@@ -15,6 +15,9 @@ from gazevoice.components.microphone import LIST_DEVICES
 from gazevoice.events import EventBus
 from gazevoice.voice.audio import MicError
 from gazevoice.voice.gaze_tracker import GazeError, GazeTracker
+from gazevoice.components.brains import CLAUDE_ISOLATION
+from gazevoice.voice.brains import claude_session_argv
+from gazevoice.voice.picture import PICTURE_MODEL, PICTURE_PROMPT, Describer
 from gazevoice.voice.service import PointerTracker
 from gazevoice.voice.wiring import build_voice, voice_readiness
 
@@ -155,6 +158,47 @@ class BuildVoiceTest(unittest.TestCase):
         voice = self.gaze_voice(gaze_mode="on", gaze_source="camera")
         self.assertIsNone(voice.factories.gaze)  # voice runs on the selection
         self.assertEqual((voice.gaze_mode, voice.gaze_source), ("on", "camera"))
+
+    # --- pictures ---------------------------------------------------------------------------------
+    def leftover_image(self):
+        images = self.t.paths.gaze_images
+        images.mkdir(parents=True, exist_ok=True)
+        leftover = images / "gazevoice-gaze-123.png"
+        leftover.write_bytes(b"\x89PNG left by a crash")
+        return leftover
+
+    def test_pictures_are_off_by_default_so_no_describer_is_built(self):
+        voice = self.gaze_voice(gaze_mode="on", gaze_source="mouse")
+        self.assertIsNotNone(voice.factories.pictures)  # starting voice always clears what a crash left
+        self.assertIsNone(voice.factories.pictures())
+
+    def test_starting_voice_clears_leftover_images_whether_or_not_pictures_are_on(self):
+        for pictures in (False, True):
+            leftover = self.leftover_image()
+            voice = self.gaze_voice(gaze_mode="on", gaze_source="mouse", gaze_pictures=pictures)
+            voice.factories.pictures()
+            self.assertFalse(leftover.exists(), pictures)
+
+    def test_turning_pictures_on_builds_a_describer_that_uses_this_apps_folder_and_claude(self):
+        voice = self.gaze_voice(gaze_mode="on", gaze_source="mouse", gaze_pictures=True)
+        describer = voice.factories.pictures()
+        self.assertIsInstance(describer, Describer)
+        self.assertEqual(describer.paths, self.t.paths)
+        self.assertEqual(describer.command, ("claude",))
+        self.assertFalse(describer.ready())  # nothing has been checked yet
+
+    def test_unity_never_builds_a_picture_part(self):
+        voice = self.gaze_voice(host="unity", gaze_pictures=True)
+        self.assertIsNone(voice.factories.pictures)
+
+    def test_the_refiner_and_the_describer_are_started_in_the_same_folder_with_the_same_isolation(self):
+        voice = self.gaze_voice(gaze_mode="on", gaze_source="mouse", gaze_pictures=True)
+        refiner = voice.factories.refiner()
+        argv = claude_session_argv(PICTURE_PROMPT, PICTURE_MODEL, None, max_turns=1)
+        self.assertEqual(str(refiner.cwd), str(self.t.paths.work))
+        for flag in CLAUDE_ISOLATION:
+            self.assertIn(flag, refiner.argv)
+            self.assertIn(flag, argv)
 
     # --- camera gaze: only once it is installed, calibrated and has a camera ------------------------
     def set_up_gaze(self, calibration="default", model=True, venv=True):

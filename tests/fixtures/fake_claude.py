@@ -5,8 +5,18 @@ Message content decides the behaviour: "use tool", "fail", "die", "slow" (runs u
 control_request interrupt ends the running turn and keeps the session, while SIGINT ends the process.
 FAKE_CLAUDE_ARGV_OUT=<file> records argv. FAKE_MCP_STATUS sets the blender server's status.
 FAKE_CLAUDE_STARTUP=<seconds> delays the first turn; an interrupt sent before a turn begins is lost.
+
+A message whose content is a list of blocks may carry an image (the picture describer). Then the reply comes
+from FAKE_CLAUDE_PICTURE (default "the left wing tip"), which may also be one of the words above to misbehave.
+FAKE_CLAUDE_STDIN_OUT=<file> records the shape of that message (never the image itself): block types, the
+image's media type, length and SHA-256, and the text. FAKE_CLAUDE_PID_OUT=<file> records the process id.
+FAKE_CLAUDE_NEVER_READS=1 sleeps without ever reading stdin, like a process that hung before it started.
+FAKE_CLAUDE_LEAK_BASE64=<dir> and FAKE_CLAUDE_LEAK_RAW=<dir> make it behave like a Claude Code that keeps a copy of
+the picture there (as sent, or decoded), so the leftover check has something to find.
 """
 
+import base64
+import hashlib
 import json
 import os
 import queue
@@ -20,6 +30,12 @@ if os.environ.get("FAKE_CLAUDE_ARGV_OUT"):
         json.dump(sys.argv[1:], fh)
 
 signal.signal(signal.SIGINT, lambda *_: os._exit(0))
+
+if os.environ.get("FAKE_CLAUDE_PID_OUT"):
+    with open(os.environ["FAKE_CLAUDE_PID_OUT"], "w") as fh:
+        fh.write(str(os.getpid()))
+if os.environ.get("FAKE_CLAUDE_NEVER_READS"):
+    time.sleep(60)
 
 lock = threading.Lock()
 messages: queue.Queue = queue.Queue()
@@ -62,6 +78,29 @@ while True:
         time.sleep(float(os.environ.get("FAKE_CLAUDE_STARTUP", "0")))
     assert message["type"] == "user" and message["message"]["role"] == "user"
     content = message["message"]["content"]
+    pictured = False
+    if isinstance(content, list):  # content blocks: text, and maybe an image
+        images = [b for b in content if b.get("type") == "image"]
+        pictured = bool(images)
+        if os.environ.get("FAKE_CLAUDE_STDIN_OUT"):
+            image = images[0]["source"] if images else {}
+            data = image.get("data", "")
+            with open(os.environ["FAKE_CLAUDE_STDIN_OUT"], "w") as fh:
+                json.dump({
+                    "types": [b.get("type") for b in content],
+                    "source_type": image.get("type"), "media_type": image.get("media_type"),
+                    "length": len(data), "sha256": hashlib.sha256(data.encode()).hexdigest(),
+                    "text": " ".join(b.get("text", "") for b in content if b.get("type") == "text"),
+                    "cwd": os.getcwd(),
+                }, fh)
+        for variable, make in (("FAKE_CLAUDE_LEAK_BASE64", lambda d: d.encode()),
+                               ("FAKE_CLAUDE_LEAK_RAW", lambda d: base64.b64decode(d))):
+            if os.environ.get(variable) and images:
+                leak = os.path.join(os.environ[variable], f"leak-{os.getpid()}.bin")
+                with open(leak, "wb") as fh:
+                    fh.write(b"cache: " + make(images[0]["source"]["data"]))
+        content = os.environ.get("FAKE_CLAUDE_PICTURE", "the left wing tip") if images else \
+            " ".join(b.get("text", "") for b in content if b.get("type") == "text")
     interrupt.clear()
     servers = []
     if "--mcp-config" in sys.argv:
@@ -91,4 +130,4 @@ while True:
         else:
             result("Finished the slow job.")
     else:
-        result(f"echo: {content}")
+        result(content if pictured else f"echo: {content}")

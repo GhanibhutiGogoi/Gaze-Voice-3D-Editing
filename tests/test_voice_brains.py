@@ -13,6 +13,15 @@ FAKE_CLAUDE = [sys.executable, str(FIXTURES / "fake_claude.py")]
 FAKE_CODEX = [sys.executable, str(FIXTURES / "fake_codex.py")]
 
 
+def wait_for_exit(session, seconds=3.0):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if not session.alive:
+            return True
+        time.sleep(0.02)
+    return not session.alive
+
+
 class ArgvTest(unittest.TestCase):
     def test_editor_argv(self):
         argv = claude_session_argv(Path("/p/editor.md"), "sonnet", Path("/p/mcp.json"), max_turns=12)
@@ -61,6 +70,69 @@ class ClaudeSessionTest(unittest.TestCase):
             self.assertEqual(s.turns, 2)
         finally:
             s.close()
+
+    def test_send_takes_content_blocks_as_well_as_text(self):
+        record = Path(self.tmp.name) / "stdin.json"
+        blocks = [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}},
+                  {"type": "text", "text": "What is in the ring?"}]
+        s = self.session(env={"FAKE_CLAUDE_STDIN_OUT": str(record), "FAKE_CLAUDE_PICTURE": "a wing tip"})
+        s.start()
+        try:
+            picture = s.send(blocks)
+            text = s.send("hello")  # strings go as they always did
+        finally:
+            s.close()
+        self.assertEqual((picture.text, picture.is_error), ("a wing tip", False))
+        self.assertEqual(text.text, "echo: hello")
+        sent = json.loads(record.read_text())
+        self.assertEqual((sent["types"], sent["media_type"], sent["length"], sent["text"]),
+                         (["image", "text"], "image/png", len("iVBORw0KGgo="), "What is in the ring?"))
+
+    def test_nothing_that_was_sent_is_kept_by_the_session(self):
+        data = "iVBORw0KGgo" + "A" * 5000
+        blocks = [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}},
+                  {"type": "text", "text": "What is in the ring?"}]
+        s = self.session()
+        s.start()
+        try:
+            s.send(blocks)
+            kept = repr({k: v for k, v in vars(s).items() if k not in ("proc", "_threads")})
+            kept += repr(list(s._stderr)) + repr(s.init) + repr(list(s._events.queue))
+        finally:
+            s.close()
+        self.assertNotIn("iVBOR", kept)
+
+    def test_kill_ends_a_process_that_is_busy_and_is_safe_to_repeat(self):
+        s = self.session()
+        s.kill()  # not started yet: nothing to do
+        s.start()
+        outcome = []
+
+        def busy():
+            try:
+                outcome.append(s.send("slow", timeout=10))
+            except BrainError as exc:
+                outcome.append(exc)
+
+        thread = threading.Thread(target=busy, daemon=True)
+        thread.start()
+        time.sleep(0.3)
+        began = time.monotonic()
+        s.kill()
+        s.kill()
+        self.assertTrue(wait_for_exit(s))
+        thread.join(3)
+        self.assertLess(time.monotonic() - began, 2.0)
+        self.assertIsInstance(outcome[0], BrainError)  # the turn that was running learns the process is gone
+        s.close()
+
+    def test_close_can_be_told_how_long_to_wait_for_a_process_that_wont_leave(self):
+        s = self.session(env={"FAKE_CLAUDE_NEVER_READS": "1"})  # it never notices that its input has closed
+        s.start()
+        began = time.monotonic()
+        s.close(grace=0.3)
+        self.assertLess(time.monotonic() - began, 2.5)
+        self.assertFalse(s.alive)
 
     def test_tools_are_reported_live_and_in_the_result(self):
         seen = []

@@ -290,6 +290,7 @@ function resultLine(job) {
   if (r.calibrated) return typeof r.median === "number" ? `Typically off by ${Math.round(r.median * 100)}% of the viewport` : "Calibrated";
   if (r.tested) return typeof r.followed === "number" ? `The ring found you ${Math.round(r.followed * 100)}% of the time` : "Tested";
   if (r.installed) return "Installed";
+  if (r.passed) return `Pictures are cleaned up with Claude Code ${r.claude}`;
   return "Done";
 }
 
@@ -1049,7 +1050,10 @@ function gazeRows(settings) {
   return [
     routeRow("Gaze", "gaze_mode", settings.gaze_mode, [["off", "Off"], ["shadow", "Watch only"], ["on", "On"]]),
     routeRow("Gaze source", "gaze_source", settings.gaze_source, [["camera", "Camera"], ["mouse", "Mouse"]]),
-    h("p", { class: "route-note", text: "Gaze tells the editor what you were looking at when you say this, that or there. Watch only records it and compares it with your selection, but changes nothing. Mouse uses the pointer over Blender's 3D viewport while you hold the key. Camera uses the Gaze unit in the rack: it has to be installed and calibrated, and until then voice uses your selection. The camera is only on while voice is on, or while you calibrate or test it, and no picture is kept." }),
+    h("p", { class: "route-note", text: "Gaze tells the editor what you were looking at when you say this, that or there. Watch only records it and compares it with your selection, but changes nothing. Mouse uses the pointer over Blender's 3D viewport while you hold the key. Camera uses the Gaze unit in the rack: it has to be installed and calibrated, and until then voice uses your selection. The camera is only on while voice is on, or while you calibrate or test it, and no picture from the camera is kept." }),
+    routeRow("Pictures · each unnamed target uses a little of your plan", "gaze_pictures", settings.gaze_pictures === true,
+      [[false, "Off"], [true, "On"]]),
+    h("p", { class: "route-note", text: "When gaze is On and you look at a big part of a model that has nothing to name it, a picture of just that spot in Blender's viewport (never your camera) goes to a short-lived Claude Code process, which says in a few words what it shows. Only those words reach the editor. Pictures stay off until you turn them on here and press Check pictures get cleaned up on the Gaze unit; a new Claude Code version needs the check again. Pictures are deleted from this Mac right after use. Anthropic keeps what's sent under your account's terms." }),
   ];
 }
 

@@ -2,18 +2,25 @@ import contextlib
 import io
 import json
 import math
+import os
 import struct
+import sys
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from gazevoice.components.base import CameraClaim
 from gazevoice.events import EventBus
 from gazevoice.voice.audio import MicError, RingBuffer
 from gazevoice.voice.brains import BrainError, TurnResult
+from gazevoice.paths import AppPaths
+from gazevoice.probes import ProbeCache
+from gazevoice.runner import FakeRunner
 from gazevoice.voice.gaze import GazeSample, GazeTrack
+from gazevoice.voice.picture import Describer, clear_leftover_images, make_noise_picture, write_picture_check
 from gazevoice.voice.service import Factories, PointerTracker, VoiceError, VoiceService
 from gazevoice.voice.stt import SpeechError
 
@@ -27,9 +34,11 @@ def wait_for(predicate, timeout=5.0):
     raise AssertionError("condition not met in time")
 
 
+FAKE_CLAUDE = [sys.executable, str(Path(__file__).parent / "fixtures" / "fake_claude.py")]
 EAGLE = {"uid": 116, "name": "Eagle", "faces": 5120, "point": [0.41, 0.12, 0.73]}
 PERCH = {"uid": 117, "name": "Perch", "faces": 40, "point": [0.5, 0.1, 0.2]}
 WING_PIECE = {"face": 3120, "part": "Wing.L", "piece_faces": 480, "object_faces": 5120}
+BODY_PIECE = {"face": 3120, "part": None, "piece_faces": 4000, "object_faces": 5120}  # big, and nothing names it
 
 
 class FakeBridge:
@@ -52,6 +61,12 @@ class FakeBridge:
         self.gaze_error: Exception | None = None  # every gaze request raises this (a dead socket)
         self.view_reply = {"ok": True, "width": 1840, "height": 1100}  # what gaze_view says the viewport is
         self.picks, self.pieces, self.shows = [], [], []
+        # gaze_crop: what it answers (an add-on from before pictures knows no such command), the picture the next
+        # crop will make (None: it fails), and how many more times gaze_crop_result says "pending" first.
+        self.crop_start = {"ok": False, "error": "unknown command"}
+        self.crop_png = None
+        self.crop_pending = 0
+        self.crops, self.crop_reads, self._crop = [], 0, None
         self.lock = threading.Lock()
         self._events: list[dict] = []
         self._seq = 0
@@ -129,6 +144,19 @@ class FakeBridge:
         if cmd == "gaze_show":
             self.shows.append(req)
             return {"ok": True}
+        if cmd == "gaze_crop":
+            self.crops.append(req)
+            self._crop = self.crop_png if self.crop_start.get("ok") else None
+            return self.crop_start
+        if cmd == "gaze_crop_result":
+            self.crop_reads += 1
+            if self.crop_pending > 0:
+                self.crop_pending -= 1
+                return {"ok": True, "pending": True}
+            if self._crop is None:
+                return {"ok": False, "error": "no picture is waiting"}
+            png, self._crop = self._crop, None  # handed over once
+            return {"ok": True, "png": png}
         return {"ok": False, "error": "unknown command"}
 
     def close(self):
@@ -273,6 +301,30 @@ class FakeGaze:
             self._track.add(GazeSample(start + i * 0.05, u, v, confidence))
 
 
+class FakePictures:
+    """The service's picture part, without a process: ready() says whether pictures may be used, describe() answers."""
+
+    def __init__(self, reply="the left wing tip", ready=True):
+        self.reply = reply  # a sentence, None, an Exception to raise, or a function of the call
+        self.is_ready = ready
+        self.ready_calls = 0
+        self.calls = []
+
+    def ready(self):
+        self.ready_calls += 1
+        return self.is_ready
+
+    def describe(self, png_base64, word, object_name, *, timeout, cancelled=None):
+        self.calls.append({"png": png_base64, "word": word, "object": object_name, "timeout": timeout,
+                           "cancelled": cancelled})
+        reply = self.reply(self.calls[-1]) if callable(self.reply) else self.reply
+        if isinstance(reply, list):
+            reply = reply[len(self.calls) - 1]
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+
 REFINED = json.dumps({"kind": "command", "text": "Make this twice as tall."})
 
 
@@ -304,6 +356,8 @@ class VoiceTestBase(unittest.TestCase):
         self.engine = "parakeet"
         self.gaze = None  # set a gaze part before build() to give the service one
         self.gazes_made = 0
+        self.pictures = None  # set a picture part before build() to give the service one
+        self.pictures_made = 0
 
     def tearDown(self):
         if hasattr(self, "service"):
@@ -318,11 +372,16 @@ class VoiceTestBase(unittest.TestCase):
         self.gazes_made += 1
         return self.gaze
 
+    def make_pictures(self):
+        self.pictures_made += 1
+        return self.pictures
+
     def build(self, **kwargs):
         factories = Factories(
             bridge=lambda: self.bridge, mic=lambda: self.mic, stt=lambda: self.stt,
             refiner=lambda: self.refiner, editor=self.make_editor,
             gaze=self.make_gaze if self.gaze is not None else None,
+            pictures=self.make_pictures if self.pictures is not None else None,
         )
         # The fake mic's audio is stamped 1000.1–1010 and speak() presses at 1002, so the service's
         # clock starts there too; on the real clock every hold would look decades long.
@@ -1593,6 +1652,23 @@ class GazeChoiceTest(VoiceTestBase):
         self.assertEqual(answer["kind"], "")
         self.assertEqual(len(self.refiner.sent), 1)
 
+    def test_the_picture_is_of_the_one_the_person_picked(self):
+        self.stt = FakeStt(["add blue color there", "Two."], words=THERE_WORDS)
+        self.bridge.piece_reply = BODY_PIECE
+        self.bridge.crop_start = {"ok": True, "pending": True}
+        self.bridge.crop_png = make_noise_picture(64).base64
+        self.pictures = FakePictures("the perch's top")
+        self.start()
+        spoken = self.hold()
+        self.wait_for_labels()
+        self.assertEqual(self.pictures.calls, [])  # not before they have chosen
+        self.assertEqual(self.bridge.crops, [])
+        self.hold(1004.0, 1005.0)
+        wait_for(lambda: spoken["stage"] == "done")
+        self.assertEqual([c["object"] for c in self.pictures.calls], ["Perch"])
+        self.assertEqual(spoken["gaze"]["targets"][0]["picture"], "the perchs top")  # quote marks are dropped
+        self.assertIn('picture (only a description of what the ring shows): "the perchs top"', self.editor.sent[0])
+
     def test_picking_the_first_one_keeps_the_guess_it_already_looked_at(self):
         self.stt = FakeStt(["add blue color there", "number 1"], words=THERE_WORDS)
         self.start()
@@ -1756,6 +1832,460 @@ class GazeChoiceTest(VoiceTestBase):
         self.assertNotIn(WHICH[0], self.statuses())
         self.assertIn("Focus: selected Chair", self.editor.sent[0])
         self.assertEqual((record["gaze"]["status"], record["gaze"]["asked"]), ("clarify", False))
+
+
+LOGGED_IN = json.dumps({"loggedIn": True, "authMethod": "claude.ai"})
+
+
+class GazePictureTest(VoiceTestBase):
+    """A big mesh with nothing to name its part: a picture of it turns into one sentence in the Focus line."""
+
+    def setUp(self):
+        super().setUp()
+        self.arm()
+
+    def arm(self):
+        self.stt = FakeStt(["add blue color there"], words=THERE_WORDS)
+        self.refiner = FakeSession([TurnResult(THERE_REFINED, False)])
+        self.editor = FakeSession([TurnResult("Made the wing blue.", False, ["execute_blender_code"])])
+        self.gaze = FakeGaze()
+        self.bridge.selected = []
+        self.bridge.pick_reply = lambda points: [EAGLE] * 19 + [PERCH] * 4 + [None]
+        self.bridge.piece_reply = BODY_PIECE
+        self.picture = make_noise_picture(64)
+        self.bridge.crop_start = {"ok": True, "pending": True}
+        self.bridge.crop_png = self.picture.base64
+        self.pictures = FakePictures()
+
+    def run_it(self, mode="on", look=True, **looking):
+        self.build(gaze_mode=mode, gaze_source="mouse").start()
+        if look:
+            self.gaze.look(0.5, 0.5, **looking)
+        return self.speak()
+
+    def status_texts(self):
+        return [text for text, _ in self.bridge.statuses]
+
+    # --- what it does ---------------------------------------------------------------------------------------
+    def test_a_big_unnamed_piece_is_looked_at_closer(self):
+        record = self.run_it()
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertEqual(self.bridge.crops, [{"cmd": "gaze_crop", "u": 0.5, "v": 0.5, "radius": [0.1, 0.15], "size": 512}])
+        self.assertEqual(self.bridge.crop_reads, 1)
+        self.assertEqual(self.pictures_made, 1)
+        call, = self.pictures.calls
+        self.assertEqual((call["png"], call["word"], call["object"]), (self.picture.base64, "there", "Eagle"))
+        self.assertTrue(15 < call["timeout"] <= 20.0, call["timeout"])  # what is left of the 20 seconds
+        self.assertEqual(record["gaze"]["targets"][0]["picture"], "the left wing tip")
+        self.assertIn("Looking closer…", self.status_texts())
+        self.assertGreaterEqual(record["timings"]["picture"], 0)
+
+    def test_the_editor_gets_the_sentence_and_never_the_image(self):
+        record = self.run_it()
+        self.assertEqual(self.editor.sent[0], "\n".join([
+            "Command: Add blue color there.",
+            'Heard: "add blue color there"',
+            'Focus (gaze): "there" at 1.0 s → Eagle (79%), Perch (17%)',
+            "  point (0.41, 0.12, 0.73) on face 3120 · connected piece of 4000 of 5120 faces",
+            '  picture (only a description of what the ring shows): "the left wing tip"',
+            "  gaze is accurate to about 10% of the viewport · selected: nothing",
+        ]))
+        self.assertIn("the left wing tip", json.loads(self.refiner.sent[0])["gaze"])
+        for sent in (*self.editor.sent, *self.refiner.sent):
+            self.assertNotIn("iVBOR", sent)
+            self.assertNotIn(self.picture.base64[:60], sent)
+        self.assertEqual(record["stage"], "done", record["error"])
+
+    def test_records_never_hold_the_image(self):
+        published = []
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        real = self.service.bus.publish
+        self.service.bus.publish = lambda kind, data: (published.append(json.dumps([kind, data])), real(kind, data))[1]
+        self.gaze.look(0.5, 0.5)
+        record = self.speak()
+        saved = (Path(self.tmp.name) / "commands" / record["id"] / "record.json").read_text()
+        everything = "\n".join([json.dumps(self.service.snapshot()["recent"]), saved, *published,
+                                 *self.status_texts()])
+        self.assertIn("the left wing tip", saved)
+        self.assertNotIn("iVBOR", everything)
+        self.assertNotIn(self.picture.base64[:60], everything)
+        self.assertNotIn(self.picture.base64, repr(record))
+
+    def test_the_sentence_goes_to_the_target_it_describes(self):
+        self.stt = FakeStt(["move this there"], words=THIS_AND_THERE)
+        self.pictures.reply = ["the beak", "the tail feathers"]
+        record = self.run_it(start=1001.6, count=30)  # eyes on the Eagle through both words
+        self.assertEqual([t["picture"] for t in record["gaze"]["targets"]], ["the beak", "the tail feathers"])
+        self.assertEqual([c["word"] for c in self.pictures.calls], ["this", "there"])
+        self.assertEqual(len(self.bridge.crops), 2)
+        self.assertEqual(self.editor.sent[0].count("picture (only a description"), 2)
+
+    # --- when it doesn't happen -------------------------------------------------------------------------------
+    def test_a_named_part_needs_no_picture(self):
+        self.bridge.piece_reply = WING_PIECE
+        record = self.run_it()
+        self.assertEqual((self.bridge.crops, self.pictures.calls, self.pictures.ready_calls), ([], [], 0))
+        self.assertNotIn("picture", record["timings"])
+        self.assertNotIn("picture (", self.editor.sent[0])
+
+    def test_a_small_connected_piece_needs_no_picture(self):
+        self.bridge.piece_reply = {**BODY_PIECE, "piece_faces": 40}
+        self.run_it()
+        self.assertEqual((self.bridge.crops, self.pictures.calls), ([], []))
+
+    def test_pictures_off_means_no_crop_is_taken(self):
+        self.pictures = None  # the setting is off: the wiring builds no describer
+        record = self.run_it()
+        self.assertEqual(self.bridge.crops, [])
+        self.assertEqual(self.bridge.crop_reads, 0)
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertNotIn("picture (", self.editor.sent[0])
+
+    def test_a_factory_that_gives_nothing_means_pictures_off_too(self):
+        self.pictures = FakePictures()
+        self.make_pictures = lambda: None
+        record = self.run_it()
+        self.assertEqual(self.bridge.crops, [])
+        self.assertEqual(record["stage"], "done", record["error"])
+
+    def test_shadow_mode_sends_no_picture(self):
+        self.bridge.selected = ["Chair"]
+        record = self.run_it("shadow")
+        self.assertEqual((self.bridge.crops, self.bridge.crop_reads, self.pictures.calls, self.pictures.ready_calls),
+                         ([], 0, [], 0))
+        self.assertIsNone(record["gaze"]["targets"][0]["picture"])
+        self.assertNotIn("picture (", self.editor.sent[0])
+        self.assertNotIn("picture", record["timings"])
+
+    def test_pictures_stay_off_until_the_check_has_passed(self):
+        self.pictures.is_ready = False
+        record = self.run_it()
+        self.assertGreaterEqual(self.pictures.ready_calls, 1)
+        self.assertEqual((self.bridge.crops, self.pictures.calls), ([], []))
+        self.assertNotIn("Looking closer…", self.status_texts())
+        self.assertNotIn("picture", record["timings"])
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertIn('Focus (gaze): "there"', self.editor.sent[0])  # the text-only Focus line, as without pictures
+
+    def test_a_picture_is_not_taken_for_a_guess_nobody_settled(self):
+        self.bridge.pick_reply = lambda points: [EAGLE] * 11 + [PERCH] * 10 + [None] * 3  # too close to call
+        self.bridge.selected = ["Chair"]
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.service.choice_seconds = 0.3  # nobody answers
+        self.gaze.look(0.5, 0.5)
+        record = self.speak()
+        self.assertEqual((self.bridge.crops, self.pictures.calls), ([], []))
+        self.assertIn("Focus: selected Chair", self.editor.sent[0])
+        self.assertEqual(record["stage"], "done", record["error"])
+
+    def test_unity_never_starts_the_picture_part(self):
+        self.stt = FakeStt(["add a light there"], words=THERE_WORDS)
+        self.build(host="unity", gaze_mode="on", gaze_source="mouse").start()
+        self.speak()
+        self.assertEqual((self.pictures_made, self.bridge.crops), (0, []))
+
+    # --- when it goes wrong: the edit goes on as if pictures were off --------------------------------------------
+    def carries_on(self, record):
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertIsNone(record["gaze"]["targets"][0]["picture"])
+        self.assertNotIn("picture (", self.editor.sent[0])
+        self.assertIn('Focus (gaze): "there" at 1.0 s', self.editor.sent[0])
+        self.assertEqual(len(self.editor.sent), 1)
+
+    def test_an_add_on_from_before_pictures_carries_on_text_only(self):
+        self.bridge.crop_start = {"ok": False, "error": "unknown command"}
+        record = self.run_it()
+        self.carries_on(record)
+        self.assertEqual((len(self.bridge.crops), self.bridge.crop_reads, self.pictures.calls), (1, 0, []))
+
+    def test_a_crop_that_cant_be_made_carries_on(self):
+        self.bridge.crop_start = {"ok": False, "error": "no 3D viewport"}
+        self.carries_on(self.run_it())
+        self.assertEqual(self.pictures.calls, [])
+
+    def test_a_crop_that_is_refused_because_one_is_still_pending_carries_on(self):
+        self.bridge.crop_start = {"ok": False, "error": "a picture is already being taken"}
+        self.carries_on(self.run_it())
+        self.assertEqual((self.pictures.calls, self.bridge.crop_reads), ([], 0))
+
+    def test_a_viewport_that_never_drew_carries_on(self):
+        self.bridge.crop_png = None  # the add-on gave up after three seconds: its result is an error
+        self.bridge.crop_pending = 2
+        record = self.run_it()
+        self.carries_on(record)
+        self.assertEqual((self.bridge.crop_reads, self.pictures.calls), (3, []))
+
+    def test_waiting_for_the_picture_polls_until_it_is_ready(self):
+        self.bridge.crop_pending = 4
+        record = self.run_it()
+        self.assertEqual(self.bridge.crop_reads, 5)
+        self.assertEqual(record["gaze"]["targets"][0]["picture"], "the left wing tip")
+
+    def test_a_picture_that_never_comes_is_given_up_on_at_the_deadline(self):
+        self.bridge.crop_pending = 10 ** 9
+        with patch("gazevoice.voice.service.PICTURE_SECONDS", 0.5):
+            began = time.monotonic()
+            record = self.run_it()
+        self.carries_on(record)
+        self.assertLess(time.monotonic() - began, 5.0)
+        self.assertGreaterEqual(record["timings"]["picture"], 0.5)
+
+    def test_a_second_target_gets_no_crop_once_the_time_is_up(self):
+        self.stt = FakeStt(["move this there"], words=THIS_AND_THERE)
+
+        def slow_describer(call):
+            time.sleep(0.6)  # takes all the time there is
+            return "the beak"
+
+        self.pictures.reply = slow_describer
+        with patch("gazevoice.voice.service.PICTURE_SECONDS", 0.4):
+            record = self.run_it(start=1001.6, count=30)
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertEqual(len(self.bridge.crops), 1)  # not even a picture is taken for the second one
+        self.assertEqual([t["picture"] for t in record["gaze"]["targets"]], ["the beak", None])
+
+    def test_a_describer_that_says_nothing_or_unclear_carries_on(self):
+        self.pictures.reply = None
+        self.carries_on(self.run_it())
+
+    def test_a_describer_that_blows_up_carries_on_and_says_nothing_of_why(self):
+        self.pictures.reply = RuntimeError("boom iVBORw0KGgoAAAANSUhEUgAAAQ")
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            record = self.run_it()
+        self.carries_on(record)
+        self.assertNotIn("iVBOR", errors.getvalue())  # nothing a describer says is repeated: it may hold the picture
+        self.assertNotIn("boom", errors.getvalue())
+        self.assertIn("no picture", errors.getvalue())
+
+    def test_a_describer_that_cant_even_say_if_it_is_ready_carries_on(self):
+        self.pictures.ready = lambda: (_ for _ in ()).throw(OSError("claude vanished"))
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            record = self.run_it()
+        self.carries_on(record)
+        self.assertNotIn("claude vanished", errors.getvalue())
+        self.assertEqual(self.bridge.crops, [])
+
+    def test_a_bridge_that_dies_while_the_picture_is_being_made_carries_on(self):
+        self.bridge.gaze_error = None
+        real = self.bridge.gaze
+
+        def dying(cmd, req):
+            if cmd == "gaze_crop_result":
+                raise ConnectionResetError("Blender went away")
+            return real(cmd, req)
+
+        self.bridge.gaze = dying
+        self.carries_on(self.run_it())
+
+    def test_a_picture_that_is_not_a_string_is_not_sent(self):
+        self.bridge.crop_png = {"nope": 1}
+        self.carries_on(self.run_it())
+        self.assertEqual(self.pictures.calls, [])
+
+    # --- stopping ----------------------------------------------------------------------------------------------
+    def wait_in_the_describer(self):
+        """A describer that waits as long as it is allowed to, the way a slow process would, and reports why it left."""
+        started, left = threading.Event(), []
+
+        def describe(call):
+            started.set()
+            end = time.monotonic() + 8
+            while time.monotonic() < end and not call["cancelled"]():
+                time.sleep(0.02)
+            left.append("cancelled" if call["cancelled"]() else "timed out")
+            return None
+
+        self.pictures.reply = describe
+        return started, left
+
+    def test_stop_during_the_picture_ends_the_describer_and_the_command(self):
+        started, left = self.wait_in_the_describer()
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.gaze.look(0.5, 0.5)
+        self.service.ptt("down", 1002.0)
+        self.service.ptt("up", 1003.0)
+        spoken = self.last_record()
+        self.assertTrue(started.wait(5))
+        self.service.say("stop")
+        wait_for(lambda: spoken["stage"] in ("stopped", "done", "failed"))
+        self.assertEqual(spoken["stage"], "stopped")
+        self.assertEqual(left, ["cancelled"])
+        self.assertEqual((self.refiner.sent, self.editor.sent), ([], []))
+
+    def test_turning_voice_off_during_the_picture_ends_the_describer(self):
+        started, left = self.wait_in_the_describer()
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.gaze.look(0.5, 0.5)
+        self.service.ptt("down", 1002.0)
+        self.service.ptt("up", 1003.0)
+        self.assertTrue(started.wait(5))
+        began = time.monotonic()
+        self.service.stop()
+        self.assertLess(time.monotonic() - began, 5.0)
+        self.assertEqual(left, ["cancelled"])
+        self.assertEqual(self.service.snapshot()["state"], "off")
+        self.assertEqual((self.refiner.sent, self.editor.sent), ([], []))
+
+
+class GazePictureRealRouteTest(VoiceTestBase):
+    """The whole path with the real describer talking to fake_claude.py. The app folder is the service's own folder."""
+
+    def setUp(self):
+        super().setUp()
+        self.out = tempfile.TemporaryDirectory()  # what fake_claude.py reports, kept out of the app folder
+        self.pid_file = Path(self.out.name) / "pid"
+        self.paths = AppPaths(Path(self.tmp.name))
+        self.paths.ensure()
+        write_picture_check(self.paths.gaze_picture_check, "2.1.303", 1.0)
+        self.picture = make_noise_picture(256)
+        self.arm()
+
+    def arm(self):
+        """Everything one voice run uses, new: a second run in the same test starts from here."""
+        self.stt = FakeStt(["add blue color there"], words=THERE_WORDS)
+        self.refiner = FakeSession([TurnResult(THERE_REFINED, False)])
+        self.editor = FakeSession([TurnResult("Made the wing blue.", False, ["execute_blender_code"])])
+        self.editors_made = self.pictures_made = 0
+        self.gaze = FakeGaze()
+        self.mic = FakeMic()
+        self.bridge = FakeBridge()
+        self.bridge.selected = []
+        self.bridge.pick_reply = lambda points: [EAGLE] * 19 + [PERCH] * 4 + [None]
+        self.bridge.piece_reply = BODY_PIECE
+        self.bridge.crop_start = {"ok": True, "pending": True}
+        self.bridge.crop_png = self.picture.base64
+        self.pid_file.unlink(missing_ok=True)
+        self.use_claude()
+
+    def tearDown(self):
+        super().tearDown()
+        self.out.cleanup()
+
+    def use_claude(self, reply=None, **env):
+        runner = FakeRunner(which={"claude": "/Users/me/.local/bin/claude"})
+        runner.add(["claude", "--version"], stdout="2.1.303 (Claude Code)\n")
+        runner.add(["claude", "auth", "status"], stdout=LOGGED_IN)
+        environ = {"FAKE_CLAUDE_PID_OUT": str(self.pid_file)}
+        if reply is not None:
+            environ["FAKE_CLAUDE_PICTURE"] = reply
+        self.pictures = Describer(self.paths, runner, ProbeCache(), command=FAKE_CLAUDE, env={**environ, **env})
+
+    def make_pictures(self):
+        clear_leftover_images(self.paths)
+        return super().make_pictures()
+
+    def run_it(self, mode="on"):
+        self.build(gaze_mode=mode, gaze_source="mouse").start()
+        self.gaze.look(0.5, 0.5)
+        return self.speak()
+
+    def picture_data_in_the_app_folder(self):
+        found = []
+        for path in Path(self.tmp.name).rglob("*"):
+            if path.is_file():
+                data = path.read_bytes()
+                if b"\x89PNG" in data or b"iVBOR" in data:
+                    found.append(path)
+        return found
+
+    def pid(self):
+        return int(self.pid_file.read_text())
+
+    def process_gone(self):
+        try:
+            os.kill(self.pid(), 0)
+        except ProcessLookupError:
+            return True
+        return False
+
+    def test_the_sentence_comes_from_a_process_that_has_exited(self):
+        record = self.run_it()
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertIn('  picture (only a description of what the ring shows): "the left wing tip"', self.editor.sent[0])
+        self.assertTrue(self.process_gone())
+
+    def test_no_picture_is_left_behind(self):
+        # The scan has to be able to see one: plant a copy and watch it get found.
+        planted = Path(self.tmp.name) / "work" / "planted.txt"
+        planted.write_bytes(b"iVBORw0KGgoAAAA")
+        self.assertEqual(self.picture_data_in_the_app_folder(), [planted])
+        planted.unlink()
+        for reply in (None, "fail", "die"):  # a full run, then runs where the describer fails
+            with self.subTest(reply=reply):
+                self.arm()
+                if reply:
+                    self.use_claude(reply)
+                record = self.run_it()
+                self.assertEqual(record["stage"], "done", record["error"])
+                self.assertIn("record.json", [p.name for p in Path(self.tmp.name).rglob("*.json")])
+                self.assertEqual(self.picture_data_in_the_app_folder(), [])
+                self.assertTrue(self.process_gone())
+                self.service.stop()
+
+    def test_a_slow_describer_is_given_up_on_and_the_edit_carries_on(self):
+        self.use_claude("slow")
+        with patch("gazevoice.voice.service.PICTURE_SECONDS", 0.8):
+            began = time.monotonic()
+            record = self.run_it()
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertLess(time.monotonic() - began, 6.0)
+        self.assertIsNone(record["gaze"]["targets"][0]["picture"])
+        self.assertNotIn("picture (", self.editor.sent[0])
+        self.assertEqual(len(self.editor.sent), 1)  # the edit still happened, on the text-only Focus line
+        self.assertTrue(wait_until_true(self.process_gone))
+
+    def test_stop_kills_the_describer_that_is_still_thinking(self):
+        self.use_claude("slow")
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.gaze.look(0.5, 0.5)
+        self.service.ptt("down", 1002.0)
+        self.service.ptt("up", 1003.0)
+        spoken = self.last_record()
+        wait_for(lambda: self.pid_file.exists())
+        self.service.say("stop")
+        wait_for(lambda: spoken["stage"] == "stopped")
+        self.assertTrue(wait_until_true(self.process_gone))
+        self.assertEqual((self.refiner.sent, self.editor.sent), ([], []))
+
+    def test_turning_voice_off_kills_the_describer_that_is_still_thinking(self):
+        self.use_claude("slow")
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.gaze.look(0.5, 0.5)
+        self.service.ptt("down", 1002.0)
+        self.service.ptt("up", 1003.0)
+        wait_for(lambda: self.pid_file.exists())
+        self.service.stop()
+        self.assertTrue(wait_until_true(self.process_gone))
+
+    def test_leftover_images_are_cleared_when_voice_starts(self):
+        images = self.paths.gaze_images
+        images.mkdir(parents=True)
+        (images / "gazevoice-gaze-77.png").write_bytes(b"\x89PNG left behind by a crash")
+        (images / "other.txt").write_text("not ours")
+        for mode in ("off", "on"):  # whatever the gaze setting is
+            self.arm()
+            (images / "gazevoice-gaze-77.png").write_bytes(b"\x89PNG left behind by a crash")
+            self.build(gaze_mode=mode, gaze_source="mouse").start()
+            self.assertEqual(sorted(p.name for p in images.iterdir()), ["other.txt"], mode)
+            self.service.stop()
+
+    def test_records_never_hold_the_image(self):
+        record = self.run_it()
+        saved = (Path(self.tmp.name) / "commands" / record["id"] / "record.json").read_text()
+        self.assertIn("the left wing tip", saved)
+        self.assertNotIn("iVBOR", saved)
+        self.assertNotIn("iVBOR", json.dumps(self.service.snapshot()["recent"]))
+
+
+def wait_until_true(predicate, seconds=3.0):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
 
 
 if __name__ == "__main__":

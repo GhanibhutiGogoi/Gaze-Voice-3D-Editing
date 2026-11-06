@@ -33,6 +33,7 @@ class Settings:
     camera_device: str = ""  # "" = auto (the Mac's own camera); otherwise the camera's name, since its number moves
     gaze_mode: str = "off"
     gaze_source: str = "camera"
+    gaze_pictures: bool = False  # describe a big unnamed part from a picture of it; each one uses a little of the plan
     # Each step has a source (a built-in brain or a provider id) and remembers its choices for both kinds.
     editor_source: str = "auto"
     editor_model: str = "default"
@@ -91,6 +92,8 @@ def _check(key: str, value: Any) -> None:
         raise ValueError(f"gaze_mode must be one of {', '.join(GAZE_MODES)}")
     if key == "gaze_source" and value not in GAZE_SOURCES:
         raise ValueError(f"gaze_source must be one of {', '.join(GAZE_SOURCES)}")
+    if key == "gaze_pictures" and not isinstance(value, bool):
+        raise ValueError("gaze_pictures must be true or false")
     if key == "mic_device" and not (isinstance(value, str) and (value == "" or value.isdigit())):
         raise ValueError('mic_device must be "" (auto) or a device number such as "2"')
     if key == "camera_device" and not (isinstance(value, str) and len(value) <= 200 and value.isprintable()):

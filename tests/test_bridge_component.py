@@ -1,3 +1,4 @@
+import base64
 import json
 import socket
 import socketserver
@@ -88,6 +89,21 @@ class SocketHelpersTest(unittest.TestCase):
             self.assertTrue(client.request({"cmd": "ping"}, timeout=3)["ok"])
             with self.assertRaises(OSError):  # and the default applies again afterwards
                 client.request({"cmd": "ping"})
+        finally:
+            client.close()
+            fake.close()
+
+    def test_a_picture_reply_passes_through_the_client_and_none_of_it_stays(self):
+        fake = FakeBridge()
+        picture = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 600  # far longer than one socket read
+        client = BridgeClient(port=fake.port)
+        try:
+            self.assertTrue(client.request({"cmd": "gaze_crop", "u": 0.5, "v": 0.5, "radius": [0.1, 0.1], "size": 64})["ok"])
+            fake.scene.crop.finish(picture)
+            reply = client.request({"cmd": "gaze_crop_result"})
+            self.assertEqual(len(reply["png"]), len(base64.b64encode(picture)))
+            self.assertEqual(client._buffer, b"")  # the reply was handed over, not kept
+            self.assertEqual(client.request({"cmd": "gaze_crop_result"})["error"], "no picture is waiting")
         finally:
             client.close()
             fake.close()

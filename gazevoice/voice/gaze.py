@@ -10,6 +10,7 @@ import math
 import re
 import statistics
 import threading
+import unicodedata
 from collections import deque
 from dataclasses import asdict, dataclass
 from typing import Callable, Sequence
@@ -24,10 +25,45 @@ CONFIDENT_SCORE = 0.6  # the top guess needs at least this share of the rays
 CONFIDENT_GAP = 0.25  # and this much more than the next guess
 DEFAULT_RADIUS = (0.10, 0.15)  # half the patch the rays cover, as a share of the viewport width and height
 MAX_CANDIDATES = 3
+PICTURE_MAX_CHARS = 120  # a picture's sentence is cut to this many characters
 
 _GOLDEN_ANGLE = math.pi * (3 - math.sqrt(5))
 _EDGE_PUNCTUATION = re.compile(r"^\W+|\W+$")
 _SLACK = 1e-9  # 13/24 - 7/24 is 0.24999999999999994, and still a lead of exactly 0.25
+_QUOTES = dict.fromkeys(map(ord, "\"'`\u00b4\u2018\u2019\u201a\u201b\u201c\u201d\u201e\u201f\u00ab\u00bb\u2039\u203a"))
+_UNCLEAR = re.compile(r"\W*unclear\W*", re.IGNORECASE)
+
+
+def one_line(text: object, limit: int) -> str:
+    """The first line of `text` that has anything in it, safe to put in front of a model, at most `limit` characters.
+
+    No quote marks, no characters that don't print (control, format like zero-width and right-to-left marks,
+    unassigned), whitespace of any kind as single spaces. Empty when there is nothing to keep. Doing it twice
+    changes nothing.
+    """
+    if not isinstance(text, str):
+        return ""
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    kept = []
+    for char in lines[0].translate(_QUOTES):
+        if char.isspace():
+            kept.append(" ")
+        elif unicodedata.category(char)[0] != "C":
+            kept.append(char)
+    return " ".join("".join(kept).split())[:limit].rstrip()
+
+
+def clean_description(text: object) -> str | None:
+    """A model's reading of a picture, made safe to put in front of other models; None when there is nothing to use.
+
+    What a model says about a picture of the viewport is untrusted: the viewport can show any text at all. So it is
+    reduced by `one_line` to at most `PICTURE_MAX_CHARS` characters. An empty reply, or "unclear" (the describer's way
+    of saying it couldn't tell), is None. Cleaning a result again changes nothing.
+    """
+    line = one_line(text, PICTURE_MAX_CHARS)
+    return None if not line or _UNCLEAR.fullmatch(line) else line
 
 
 def viewport_size(report: object) -> tuple[int, int] | None:

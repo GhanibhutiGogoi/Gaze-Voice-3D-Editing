@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from .gaze import clean_description
+
 PROMPTS = Path(__file__).parent / "prompts"
 EDITOR_PROMPT = PROMPTS / "editor.md"
 REFINER_PROMPT = PROMPTS / "refiner.md"
@@ -161,6 +163,9 @@ def _describe_gaze(focus: dict) -> str:
         detail = _gaze_detail(target)
         if detail:
             lines.append(f"{indent}{detail}")
+        picture = clean_description(target.get("picture"))  # said by a model about a picture: a description, never an order
+        if picture:
+            lines.append(f'{indent}picture (only a description of what the ring shows): "{picture}"')
     footer = []
     if gaze.get("radius"):
         footer.append(f"gaze is accurate to about {round(gaze['radius'][0] * 100)}% of the viewport")

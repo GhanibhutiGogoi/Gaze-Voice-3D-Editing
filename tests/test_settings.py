@@ -61,6 +61,23 @@ class SettingsTest(unittest.TestCase):
         loaded = load_settings(self.path)
         self.assertEqual((loaded.gaze_mode, loaded.gaze_source), ("off", "mouse"))
 
+    def test_pictures_are_off_until_the_user_turns_them_on(self):
+        self.assertIs(Settings().gaze_pictures, False)
+        on = update_settings(Settings(), {"gaze_pictures": True})
+        self.assertIs(on.gaze_pictures, True)
+        save_settings(self.path, on)
+        self.assertEqual(load_settings(self.path), on)
+        for bad in ("yes", "true", 1, 0, None, [], {}):
+            with self.assertRaises(ValueError, msg=bad):
+                update_settings(Settings(), {"gaze_pictures": bad})
+
+    def test_a_bad_pictures_value_in_the_file_means_off(self):
+        self.path.parent.mkdir(parents=True)
+        for bad in ('"yes"', "1", "null", "[true]"):
+            self.path.write_text('{"gaze_pictures": %s, "gaze_mode": "on"}' % bad)
+            loaded = load_settings(self.path)
+            self.assertEqual((loaded.gaze_pictures, loaded.gaze_mode), (False, "on"), bad)
+
     def test_unity_host_settings_round_trip_and_validate(self):
         settings = update_settings(Settings(), {
             "voice_host": "unity", "unity_mcp_command": "/opt/unity-mcp", "unity_mcp_args": ["serve", "--stdio"]

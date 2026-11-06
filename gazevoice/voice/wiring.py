@@ -16,6 +16,7 @@ from .audio import MicError, MicStream, mic_argv
 from .brains import BrainError, ClaudeSession, CodexSession, claude_session_argv
 from .commands import EDITOR_PROMPT, REFINER_PROMPT, UNITY_EDITOR_PROMPT, UNITY_REFINER_PROMPT
 from .gaze_tracker import GazeError, GazeTracker
+from .picture import Describer, clear_leftover_images
 from .service import EDITOR_WARMUP, REFINER_WARMUP, Factories, PointerTracker, VoiceService
 from .stt import SpeechService
 
@@ -192,6 +193,10 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
             except ProbeTimedOut:  # can't tell yet, which is no reason to leave gaze out: starting voice asks again
                 gaze = camera_gaze
 
+    def pictures() -> Describer | None:
+        clear_leftover_images(paths)  # whatever a crash left goes at every start, with pictures on or not
+        return Describer(paths, ctx.runner, ctx.probes) if settings.gaze_pictures else None
+
     factories = Factories(
         bridge=bridge_factory,
         mic=mic,
@@ -200,6 +205,7 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
         refiner=refiner,
         editor=editor,
         gaze=gaze,
+        pictures=pictures if host == "blender" else None,
     )
     return VoiceService(paths.logs, bus, factories, engine=engine.key, brain=sources["editor"], host=host,
                         gaze_mode=gaze_mode, gaze_source=settings.gaze_source, camera=ctx.camera)

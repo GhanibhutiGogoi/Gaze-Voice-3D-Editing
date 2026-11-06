@@ -18,7 +18,10 @@ where the person looked. When a spoken command has a pointing word like "there",
 what was under that spot and, in "on" mode, tells the brains in the focus. When two guesses are too close to
 call, the edit thread puts numbers on them in the viewport and waits for the person to say one; the stt thread
 keeps running, so the answer is heard. Gaze never edits anything, and whatever goes wrong with it, the command
-runs on the selection.
+runs on the selection. A target that is a big stretch of mesh with nothing to name it can also be looked at closer, when
+the person has turned pictures on: a crop of the viewport goes from Blender's memory to one short-lived process that says
+in a few words what is inside the ring (see picture.py). Only that sentence joins the focus, and if anything about it
+fails or takes too long the command goes on without it.
 
 Everything a command did is kept in a record (shown on the dashboard, saved to
 logs/commands/<time>-<n>/record.json next to its audio).
@@ -49,11 +52,14 @@ from .gaze import (
     GazeSample,
     GazeTrack,
     Grounding,
+    Target,
+    clean_description,
     ground,
     is_clear,
     pointing_words,
     viewport_size,
 )
+from .picture import PICTURE_SECONDS, PICTURE_SIZE, needs_picture
 from .stt import SpeechError
 
 PREROLL = 0.35  # seconds of audio kept from before the key went down
@@ -79,6 +85,10 @@ CAMERA_BUSY = "Gaze is using the camera to calibrate or test. Wait for it to fin
 CHOICE_SECONDS = 8.0  # how long numbers stay on screen waiting to be answered
 WHICH_ONE = "Which one? Say the number."
 NO_ANSWER = "No answer, using your selection"
+LOOKING_CLOSER = "Looking closer…"
+NO_PICTURE = "GazeVoice: no picture, going on with text only"  # never says why: what failed may have held the picture
+CROP_POLL_SECONDS = 0.05  # between asking Blender whether the crop is ready
+BRIDGE_REPLY_SECONDS = 2.0  # the longest Blender is given to answer one crop request
 COULDNT_TELL = "Couldn't tell what you meant. Select it or say its name."
 _COULDNT = re.compile(r"(?:could(?:n['’]t| not)|can(?:['’]t|not))\b", re.IGNORECASE)  # the editor saying it failed
 
@@ -118,6 +128,10 @@ class Factories:
     # Builds a gaze part: .start(), .stop(), .alive, .track (a GazeTrack), .radius and .view (the viewport size it was
     # calibrated for, or None when it needs no calibration). None means no gaze.
     gaze: Callable[[], Any] | None = None
+    # Builds the picture part, or returns None when pictures are off: .ready() says whether pictures may be used right
+    # now, and .describe(png_base64, word, object_name, timeout=…, cancelled=…) gives one clean sentence, or None.
+    # It is called every time voice starts, so it is also where leftovers from a crash are swept. None means neither.
+    pictures: Callable[[], Any] | None = None
 
 
 class PointerTracker:
@@ -217,6 +231,7 @@ class VoiceService:
         self._reset_pending = False
         self._conversation_since = 0.0
         self._bridge = self._mic = self._stt = self._refiner = self._editor = self._gaze = None
+        self._pictures = None  # describes big unnamed targets from a picture, when pictures are on
         self._gaze_problem = ""  # why gaze didn't start, if it didn't
         # Commands whose gaze could be compared with the selection, and how many of those agreed with it.
         self._gaze_checked = self._gaze_matched = 0
@@ -390,6 +405,7 @@ class VoiceService:
         if self.host == "blender":
             self._hide_gaze()  # nothing stale on screen
             self._start_gaze(run)
+            self._start_pictures(run)
         self._bridge_call({"cmd": "poll"})  # drop key presses (and mouse positions) Blender queued while voice was off
 
     def _start_gaze(self, run: _Run) -> None:
@@ -412,6 +428,20 @@ class VoiceService:
                     self._gaze = None
             _end(part)
             self._gaze_unavailable(run, exc)
+
+    def _start_pictures(self, run: _Run) -> None:
+        """Pictures are an extra too: if they can't be set up, voice goes on without them."""
+        factory = self.factories.pictures
+        if factory is None:
+            return
+        try:
+            part = factory()
+        except Exception:  # noqa: BLE001 - pictures never stop voice
+            print(NO_PICTURE, file=sys.stderr)
+            return
+        with self._lock:
+            if not run.stop.is_set():
+                self._pictures = part
 
     def _gaze_unavailable(self, run: _Run, exc: Exception) -> None:
         if run.stop.is_set():  # it was stopped while starting, which is why it failed
@@ -476,7 +506,7 @@ class VoiceService:
     def _teardown_parts(self) -> None:
         with self._lock:
             parts = [p for p in (self._gaze, self._editor, self._refiner, self._stt, self._mic) if p is not None]
-            self._mic = self._stt = self._refiner = self._editor = self._gaze = None
+            self._mic = self._stt = self._refiner = self._editor = self._gaze = self._pictures = None
         for part in parts:
             _end(part)
 
@@ -1116,6 +1146,82 @@ class VoiceService:
         live = viewport_size(reply) if reply and reply.get("ok") else None
         return live is not None and live != saved
 
+    def _crop_result(self, deadline: float, run: _Run, cancelled: Callable[[], bool]) -> str | None:
+        """The picture Blender made, as base64, once it is ready. None on any error, or at the deadline or a stop."""
+        while not cancelled():
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None
+            reply = self._bridge_call({"cmd": "gaze_crop_result"}, timeout=max(0.2, min(BRIDGE_REPLY_SECONDS, left)))
+            if not (reply and reply.get("ok")):
+                return None
+            if not reply.get("pending"):
+                png = reply.get("png")
+                return png if isinstance(png, str) and png else None
+            run.stop.wait(CROP_POLL_SECONDS)
+        return None
+
+    def _picture_of(
+        self, target: Target, radius: tuple[float, float], pictures, deadline: float, run: _Run,
+        cancelled: Callable[[], bool],
+    ) -> str | None:
+        """One sentence about what is inside the ring around where the person looked, or None.
+
+        Blender crops its viewport to the ring, from memory, and hands the picture over once. It goes straight to the
+        describer and is not kept anywhere here: not in the record, the target, or the bridge client.
+        """
+        ru, rv = float(radius[0]), float(radius[1])
+        u, v = target.fixation.u, target.fixation.v
+        if not all(math.isfinite(x) and x > 0 for x in (ru, rv)) or not all(math.isfinite(x) for x in (u, v)):
+            return None
+        ring = [min(1.0, ru), min(1.0, rv)]
+        started = self._bridge_call({"cmd": "gaze_crop", "u": min(1.0, max(0.0, u)), "v": min(1.0, max(0.0, v)),
+                                     "radius": ring, "size": PICTURE_SIZE})
+        if not (started and started.get("ok") and started.get("pending")):
+            return None  # an add-on from before pictures says "unknown command", which is no picture and no error
+        png = self._crop_result(deadline, run, cancelled)
+        left = deadline - time.monotonic()
+        if png is None or left <= 0 or cancelled():
+            return None
+        return clean_description(pictures.describe(png, target.word, target.candidates[0].name, timeout=left,
+                                                   cancelled=cancelled))
+
+    def _look_closer(self, record: dict, grounding: Grounding, run: _Run) -> None:
+        """For each settled target that is a big piece of mesh with no name, put a sentence from a picture in `picture`.
+
+        All of it, the crops and the describers, shares one PICTURE_SECONDS. Nothing here can stop a command: pictures
+        off, a check that hasn't passed for this Claude Code, an add-on that can't crop, an error, a describer that is
+        slow or says "unclear", all leave `picture` None and the command goes on with the text it has. A stop, or voice
+        turning off, ends the wait at once and kills the describer.
+        """
+        pictures = self._pictures
+        wanted = [t for t in grounding.targets if needs_picture(t)]
+        if pictures is None or not wanted:
+            return
+
+        def cancelled() -> bool:
+            return bool(record["_stop"] or run.stop.is_set())
+
+        try:
+            if cancelled() or not pictures.ready():
+                return
+        except Exception:  # noqa: BLE001 - not being able to tell is the same as not allowed
+            print(NO_PICTURE, file=sys.stderr)
+            return
+        began = time.monotonic()
+        deadline = began + PICTURE_SECONDS
+        self._stage("refining", record)  # the command is still being understood
+        self._status(LOOKING_CLOSER, "working")
+        try:
+            for target in wanted:
+                if cancelled() or time.monotonic() >= deadline:
+                    break
+                target.picture = self._picture_of(target, grounding.radius, pictures, deadline, run, cancelled)
+        except Exception:  # noqa: BLE001 - whatever went wrong, the person's command is not the place to say so
+            print(NO_PICTURE, file=sys.stderr)
+        finally:
+            record["timings"]["picture"] = round(time.monotonic() - began, 2)
+
     def _ground(self, record: dict, run: _Run) -> bool:
         """Work out what the pointing words in a spoken command refer to, from where the person was looking.
 
@@ -1141,6 +1247,8 @@ class VoiceService:
             grounding = ground(words, clip_start, gaze.track, gaze.radius, self._pick, self._piece)
             if self.gaze_mode == "on" and grounding.status == "clarify":
                 asked, settled = True, self._settle(record, grounding, run)
+            if self.gaze_mode == "on" and grounding.status == "resolved":  # watching only never takes a picture
+                self._look_closer(record, grounding, run)
             found = grounding.to_dict()
         except Exception as exc:  # noqa: BLE001 - a dead socket or odd data from the host must not stop voice
             print(f"GazeVoice: gaze failed: {exc!r}", file=sys.stderr)

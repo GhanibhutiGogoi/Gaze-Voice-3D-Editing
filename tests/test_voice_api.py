@@ -224,6 +224,9 @@ class VoiceApiTest(unittest.TestCase):
     def test_changing_the_gaze_source_while_voice_is_on_asks_for_a_restart(self):
         self.asks_for_a_restart_after({"gaze_source": "mouse"})
 
+    def test_turning_pictures_on_while_voice_is_on_asks_for_a_restart(self):
+        self.asks_for_a_restart_after({"gaze_pictures": True})
+
     def test_changing_the_camera_while_voice_is_on_asks_for_a_restart(self):
         self.asks_for_a_restart_after({"camera_device": "MacBook Air Camera"})
 
