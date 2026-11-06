@@ -15,10 +15,10 @@ outlives its run can never pick up the next run's commands.
 
 A fourth part is optional: gaze (the camera, or the mouse standing in for it). It only keeps a short track of
 where the person looked. When a spoken command has a pointing word like "there", the edit thread asks the host
-what was under that spot and, in "on" mode, tells the brains in the focus. When two guesses are too close to
-call, the edit thread puts numbers on them in the viewport and waits for the person to say one; the stt thread
-keeps running, so the answer is heard. Gaze never edits anything, and whatever goes wrong with it, the command
-runs on the selection. A target that is a big stretch of mesh with nothing to name it can also be looked at closer, when
+what was under that spot and, in "on" mode, tells the brains in the focus. When the guesses are too close to call,
+or the only one is very weak, the edit thread puts numbers on them in the viewport and waits for the person to say
+one; the stt thread keeps running, so the answer is heard. Gaze never edits anything, and whatever goes wrong with it,
+the command runs on the selection. A target that is a big stretch of mesh with nothing to name it can also be looked at closer, when
 the person has turned pictures on: a crop of the viewport goes from Blender's memory to one short-lived process that says
 in a few words what is inside the ring (see picture.py). Only that sentence joins the focus, and if anything about it
 fails or takes too long the command goes on without it.
@@ -1246,9 +1246,9 @@ class VoiceService:
     def _ground(self, record: dict, run: _Run) -> bool:
         """Work out what the pointing words in a spoken command refer to, from where the person was looking.
 
-        The answer goes in record["gaze"]. In "on" mode it also joins the focus the brains read, and guesses too close
-        to call are put to the person first (see _ask_which). Nothing here can stop a command: if gaze is lost or
-        breaks, or nobody says which one, the command runs on the selection. The one exception is that last case with
+        The answer goes in record["gaze"]. In "on" mode it also joins the focus the brains read, and guesses that aren't
+        clear (see is_clear) are put to the person first (see _ask_which). Nothing here can stop a command: if gaze is
+        lost or breaks, or nobody says which one, the command runs on the selection. The one exception is that last case with
         nothing selected. There is nothing to run it on, so the command fails and this returns False. A camera that was
         calibrated on a differently sized viewport is treated like lost gaze, and the status line says to calibrate again.
         """

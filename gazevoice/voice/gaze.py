@@ -23,6 +23,7 @@ MIN_CONFIDENCE = 0.5  # a sample below this is a blink or a lost face
 RAYS = 24  # votes per pointing word
 CONFIDENT_SCORE = 0.6  # the top guess needs at least this share of the rays
 CONFIDENT_GAP = 0.25  # and this much more than the next guess
+LONE_GUESS_FLOOR = 0.2  # when only one object was hit, this share of the rays is enough: the rest hit nothing
 DEFAULT_RADIUS = (0.10, 0.15)  # half the patch the rays cover, as a share of the viewport width and height
 MAX_CANDIDATES = 3
 PICTURE_MAX_CHARS = 120  # a picture's sentence is cut to this many characters
@@ -273,10 +274,15 @@ class Grounding:
 
 
 def is_clear(target: Target) -> bool:
-    """Whether the top guess wins by enough that nobody needs to be asked which one was meant."""
+    """Whether the top guess wins by enough that nobody needs to be asked which one was meant.
+
+    A guess with no rival only has to clear LONE_GUESS_FLOOR: rays that hit nothing vote for nothing, so a wing
+    against empty background isn't in doubt just because it fills part of the patch. Rivals need the full rule.
+    """
     best = target.candidates[0].score
-    runner_up = target.candidates[1].score if len(target.candidates) > 1 else 0.0
-    return best >= CONFIDENT_SCORE - _SLACK and best - runner_up >= CONFIDENT_GAP - _SLACK
+    if len(target.candidates) == 1:
+        return best >= LONE_GUESS_FLOOR - _SLACK
+    return best >= CONFIDENT_SCORE - _SLACK and best - target.candidates[1].score >= CONFIDENT_GAP - _SLACK
 
 
 def ground(

@@ -8,6 +8,7 @@ from gazevoice.voice.gaze import (
     CONFIDENT_GAP,
     CONFIDENT_SCORE,
     DEFAULT_RADIUS,
+    LONE_GUESS_FLOOR,
     MAX_CANDIDATES,
     MIN_CONFIDENCE,
     MIN_SAMPLES,
@@ -362,13 +363,31 @@ class GroundTest(unittest.TestCase):
         with mock.patch.object(gaze, "CONFIDENT_SCORE", 0.5):
             self.assertEqual(self.look([(CHAIR, 13), (TABLE, 7)]).status, "resolved")
 
-    def test_a_weak_lone_guess_needs_clarifying(self):
-        grounding = self.look([(CHAIR, 10)])  # 0.42, nothing else near
-        self.assertEqual(grounding.status, "clarify")
+    def test_a_lone_guess_at_or_above_the_floor_is_resolved(self):
+        for votes_for_it in (15, 14, 10, 5):  # 0.625, then 0.58 (a wing on empty background), 0.42 and 0.21
+            with self.subTest(votes=votes_for_it):
+                self.assertEqual(self.look([(CHAIR, votes_for_it)]).status, "resolved")
 
-    def test_a_strong_lone_guess_is_resolved(self):
-        grounding = self.look([(CHAIR, 15)])
+    def test_a_lone_guess_exactly_on_the_floor_is_resolved(self):
+        with mock.patch.object(gaze, "LONE_GUESS_FLOOR", 6 / 24):
+            self.assertEqual(self.look([(CHAIR, 6)]).status, "resolved")
+
+    def test_a_lone_guess_below_the_floor_needs_clarifying(self):
+        self.assertLess(4 / 24, LONE_GUESS_FLOOR)
+        self.assertEqual(self.look([(CHAIR, 4)]).status, "clarify")  # 0.17 of the rays
+
+    def test_a_wing_against_empty_background_needs_no_question(self):
+        def wing(points):  # 30% by 16% of the viewport, centred where the person looked
+            return [CHAIR if abs(u - 0.5) <= 0.15 and abs(v - 0.5) <= 0.08 else None for u, v in points]
+
+        grounding = ground(said(("this", 0.4, 0.6)), self.CLIP, track_of(*steady(100.0, 0.5, 0.5)), DEFAULT_RADIUS,
+                           wing, self.piece)
+        self.assertAlmostEqual(grounding.targets[0].candidates[0].score, 0.58, places=2)
         self.assertEqual(grounding.status, "resolved")
+
+    def test_the_floor_is_only_for_a_lone_guess(self):
+        grounding = self.look([(CHAIR, 13), (TABLE, 1)])  # 0.54 leads by 0.5, but something else was hit
+        self.assertEqual(grounding.status, "clarify")
 
     def test_each_pointing_word_gets_its_own_target(self):
         words = said(("move", 0.0, 0.3), ("this", 0.4, 0.6), ("over", 0.7, 0.9), ("there", 1.0, 1.3))
