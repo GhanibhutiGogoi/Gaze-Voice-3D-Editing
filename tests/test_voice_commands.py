@@ -84,6 +84,24 @@ class RefinerTest(unittest.TestCase):
         self.assertEqual(parse_refined('{"kind": "ignore", "text": ""}', "what time is it").kind, "ignore")
 
 
+def candidate(name, score, point=(0.41, 0.12, 0.73), faces=5120):
+    return {"uid": 1, "name": name, "score": score, "faces": faces, "u": 0.5, "v": 0.5, "point": list(point)}
+
+
+def gaze_target(word="there", at=1.2, candidates=None, piece=None):
+    return {"word": word, "at": at, "candidates": candidates or [candidate("Eagle", 0.82), candidate("Perch", 0.14)],
+            "fixation": {"u": 0.5, "v": 0.5, "samples": 8}, "piece": piece, "picture": None}
+
+
+WING = {"face": 3120, "part": "Wing.L", "piece_faces": 480, "object_faces": 5120}
+
+
+def gaze_focus(*targets, selected=(), radius=(0.10, 0.15)):
+    focus = {"active": None, "selected": list(selected), "mode": "OBJECT"} if selected is not None else {}
+    focus["gaze"] = {"status": "resolved", "targets": list(targets), "radius": list(radius)}
+    return focus
+
+
 class EditorMessageTest(unittest.TestCase):
     def test_includes_command_heard_and_focus(self):
         focus = {"active": "Chair", "selected": ["Chair", "Leg.001"], "mode": "OBJECT"}
@@ -95,6 +113,79 @@ class EditorMessageTest(unittest.TestCase):
     def test_focus_descriptions(self):
         self.assertIn("nothing selected", describe_focus({"active": None, "selected": [], "mode": "OBJECT"}))
         self.assertIn("unknown", describe_focus(None))
+
+    def test_describe_focus_keeps_todays_text_without_gaze(self):
+        self.assertEqual(describe_focus(None), "unknown (Blender didn't report a selection)")
+        self.assertEqual(describe_focus({}), "unknown (Blender didn't report a selection)")
+        self.assertEqual(describe_focus({"active": None, "selected": [], "mode": "OBJECT"}),
+                         "nothing selected · mode OBJECT · source: selection")
+        self.assertEqual(describe_focus({"active": "Chair", "selected": ["Chair", "Leg.001"], "mode": "EDIT"}),
+                         "selected Chair, Leg.001 (active: Chair) · mode EDIT · source: selection")
+        self.assertEqual(describe_focus({"active": None, "selected": ["Chair"], "mode": None}),
+                         "selected Chair · mode ? · source: selection")
+        # A gaze that found nothing (or an empty one) changes nothing about the text.
+        plain = {"active": "Chair", "selected": ["Chair"], "mode": "OBJECT"}
+        for empty in ({}, {"status": "none", "targets": [], "radius": [0.1, 0.15]}, None):
+            self.assertEqual(describe_focus({**plain, "gaze": empty}), describe_focus(plain))
+        self.assertEqual(editor_message("Make it red.", "make it red", plain),
+                         "Command: Make it red.\nHeard: \"make it red\"\n"
+                         "Focus: selected Chair (active: Chair) · mode OBJECT · source: selection")
+
+    def test_describe_focus_lists_each_word_with_its_guesses(self):
+        one = describe_focus(gaze_focus(gaze_target()))
+        self.assertTrue(one.startswith('Focus (gaze): "there" at 1.2 s → Eagle (82%), Perch (14%)\n'), one)
+        two = describe_focus(gaze_focus(
+            gaze_target("this", 0.4, [candidate("Chair", 0.9)]),
+            gaze_target("there", 1.2, [candidate("Table", 0.7), candidate("Floor", 0.2)])))
+        lines = two.splitlines()
+        self.assertEqual(lines[0], 'Focus (gaze): "this" at 0.4 s → Chair (90%)')
+        self.assertIn('  "there" at 1.2 s → Table (70%), Floor (20%)', lines)
+        self.assertLess(lines.index('  "there" at 1.2 s → Table (70%), Floor (20%)'), len(lines) - 1)
+
+    def test_describe_focus_gives_the_point_face_and_piece(self):
+        text = describe_focus(gaze_focus(gaze_target(piece=WING)))
+        self.assertEqual(text, "\n".join([
+            'Focus (gaze): "there" at 1.2 s → Eagle (82%), Perch (14%)',
+            "  part: Wing.L · point (0.41, 0.12, 0.73) on face 3120 · connected piece of 480 of 5120 faces",
+            "  gaze is accurate to about 10% of the viewport · selected: nothing",
+        ]))
+
+    def test_the_gaze_text_leaves_out_what_it_doesnt_know(self):
+        no_part = describe_focus(gaze_focus(gaze_target(piece={**WING, "part": None})))
+        self.assertIn("\n  point (0.41, 0.12, 0.73) on face 3120 · connected piece of 480 of 5120 faces\n", no_part)
+        self.assertNotIn("part:", no_part)
+        too_big = describe_focus(gaze_focus(gaze_target(piece={**WING, "piece_faces": None})))
+        self.assertIn("\n  part: Wing.L · point (0.41, 0.12, 0.73) on face 3120\n", too_big)
+        self.assertNotIn("connected piece", too_big)
+        no_piece = describe_focus(gaze_focus(gaze_target(piece=None)))  # gaze_piece couldn't answer
+        self.assertIn("\n  point (0.41, 0.12, 0.73)\n", no_piece)
+        self.assertNotIn("face 3120", no_piece)
+        bare = describe_focus(gaze_focus(gaze_target(candidates=[candidate("Eagle", 0.8, point=())])))
+        self.assertEqual(bare.splitlines()[1], "  gaze is accurate to about 10% of the viewport · selected: nothing")
+
+    def test_the_gaze_text_says_what_is_selected_and_how_sure_the_gaze_is(self):
+        text = describe_focus(gaze_focus(gaze_target(), selected=["Chair", "Leg.001"], radius=(0.02, 0.03)))
+        self.assertTrue(text.endswith("  gaze is accurate to about 2% of the viewport · selected: Chair, Leg.001"))
+        unknown = describe_focus(gaze_focus(gaze_target(), selected=None))  # Blender couldn't report a selection
+        self.assertTrue(unknown.endswith("  gaze is accurate to about 10% of the viewport"), unknown)
+
+    def test_a_gaze_message_has_one_focus_line_and_no_plain_one(self):
+        message = editor_message("Add blue color there.", "add blue color there", gaze_focus(gaze_target(piece=WING)))
+        lines = message.splitlines()
+        self.assertEqual(lines[0], "Command: Add blue color there.")
+        self.assertEqual(lines[1], 'Heard: "add blue color there"')
+        self.assertTrue(lines[2].startswith('Focus (gaze): "there"'), lines[2])
+        self.assertNotIn("Focus: ", message)
+
+    def test_the_refiner_sees_the_gaze_beside_the_focus(self):
+        plain = json.loads(refiner_message("make it red", {"selected": ["Chair"]}, ["Chair"], []))
+        self.assertNotIn("gaze", plain)
+        self.assertEqual(list(plain), ["heard", "focus", "scene_objects", "previous_commands"])
+        focus = gaze_focus(gaze_target(piece=WING))
+        message = json.loads(refiner_message("add blue color there", focus, ["Eagle"], []))
+        self.assertIn('"there" at 1.2 s → Eagle (82%), Perch (14%)', message["gaze"])
+        self.assertIn("Wing.L", message["gaze"])
+        self.assertEqual(message["focus"], {"active": None, "selected": [], "mode": "OBJECT"})  # not said twice
 
 
 class PromptsTest(unittest.TestCase):
@@ -109,6 +200,16 @@ class PromptsTest(unittest.TestCase):
         self.assertIn("detailed", refiner)  # build requests become detailed briefs
         self.assertNotIn("short, direct", editor)
         self.assertIn("low-poly", editor)
+
+    def test_the_editor_prompt_covers_gaze_parts_and_own_materials(self):
+        editor = EDITOR_PROMPT.read_text()
+        for phrase in ("Focus can come from gaze", "own material", "connected piece", "vertex group", "the name wins"):
+            self.assertIn(phrase, editor)
+
+    def test_the_refiner_prompt_describes_the_gaze_field_and_keeps_pointing_words(self):
+        refiner = REFINER_PROMPT.read_text()
+        self.assertIn('"gaze"', refiner)
+        self.assertIn("Keep pointing words as said", refiner)
 
     def test_vocabulary_prompt_is_bounded(self):
         names = [f"Object_{i}" for i in range(500)]

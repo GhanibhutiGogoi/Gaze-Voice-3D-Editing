@@ -13,6 +13,11 @@ Three threads keep it responsive:
 Each Start→Stop is one run with its own queues and stop signal, so a thread that
 outlives its run can never pick up the next run's commands.
 
+A fourth part is optional: gaze (the camera, or the mouse standing in for it). It only keeps a short track of
+where the person looked. When a spoken command has a pointing word like "there", the edit thread asks the host
+what was under that spot and, in "on" mode, tells the brains in the focus. Gaze never edits anything, and
+whatever goes wrong with it, the command runs on the selection.
+
 Everything a command did is kept in a record (shown on the dashboard, saved to
 logs/commands/<time>-<n>/record.json next to its audio).
 """
@@ -22,6 +27,7 @@ from __future__ import annotations
 import collections
 import itertools
 import json
+import math
 import queue
 import re
 import sys
@@ -35,6 +41,7 @@ from ..events import EventBus
 from .audio import SILENCE_HELP, MicError, is_digital_silence, write_wav
 from .brains import BrainError
 from .commands import editor_message, meta_command, parse_refined, refiner_message, vocabulary_prompt
+from .gaze import GazeSample, GazeTrack, ground, pointing_words
 from .stt import SpeechError
 
 PREROLL = 0.35  # seconds of audio kept from before the key went down
@@ -53,6 +60,8 @@ REFINE_SECONDS = 90.0
 REFINER_WARMUP = '{"heard": "hello", "focus": {}, "scene_objects": [], "previous_commands": []}'
 EDITOR_WARMUP = "Warm-up, not a command: don't use any tools and don't change anything. Reply with exactly: ready"
 READ_ONLY_TOOLS = ("get_", "search_", "render_viewport_to_path")
+POINTER_RADIUS = (0.02, 0.03)  # a mouse is nearly exact: the rays cover this share of the viewport's width and height
+GAZE_LOST = "Gaze lost, using your selection"
 _COULDNT = re.compile(r"(?:could(?:n['’]t| not)|can(?:['’]t|not))\b", re.IGNORECASE)  # the editor saying it failed
 
 
@@ -88,6 +97,30 @@ class Factories:
     stt: Callable[[], Any]
     refiner: Callable[[], Any]
     editor: Callable[[], Any]
+    # Builds a gaze part: .start(), .stop(), .alive, .track (a GazeTrack) and .radius. None means no gaze.
+    gaze: Callable[[], Any] | None = None
+
+
+class PointerTracker:
+    """Gaze from the mouse: the pointer's place in the 3D viewport while the key is held.
+
+    The poll loop feeds it the Bridge's pointer events. It needs no camera and no calibration.
+    """
+
+    radius = POINTER_RADIUS
+
+    def __init__(self):
+        self.track = GazeTrack()
+        self.alive = False
+
+    def start(self) -> None:
+        self.alive = True
+
+    def stop(self) -> None:
+        self.alive = False
+
+    def feed(self, u: float, v: float, t: float) -> None:
+        self.track.add(GazeSample(t, u, v, 1.0))
 
 
 @dataclass
@@ -122,6 +155,8 @@ class VoiceService:
         brain: str = "claude",
         clock: Callable[[], float] = time.time,
         host: str = "blender",
+        gaze_mode: str = "off",
+        gaze_source: str = "camera",
     ):
         self.logs_dir = Path(logs_dir)
         self.bus = bus
@@ -129,6 +164,8 @@ class VoiceService:
         self.engine = engine
         self.brain = brain
         self.host = host
+        self.gaze_mode = gaze_mode  # "off", "shadow" (record only) or "on" (tell the brains)
+        self.gaze_source = gaze_source
         self.host_label = "Unity" if host == "unity" else "Blender"
         self.busy_wait = UNITY_BUSY_WAIT if host == "unity" else BUSY_WAIT
         self.clock = clock
@@ -146,7 +183,10 @@ class VoiceService:
         self._current: dict | None = None  # the command being understood or edited
         self._reset_pending = False
         self._conversation_since = 0.0
-        self._bridge = self._mic = self._stt = self._refiner = self._editor = None
+        self._bridge = self._mic = self._stt = self._refiner = self._editor = self._gaze = None
+        self._gaze_problem = ""  # why gaze didn't start, if it didn't
+        # Commands whose gaze could be compared with the selection, and how many of those agreed with it.
+        self._gaze_checked = self._gaze_matched = 0
         self._numbers = itertools.count(1)
         self._status_seq = 0
 
@@ -165,6 +205,13 @@ class VoiceService:
                 "host_connected": self.host_connected,
                 "blender_connected": self.host_connected,  # legacy dashboard clients
                 "queued": run.edit_q.qsize() if run else 0,
+                "gaze": {
+                    "mode": self.gaze_mode,
+                    "source": self.gaze_source,
+                    "live": self._gaze is not None and bool(self._gaze.alive),
+                    "checked": self._gaze_checked,
+                    "matched": self._gaze_matched,
+                },
                 "recent": [self._public(r) for r in reversed(self.recent)],
             }
 
@@ -250,6 +297,8 @@ class VoiceService:
             run = self._run = _Run()
             self._reset_pending = False
             self._conversation_since = self.clock()
+            self._gaze_problem = ""
+            self._gaze_checked = self._gaze_matched = 0
             self.state, self.reason = "starting", f"Connecting to {self.host_label}…"
         self._publish_state()
         try:
@@ -274,6 +323,9 @@ class VoiceService:
             run.started.set()
         self._publish_state()
         self._status(self._idle_hint(), "idle")
+        if self._gaze_problem:
+            problem = f"Gaze couldn't start ({self._gaze_problem}), so voice uses your selection."
+            self._status(problem, "error", revert=True)
 
     def _start_parts(self, run: _Run) -> None:
         bridge = self.factories.bridge()
@@ -300,7 +352,36 @@ class VoiceService:
         self._step(run, "Checking the microphone…")
         if mic.heard_only_silence():
             raise MicError(SILENCE_HELP)
-        self._bridge_call({"cmd": "poll"})  # drop key presses Blender queued while voice was off
+        if self.host == "blender":
+            self._bridge_call({"cmd": "gaze_show", "dot": None, "ring": None, "marks": []})  # nothing stale on screen
+            self._start_gaze(run)
+        self._bridge_call({"cmd": "poll"})  # drop key presses (and mouse positions) Blender queued while voice was off
+
+    def _start_gaze(self, run: _Run) -> None:
+        """Gaze is an extra: if it can't start, voice goes on without it, using the selection."""
+        factory = self.factories.gaze
+        if factory is None or self.gaze_mode == "off":
+            return
+        self._step(run, "Starting gaze…")
+        try:
+            part = factory()
+        except Exception as exc:  # noqa: BLE001 - gaze never stops voice
+            self._gaze_unavailable(run, exc)
+            return
+        part = self._attach(run, "_gaze", part)
+        try:
+            part.start()
+        except Exception as exc:  # noqa: BLE001
+            with self._lock:
+                if self._gaze is part:
+                    self._gaze = None
+            _end(part)
+            self._gaze_unavailable(run, exc)
+
+    def _gaze_unavailable(self, run: _Run, exc: Exception) -> None:
+        if run.stop.is_set():  # it was stopped while starting, which is why it failed
+            raise _Cancelled() from exc
+        self._gaze_problem = str(exc) or type(exc).__name__
 
     def _step(self, run: _Run, reason: str) -> None:
         with self._lock:
@@ -354,8 +435,8 @@ class VoiceService:
 
     def _teardown_parts(self) -> None:
         with self._lock:
-            parts = [p for p in (self._editor, self._refiner, self._stt, self._mic) if p is not None]
-            self._mic = self._stt = self._refiner = self._editor = None
+            parts = [p for p in (self._gaze, self._editor, self._refiner, self._stt, self._mic) if p is not None]
+            self._mic = self._stt = self._refiner = self._editor = self._gaze = None
         for part in parts:
             _end(part)
 
@@ -546,7 +627,9 @@ class VoiceService:
             "audio": None,
             "refine_error": None,
             "refiner_reply": None,
+            "gaze": None,  # what the pointing words referred to, when gaze was asked
             "timings": {},
+            "_gaze_note": "",  # shown beside the status when gaze didn't help
             "_t0": 0.0,
             "_t1": 0.0,
             "_stop": False,
@@ -659,7 +742,21 @@ class VoiceService:
                 self.ptt(event.get("state", ""), event.get("t"))
             elif event.get("type") == "toggle":
                 self.ptt("up" if self._listening else "down", event.get("t"), via="toggle")
+            elif event.get("type") == "pointer":
+                self._pointer(event)
         return ack, boot
+
+    def _pointer(self, event: dict) -> None:
+        """The mouse stands in for gaze. An odd event is skipped: this runs inside the poll loop."""
+        gaze = self._gaze
+        if not isinstance(gaze, PointerTracker):
+            return
+        try:
+            t, u, v = (float(event[key]) for key in ("t", "u", "v"))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return
+        if math.isfinite(t) and math.isfinite(u) and math.isfinite(v):
+            gaze.feed(u, v, t)
 
     def _stt_loop(self, run: _Run) -> None:
         while True:
@@ -856,6 +953,66 @@ class VoiceService:
                 setattr(self, name, None)
         _end(session)
 
+    # --- gaze ---------------------------------------------------------------------------------------
+    @staticmethod
+    def _gaze_hint(record: dict) -> str:
+        return f" · {record['_gaze_note']}" if record["_gaze_note"] else ""
+
+    def _pick(self, points: list[list[float]]) -> list | None:
+        """What is under each point of the viewport, or None when Blender couldn't say."""
+        reply = self._bridge_call({"cmd": "gaze_pick", "points": points})
+        hits = reply.get("hits") if reply and reply.get("ok") else None
+        return hits if isinstance(hits, list) else None
+
+    def _piece(self, candidate) -> dict | None:
+        """Which part of the model the best guess is, or None when Blender couldn't say."""
+        if len(candidate.point) != 3:
+            return None
+        reply = self._bridge_call({"cmd": "gaze_piece", "uid": candidate.uid, "point": candidate.point})
+        if not reply or not reply.get("ok"):
+            return None
+        return {k: v for k, v in reply.items() if k != "ok"}
+
+    @staticmethod
+    def _matches_selection(gaze: dict, focus: dict | None) -> bool | None:
+        """Whether the first pointing word's best guess is selected. None when there is nothing to compare."""
+        selected = (focus or {}).get("selected") or []
+        if not selected or not gaze["targets"]:
+            return None
+        return gaze["targets"][0]["candidates"][0]["name"] in selected
+
+    def _ground(self, record: dict, run: _Run) -> None:
+        """Work out what the pointing words in a spoken command refer to, from where the person was looking.
+
+        The answer goes in record["gaze"]. In "on" mode it also joins the focus the brains read. Nothing here can
+        stop a command: if gaze is lost or breaks, the command runs on the selection.
+        """
+        gaze = self._gaze  # there is none when gaze is off, can't start, or has no camera part yet
+        if gaze is None:
+            return
+        words, clip_start = record["words"], record["_t0"] - PREROLL  # the clip _transcribe cut starts here
+        if not pointing_words(words, clip_start):
+            return
+        try:
+            found = ground(words, clip_start, gaze.track, gaze.radius, self._pick, self._piece).to_dict()
+        except Exception as exc:  # noqa: BLE001 - a dead socket or odd data from the host must not stop voice
+            print(f"GazeVoice: gaze failed: {exc!r}", file=sys.stderr)
+            found = {"status": "none", "targets": [], "radius": [], "error": repr(exc)}
+        matched = self._matches_selection(found, record["focus"])
+        record["gaze"] = {**found, "matched_selection": matched}
+        if matched is not None:
+            with self._lock:
+                self._gaze_checked += 1
+                self._gaze_matched += matched
+        if self.gaze_mode != "on":
+            return
+        if not found["targets"]:
+            record["_gaze_note"] = GAZE_LOST
+            return
+        # The brains read how long into the command each word was said, not the clock time.
+        targets = [{**t, "at": t["at"] - clip_start} for t in found["targets"]]
+        record["focus"] = {**(record["focus"] or {}), "gaze": {**found, "targets": targets}}
+
     def _refine(self, record: dict, run: _Run):
         with self._lock:
             since = self._conversation_since
@@ -887,8 +1044,12 @@ class VoiceService:
             self._meta(record["kind"], record, run)
             return
         if record["source"] == "voice":
+            self._ground(record, run)
+            if record["_stop"] or run.stop.is_set():  # "stop" was said while Blender was being asked
+                self._stopped(record, "Stopped.", run)
+                return
             self._stage("refining", record)
-            self._status("Understanding…", "working")
+            self._status(f"Understanding…{self._gaze_hint(record)}", "working")
             refined = self._refine(record, run)
             record["refined"], record["prompt"] = refined.title or refined.text, refined.text
             record["kind"], record["fallback"] = refined.kind, refined.fallback
@@ -909,7 +1070,7 @@ class VoiceService:
             self._stopped(record, "Stopped.", run)
             return
         self._stage("editing", record)
-        self._status(f"Working: {record['refined']}", "working")
+        self._status(f"Working: {record['refined']}{self._gaze_hint(record)}", "working")
         self._bridge_call({"cmd": "begin_edit"})  # from here, the host tracks changes for undo
 
         def on_tool(name: str) -> None:

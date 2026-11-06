@@ -14,6 +14,8 @@ from .providers import THINKING, ProviderConfig
 BUILTIN_SOURCES = ("auto", "claude", "codex")  # "auto" = Claude Code when it's logged in, otherwise Codex
 API_THINKING = tuple(dict.fromkeys(value for values in THINKING.values() for value in values))
 STT_ENGINES = ("parakeet", "whisper")
+GAZE_MODES = ("off", "shadow", "on")  # shadow = watch and record where you looked, but change nothing
+GAZE_SOURCES = ("camera", "mouse")  # the mouse stands in for the camera: no calibration, nearly exact
 # Claude Code models by full name; "default" leaves the choice to Claude Code.
 CLAUDE_MODELS = ("default", "claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5")
 EFFORTS = ("default", "low", "medium", "high", "xhigh", "max")  # how much Claude thinks (`claude --effort`)
@@ -28,6 +30,8 @@ class Settings:
     unity_project: str = ""  # "" = none yet; otherwise the absolute path of a Unity project
     stt_engine: str = "parakeet"
     mic_device: str = ""  # "" = auto (prefer the built-in mic); otherwise an AVFoundation index
+    gaze_mode: str = "off"
+    gaze_source: str = "camera"
     # Each step has a source (a built-in brain or a provider id) and remembers its choices for both kinds.
     editor_source: str = "auto"
     editor_model: str = "default"
@@ -82,6 +86,10 @@ def _check(key: str, value: Any) -> None:
         raise ValueError(f"{key} must be one of {', '.join(API_THINKING)}")
     if key == "stt_engine" and value not in STT_ENGINES:
         raise ValueError(f"stt_engine must be one of {', '.join(STT_ENGINES)}")
+    if key == "gaze_mode" and value not in GAZE_MODES:
+        raise ValueError(f"gaze_mode must be one of {', '.join(GAZE_MODES)}")
+    if key == "gaze_source" and value not in GAZE_SOURCES:
+        raise ValueError(f"gaze_source must be one of {', '.join(GAZE_SOURCES)}")
     if key == "mic_device" and not (isinstance(value, str) and (value == "" or value.isdigit())):
         raise ValueError('mic_device must be "" (auto) or a device number such as "2"')
     if key in ("editor_model", "refiner_model") and value not in CLAUDE_MODELS:

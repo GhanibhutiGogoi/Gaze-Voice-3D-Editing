@@ -210,6 +210,20 @@ class VoiceApiTest(unittest.TestCase):
         self.center.update_settings({"editor_effort": "max"})
         self.assertTrue(self.get("/api/state")[1]["voice"]["needs_restart"])
 
+    def asks_for_a_restart_after(self, change):
+        self.start_server()
+        _, body = self.post("/api/voice/start")
+        self.center.jobs.wait(body["job"]["id"], 5)
+        self.assertFalse(self.get("/api/state")[1]["voice"]["needs_restart"])
+        self.center.update_settings(change)
+        self.assertTrue(self.get("/api/state")[1]["voice"]["needs_restart"])
+
+    def test_changing_the_gaze_mode_while_voice_is_on_asks_for_a_restart(self):
+        self.asks_for_a_restart_after({"gaze_mode": "shadow"})
+
+    def test_changing_the_gaze_source_while_voice_is_on_asks_for_a_restart(self):
+        self.asks_for_a_restart_after({"gaze_source": "mouse"})
+
     def test_changing_a_source_asks_for_a_restart(self):
         self.start_server()
         _, body = self.post("/api/voice/start")

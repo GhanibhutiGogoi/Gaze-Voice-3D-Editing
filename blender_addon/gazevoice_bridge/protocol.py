@@ -43,7 +43,7 @@ top left. Nothing here edits the scene.
         Draws in the target viewport (a null/empty field draws nothing). "ru, rv" are the ring's radii
         as shares of the viewport's width and height.
     While the push-to-talk key is held, "poll" also carries the mouse as a stand-in for gaze, at most
-    MAX_POINTER_RATE a second:
+    MAX_POINTER_RATE a second, whether it moves or rests where it is:
         {"seq": 14, "type": "pointer", "u": 0.4, "v": 0.3, "t": …}
 """
 

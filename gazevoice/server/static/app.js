@@ -1024,10 +1024,19 @@ function renderRouting() {
     routeRow("Speech engine", "stt_engine", settings.stt_engine, [["parakeet", "Parakeet"], ["whisper", "Whisper"]]),
     ...(settings.voice_host === "unity" ? unityMcpRows(settings) : []),
     inputRow(settings.mic_device),
+    ...(settings.voice_host === "blender" ? gazeRows(settings) : []),
     stepRow("editor", settings),
     stepRow("refiner", settings),
     h("p", { class: "route-note", text: "Auto uses Claude Code when it's logged in, otherwise Codex. More thinking can make big builds better, but each command takes longer." }),
     h("p", { class: "route-note", id: "route-note" }));
+}
+
+function gazeRows(settings) {
+  return [
+    routeRow("Gaze", "gaze_mode", settings.gaze_mode, [["off", "Off"], ["shadow", "Watch only"], ["on", "On"]]),
+    routeRow("Gaze source", "gaze_source", settings.gaze_source, [["camera", "Camera"], ["mouse", "Mouse"]]),
+    h("p", { class: "route-note", text: "Gaze tells the editor what you were looking at when you say this, that or there. Watch only records it and compares it with your selection, but changes nothing. Mouse uses the pointer over Blender's 3D viewport while you hold the key. Camera isn't ready yet, so for now it uses your selection." }),
+  ];
 }
 
 function unityMcpRows(settings) {

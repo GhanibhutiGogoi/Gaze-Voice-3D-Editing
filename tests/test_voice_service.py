@@ -12,7 +12,8 @@ from pathlib import Path
 from gazevoice.events import EventBus
 from gazevoice.voice.audio import MicError, RingBuffer
 from gazevoice.voice.brains import BrainError, TurnResult
-from gazevoice.voice.service import Factories, VoiceError, VoiceService
+from gazevoice.voice.gaze import GazeSample, GazeTrack
+from gazevoice.voice.service import Factories, PointerTracker, VoiceError, VoiceService
 from gazevoice.voice.stt import SpeechError
 
 
@@ -23,6 +24,11 @@ def wait_for(predicate, timeout=5.0):
             return True
         time.sleep(0.02)
     raise AssertionError("condition not met in time")
+
+
+EAGLE = {"uid": 116, "name": "Eagle", "faces": 5120, "point": [0.41, 0.12, 0.73]}
+PERCH = {"uid": 117, "name": "Perch", "faces": 40, "point": [0.5, 0.1, 0.2]}
+WING_PIECE = {"face": 3120, "part": "Wing.L", "piece_faces": 480, "object_faces": 5120}
 
 
 class FakeBridge:
@@ -38,6 +44,12 @@ class FakeBridge:
         self.poll_error: Exception | None = None  # one poll raises this
         self.key = "⌥ Space"
         self.boot = "boot-1"
+        self.selected = ["Chair"]  # what Blender says is selected
+        self.selection_unreadable = False  # Blender can't report a selection
+        self.pick_reply = lambda points: [EAGLE] * len(points)  # what is under each gaze ray; None = no 3D viewport
+        self.piece_reply = WING_PIECE  # what gaze_piece says about the top guess; None = no such mesh object
+        self.gaze_error: Exception | None = None  # every gaze request raises this (a dead socket)
+        self.picks, self.pieces, self.shows = [], [], []
         self.lock = threading.Lock()
         self._events: list[dict] = []
         self._seq = 0
@@ -71,7 +83,10 @@ class FakeBridge:
                     events = [dict(e) for e in self._events]
             return {"ok": True, "boot": self.boot, "events": events}
         if cmd == "selection":
-            return {"ok": True, "active": "Chair", "selected": ["Chair"], "mode": "OBJECT"}
+            if self.selection_unreadable:
+                return {"ok": False}
+            active = self.selected[0] if self.selected else None
+            return {"ok": True, "active": active, "selected": list(self.selected), "mode": "OBJECT"}
         if cmd == "scene_names":
             return {"ok": True, "names": ["Chair", "Table"]}
         if cmd == "status":
@@ -79,6 +94,8 @@ class FakeBridge:
             return {"ok": True}
         if cmd == "begin_edit":
             return {"ok": True}
+        if cmd.startswith("gaze_"):
+            return self.gaze(cmd, req)
         if cmd in ("undo_push", "undo", "redo") and self.busy:
             self.busy -= 1
             return {"ok": False, "error": "busy"}
@@ -91,6 +108,24 @@ class FakeBridge:
             setattr(self, cmd + "s", getattr(self, cmd + "s") + 1)
             return {"ok": True}
         return {"ok": False}
+
+    def gaze(self, cmd, req):
+        if self.gaze_error is not None:
+            raise self.gaze_error
+        if cmd == "gaze_pick":
+            self.picks.append(req["points"])
+            if self.pick_reply is None:
+                return {"ok": False, "error": "no 3D viewport"}
+            return {"ok": True, "hits": self.pick_reply(req["points"])}
+        if cmd == "gaze_piece":
+            self.pieces.append(req)
+            if self.piece_reply is None:
+                return {"ok": False, "error": "no such mesh object"}
+            return {"ok": True, **self.piece_reply}
+        if cmd == "gaze_show":
+            self.shows.append(req)
+            return {"ok": True}
+        return {"ok": False, "error": "unknown command"}
 
     def close(self):
         pass
@@ -125,9 +160,10 @@ class FakeMic:
 
 
 class FakeStt:
-    def __init__(self, texts, block=None):
+    def __init__(self, texts, block=None, words=None):
         self.texts = list(texts)
         self.block = block  # start() waits for this (a slow model load)
+        self.words = words or []  # word timings, seconds into the clip, given with every transcript
         self.calls = []
         self.alive = True
         self.stopped = False
@@ -141,7 +177,7 @@ class FakeStt:
 
     def transcribe(self, audio, prompt=None):
         self.calls.append((audio, prompt))
-        return {"text": self.texts.pop(0) if self.texts else "", "words": [], "seconds": 0.1}
+        return {"text": self.texts.pop(0) if self.texts else "", "words": list(self.words), "seconds": 0.1}
 
     def stop(self):
         self.alive = False
@@ -201,6 +237,37 @@ class FakeSession:
         self.closed = True
 
 
+class FakeGaze:
+    """A gaze part (a camera, or the mouse). Tests drop samples into its track with look()."""
+
+    def __init__(self, fail=False, radius=(0.10, 0.15)):
+        self.fail = fail
+        self.radius = radius
+        self.alive = False
+        self.starts = self.stops = 0
+        self.track_reads = 0
+        self._track = GazeTrack()
+
+    @property
+    def track(self):
+        self.track_reads += 1  # the service looked at the gaze
+        return self._track
+
+    def start(self):
+        if self.fail:
+            raise RuntimeError("the camera is busy")
+        self.alive = True
+        self.starts += 1
+
+    def stop(self):
+        self.alive = False
+        self.stops += 1
+
+    def look(self, u, v, start=1002.5, count=8, confidence=0.9):
+        for i in range(count):
+            self._track.add(GazeSample(start + i * 0.05, u, v, confidence))
+
+
 REFINED = json.dumps({"kind": "command", "text": "Make this twice as tall."})
 
 
@@ -230,6 +297,8 @@ class VoiceTestBase(unittest.TestCase):
         self.editor = FakeSession([TurnResult("Made Chair twice as tall.", False, ["execute_blender_code"])])
         self.editors_made = 0
         self.engine = "parakeet"
+        self.gaze = None  # set a gaze part before build() to give the service one
+        self.gazes_made = 0
 
     def tearDown(self):
         if hasattr(self, "service"):
@@ -240,10 +309,15 @@ class VoiceTestBase(unittest.TestCase):
         self.editors_made += 1
         return self.editor if self.editors_made == 1 else self.next_editor
 
+    def make_gaze(self):
+        self.gazes_made += 1
+        return self.gaze
+
     def build(self, **kwargs):
         factories = Factories(
             bridge=lambda: self.bridge, mic=lambda: self.mic, stt=lambda: self.stt,
             refiner=lambda: self.refiner, editor=self.make_editor,
+            gaze=self.make_gaze if self.gaze is not None else None,
         )
         # The fake mic's audio is stamped 1000.1–1010 and speak() presses at 1002, so the service's
         # clock starts there too; on the real clock every hold would look decades long.
@@ -863,6 +937,388 @@ class VoiceRobustnessTest(VoiceTestBase):
         for _ in range(2):
             record = self.service.say("add a cube")
             wait_for(lambda: self.record(record)["stage"] in ("done", "failed"))
+
+
+# "add blue color there": the clip starts 0.35 s before the key goes down at 1002.0, so "there" is said at 1002.65.
+THERE_WORDS = [
+    {"text": "add", "start": 0.1, "end": 0.3},
+    {"text": "blue", "start": 0.4, "end": 0.6},
+    {"text": "color", "start": 0.6, "end": 0.9},
+    {"text": "there", "start": 1.0, "end": 1.2},
+]
+THERE_REFINED = json.dumps({"kind": "command", "text": "Add blue color there."})
+
+
+class GazeVoiceTest(VoiceTestBase):
+    """Where the person looks, or points with the mouse, reaches the editor as part of the focus."""
+
+    def setUp(self):
+        super().setUp()
+        self.stt = FakeStt(["add blue color there"], words=THERE_WORDS)
+        self.refiner = FakeSession([TurnResult(THERE_REFINED, False)])
+        self.editor = FakeSession([TurnResult("Made the wing blue.", False, ["execute_blender_code"])])
+        self.next_editor = FakeSession()  # for a restart
+        self.gaze = FakeGaze()
+        self.bridge.selected = []
+        self.bridge.pick_reply = lambda points: [EAGLE] * 19 + [PERCH] * 4 + [None]
+
+    def run_gaze(self, mode="on", look=True, source="mouse"):
+        self.build(gaze_mode=mode, gaze_source=source).start()
+        if look:
+            self.gaze.look(0.5, 0.5)
+        return self.speak()
+
+    def asked_gaze(self):
+        return [c for c in self.bridge.calls if c in ("gaze_pick", "gaze_piece")]
+
+    # --- the modes -----------------------------------------------------------------------------
+    def test_on_mode_puts_the_gaze_target_in_the_editors_message(self):
+        record = self.run_gaze("on")
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertEqual(self.editor.sent[0], "\n".join([
+            "Command: Add blue color there.",
+            'Heard: "add blue color there"',
+            'Focus (gaze): "there" at 1.0 s → Eagle (79%), Perch (17%)',
+            "  part: Wing.L · point (0.41, 0.12, 0.73) on face 3120 · connected piece of 480 of 5120 faces",
+            "  gaze is accurate to about 10% of the viewport · selected: nothing",
+        ]))
+        self.assertEqual(record["gaze"]["status"], "resolved")
+        self.assertEqual(self.bridge.pieces[0]["uid"], 116)  # the top guess was looked at closer
+        self.assertEqual(self.bridge.pieces[0]["point"], EAGLE["point"])
+
+    def test_shadow_mode_records_but_doesnt_change_the_focus(self):
+        self.bridge.selected = ["Chair"]
+        record = self.run_gaze("shadow")
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertEqual(self.editor.sent[0], "\n".join([
+            "Command: Add blue color there.",
+            'Heard: "add blue color there"',
+            "Focus: selected Chair (active: Chair) · mode OBJECT · source: selection",
+        ]))
+        self.assertNotIn("gaze", record["focus"])
+        self.assertNotIn("gaze", json.loads(self.refiner.sent[0]))
+        gaze = record["gaze"]
+        self.assertEqual(gaze["targets"][0]["candidates"][0]["name"], "Eagle")
+        self.assertEqual(gaze["targets"][0]["piece"], WING_PIECE)  # what Blender said about the part, without "ok"
+        self.assertIs(gaze["matched_selection"], False)  # it looked at the Eagle, with the Chair selected
+        saved = json.loads((Path(self.tmp.name) / "commands" / record["id"] / "record.json").read_text())
+        self.assertEqual(saved["gaze"], gaze)
+
+    def test_off_mode_never_starts_gaze(self):
+        record = self.run_gaze("off", look=False)
+        self.assertEqual((self.gazes_made, self.gaze.starts, self.gaze.track_reads), (0, 0, 0))
+        self.assertEqual(self.asked_gaze(), [])
+        self.assertIsNone(record["gaze"])
+        self.assertIn("Focus: nothing selected", self.editor.sent[0])
+        self.assertEqual(self.service.snapshot()["gaze"],
+                         {"mode": "off", "source": "mouse", "live": False, "checked": 0, "matched": 0})
+
+    def test_on_mode_without_a_gaze_part_runs_on_the_selection(self):
+        self.gaze = None  # the camera isn't built yet, so there is nothing to start
+        self.bridge.selected = ["Chair"]
+        record = self.run_gaze("on", look=False, source="camera")
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertIn("Focus: selected Chair", self.editor.sent[0])
+        self.assertEqual(self.asked_gaze(), [])
+        self.assertFalse(self.service.snapshot()["gaze"]["live"])
+
+    def test_the_refiner_sees_the_gaze_target_too(self):
+        self.run_gaze("on")
+        message = json.loads(self.refiner.sent[0])
+        self.assertIn("Eagle (79%)", message["gaze"])
+        self.assertIn("Wing.L", message["gaze"])
+        self.assertEqual(message["heard"], "add blue color there")
+        self.assertNotIn("gaze", message["focus"])
+
+    def test_a_command_with_no_pointing_word_skips_gaze(self):
+        self.stt = FakeStt(["add a cube"], words=[{"text": "add", "start": 0.1, "end": 0.3},
+                                                  {"text": "cube", "start": 0.4, "end": 0.7}])
+        record = self.run_gaze("on")
+        self.assertEqual(self.asked_gaze(), [])
+        self.assertIsNone(record["gaze"])
+        self.assertNotIn("(gaze)", self.editor.sent[0])
+
+    def test_word_times_count_from_the_start_of_the_recorded_clip(self):
+        # "there" is the first thing said, 0.1 s into a clip that began 0.35 s before the key went down.
+        self.stt = FakeStt(["there"], words=[{"text": "there", "start": 0.1, "end": 0.3}])
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.gaze.look(0.5, 0.5, start=1001.2)  # the eyes settled before the key was pressed
+        self.speak()
+        self.assertEqual(len(self.bridge.picks), 1)
+
+    def test_the_gaze_reaches_the_editor_even_when_the_selection_cant_be_read(self):
+        self.bridge.selection_unreadable = True
+        record = self.run_gaze("on")
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertTrue(self.editor.sent[0].splitlines()[2].startswith('Focus (gaze): "there"'))
+        self.assertNotIn("selected:", self.editor.sent[0])  # it doesn't know, so it doesn't say "nothing"
+        self.assertEqual(list(record["focus"]), ["gaze"])
+        self.assertIn("Eagle", json.loads(self.refiner.sent[0])["gaze"])
+
+    # --- losing track ----------------------------------------------------------------------------
+    def test_lost_tracking_falls_back_to_the_selection(self):
+        self.bridge.selected = ["Chair"]
+        record = self.run_gaze("on", look=False)
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertIn("Focus: selected Chair", self.editor.sent[0])
+        self.assertNotIn("(gaze)", self.editor.sent[0])
+        self.assertEqual(record["gaze"]["status"], "none")
+        self.assertIsNone(record["gaze"]["matched_selection"])
+        self.assertEqual(self.asked_gaze(), [])  # no samples, so nobody asked Blender anything
+        texts = [text for text, _ in self.bridge.statuses]
+        self.assertTrue(any(t.startswith("Understanding") and "Gaze lost" in t and "your selection" in t
+                            for t in texts), texts)
+        self.assertTrue(any("Gaze lost" in t and t.startswith("Working:") for t in texts), texts)
+
+    def test_lost_tracking_in_shadow_mode_says_nothing(self):
+        record = self.run_gaze("shadow", look=False)
+        self.assertEqual(record["gaze"]["status"], "none")
+        self.assertFalse([text for text, _ in self.bridge.statuses if "Gaze" in text])
+
+    def test_a_dead_socket_during_gaze_doesnt_stop_voice(self):
+        self.bridge.gaze_error = ConnectionResetError("Blender went away")
+        record = self.run_gaze("on")
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertIn("Focus: nothing selected", self.editor.sent[0])
+        self.assertTrue(any("Gaze lost" in text for text, _ in self.bridge.statuses))
+
+    def test_no_3d_viewport_means_no_gaze_but_voice_goes_on(self):
+        self.bridge.pick_reply = None
+        record = self.run_gaze("on")
+        self.assertEqual((record["stage"], record["gaze"]["status"]), ("done", "none"))
+
+    def test_nonsense_from_blender_doesnt_stop_voice(self):
+        self.bridge.pick_reply = lambda points: ["oops"] * len(points)
+        logged = io.StringIO()
+        with contextlib.redirect_stderr(logged):
+            record = self.run_gaze("on")
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertIn("Focus: nothing selected", self.editor.sent[0])
+        self.assertIn("gaze", logged.getvalue().lower())
+        self.assertTrue(any("Gaze" in text for text, _ in self.bridge.statuses))
+
+    def test_a_failed_piece_lookup_still_gives_the_object(self):
+        self.bridge.piece_reply = None
+        record = self.run_gaze("on")
+        self.assertIn('→ Eagle (79%), Perch (17%)\n  point (0.41, 0.12, 0.73)\n', self.editor.sent[0])
+        self.assertNotIn("part:", self.editor.sent[0])
+        self.assertIsNone(record["gaze"]["targets"][0]["piece"])
+
+    # --- starting and stopping --------------------------------------------------------------------
+    def test_gaze_failing_to_start_doesnt_stop_voice(self):
+        self.gaze = FakeGaze(fail=True)
+        self.bridge.selected = ["Chair"]
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.assertEqual(self.service.state, "ready")
+        self.assertFalse(self.gaze.alive)
+        self.assertGreaterEqual(self.gaze.stops, 1)  # whatever half-started was closed
+        self.assertFalse(self.service.snapshot()["gaze"]["live"])
+        self.assertTrue(any("Gaze couldn't start" in text and "the camera is busy" in text and "selection" in text
+                            for text, _ in self.bridge.statuses), self.bridge.statuses)
+        record = self.speak()
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertIn("Focus: selected Chair", self.editor.sent[0])
+        self.assertEqual(self.asked_gaze(), [])
+
+    def test_a_gaze_part_that_cant_even_be_built_doesnt_stop_voice(self):
+        def broken():
+            raise OSError("no camera")
+
+        self.make_gaze = broken
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.assertEqual(self.service.state, "ready")
+        self.assertEqual(self.speak()["stage"], "done")
+
+    def test_gaze_runs_while_voice_is_on_and_stops_with_it(self):
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.assertTrue(self.gaze.alive)
+        self.assertTrue(self.service.snapshot()["gaze"]["live"])
+        self.service.stop()
+        self.assertFalse(self.gaze.alive)
+        self.assertFalse(self.service.snapshot()["gaze"]["live"])
+        self.service.start()
+        self.assertTrue(self.gaze.alive)  # a fresh start opens it again
+
+    def test_stopping_while_gaze_is_starting_turns_voice_off_cleanly(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        class SlowGaze(FakeGaze):
+            def start(self):
+                started.set()
+                release.wait(5)
+                if self.stops:
+                    raise RuntimeError("stopped while starting")
+                super().start()
+
+        self.gaze = SlowGaze()
+        self.build(gaze_mode="on", gaze_source="mouse")
+        starter = threading.Thread(target=self.start_quietly)
+        starter.start()
+        self.assertTrue(started.wait(5))
+        stopper = threading.Thread(target=self.service.stop)
+        stopper.start()
+        time.sleep(0.2)
+        release.set()
+        starter.join(5)
+        stopper.join(5)
+        self.assertEqual(self.service.state, "off")
+        self.assertFalse(self.gaze.alive)
+        self.assertEqual(self.start_error, "Voice was turned off before it finished starting.")
+        self.assertFalse(self.mic.started)
+
+    def start_quietly(self):
+        try:
+            self.service.start()
+        except VoiceError as exc:
+            self.start_error = str(exc)
+
+    def test_starting_voice_clears_any_drawing_left_in_the_viewport(self):
+        for mode in ("off", "on"):
+            self.bridge.shows.clear()
+            self.build(gaze_mode=mode, gaze_source="mouse").start()
+            self.assertEqual(self.bridge.shows, [{"cmd": "gaze_show", "dot": None, "ring": None, "marks": []}], mode)
+            self.service.stop()
+
+    def test_an_old_bridge_that_cant_clear_the_drawing_doesnt_stop_voice(self):
+        self.bridge.gaze_error = ConnectionResetError("reset")
+        self.build().start()
+        self.assertEqual(self.service.state, "ready")
+
+    def test_unity_runs_exactly_as_before(self):
+        self.build(host="unity", gaze_mode="on", gaze_source="mouse").start()
+        self.gaze.look(0.5, 0.5)
+        record = self.speak()
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertEqual((self.gazes_made, self.gaze.starts), (0, 0))
+        self.assertFalse([c for c in self.bridge.calls if c.startswith("gaze_")])
+        self.assertIn("Focus: nothing selected", self.editor.sent[0])
+
+    # --- commands that never use it -----------------------------------------------------------------
+    def test_stop_and_undo_never_touch_gaze(self):
+        self.stt = FakeStt(["undo that", "stop that"], words=[{"text": "that", "start": 0.5, "end": 0.7}])
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.gaze.look(0.5, 0.5, start=1002.5)
+        self.gaze.look(0.5, 0.5, start=1004.5)
+        undone = self.speak(1002.0, 1003.0)
+        stopped = self.speak(1004.0, 1005.0)
+        self.assertEqual((undone["kind"], stopped["kind"]), ("undo", "stop"))
+        self.assertEqual(self.bridge.undos, 1)
+        self.assertEqual(self.asked_gaze(), [])
+        self.assertEqual(self.gaze.track_reads, 0)
+        self.assertEqual((undone["gaze"], stopped["gaze"]), (None, None))
+
+    def test_typed_commands_dont_use_gaze(self):
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.gaze.look(0.5, 0.5)
+        typed = self.service.say("add blue color there")
+        wait_for(lambda: self.record(typed)["stage"] == "done")
+        self.assertEqual(self.asked_gaze(), [])
+        self.assertEqual(self.gaze.track_reads, 0)
+        self.assertIsNone(self.record(typed)["gaze"])
+        self.assertIn("Focus: nothing selected", self.editor.sent[0])
+
+    def test_stop_while_blender_is_being_asked_ends_the_command_before_the_brains(self):
+        asking, release = threading.Event(), threading.Event()
+
+        def slow_pick(points):
+            asking.set()
+            release.wait(5)
+            return [EAGLE] * len(points)
+
+        self.bridge.pick_reply = slow_pick
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.gaze.look(0.5, 0.5)
+        self.service.ptt("down", 1002.0)
+        self.service.ptt("up", 1003.0)
+        spoken = self.last_record()
+        self.assertTrue(asking.wait(5))
+        self.service.say("stop")
+        release.set()
+        wait_for(lambda: self.record(spoken)["stage"] == "stopped")
+        self.assertEqual((self.refiner.sent, self.editor.sent), ([], []))
+
+    # --- how often it agrees with the selection -----------------------------------------------------
+    def test_agreement_with_the_selection_is_counted(self):
+        self.bridge.selected = ["Eagle", "Perch"]
+        self.build(gaze_mode="shadow", gaze_source="mouse").start()
+        self.assertEqual(self.service.snapshot()["gaze"],
+                         {"mode": "shadow", "source": "mouse", "live": True, "checked": 0, "matched": 0})
+        self.gaze.look(0.5, 0.5)
+        record = self.speak()
+        self.assertIs(record["gaze"]["matched_selection"], True)
+        self.assertEqual(self.service.snapshot()["gaze"]["checked"], 1)
+        self.assertEqual(self.service.snapshot()["gaze"]["matched"], 1)
+
+    def test_a_miss_counts_as_checked_but_not_matched(self):
+        self.bridge.selected = ["Chair"]
+        self.run_gaze("shadow")
+        self.assertEqual(self.service.snapshot()["gaze"]["checked"], 1)
+        self.assertEqual(self.service.snapshot()["gaze"]["matched"], 0)
+
+    def test_nothing_selected_or_no_gaze_means_nothing_to_compare(self):
+        record = self.run_gaze("shadow")  # looked at the Eagle with nothing selected
+        self.assertIsNone(record["gaze"]["matched_selection"])
+        self.assertEqual(self.service.snapshot()["gaze"]["checked"], 0)
+
+    def test_the_counts_start_over_with_each_voice_session(self):
+        self.bridge.selected = ["Eagle"]
+        self.run_gaze("shadow")
+        self.assertEqual(self.service.snapshot()["gaze"]["matched"], 1)
+        self.service.stop()
+        self.service.start()
+        self.assertEqual(self.service.snapshot()["gaze"]["checked"], 0)
+
+    # --- the mouse as a stand-in ----------------------------------------------------------------------
+    def test_the_mouse_stands_in_for_gaze(self):
+        self.gaze = PointerTracker()
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.bridge.add("ptt", state="down", t=1002.0)
+        for i in range(8):
+            self.bridge.add("pointer", u=0.4, v=0.3, t=1002.5 + i * 0.05)
+        self.bridge.add("ptt", state="up", t=1003.0)
+        wait_for(lambda: self.service.recent and self.last_record()["stage"] in ("done", "failed"))
+        self.assertEqual(self.last_record()["stage"], "done", self.last_record()["error"])
+        samples = self.gaze.track.between(1002.0, 1003.0)
+        self.assertEqual([(s.t, s.u, s.v, s.confidence) for s in samples],
+                         [(1002.5 + i * 0.05, 0.4, 0.3, 1.0) for i in range(8)])
+        self.assertEqual(self.bridge.picks[0][0], [0.4, 0.3])  # the first ray goes where the pointer was
+        self.assertTrue(all(abs(u - 0.4) <= 0.02 + 1e-9 and abs(v - 0.3) <= 0.03 + 1e-9
+                            for u, v in self.bridge.picks[0]))  # and the rays stay within the mouse's small patch
+        self.assertIn('Focus (gaze): "there"', self.editor.sent[0])
+        self.assertIn("accurate to about 2% of the viewport", self.editor.sent[0])
+
+    def test_a_pointer_tracker_is_a_gaze_part(self):
+        tracker = PointerTracker()
+        self.assertFalse(tracker.alive)
+        tracker.start()
+        self.assertTrue(tracker.alive)
+        tracker.stop()
+        self.assertFalse(tracker.alive)
+        self.assertEqual(tracker.radius, (0.02, 0.03))
+        self.assertIsNone(tracker.track.latest_time)
+
+    def test_a_malformed_pointer_event_is_ignored_and_polling_goes_on(self):
+        self.gaze = PointerTracker()
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.bridge.add("pointer", u="left", v=None, t=1002.5)
+        self.bridge.add("pointer", u=0.4, v=0.3)  # no time
+        self.bridge.add("pointer", u=float("nan"), v=0.3, t=1002.6)
+        self.bridge.add("pointer", u=0.4, v=0.3, t=float("inf"))
+        self.bridge.add("pointer", u=10 ** 400, v=0.3, t=1002.6)  # too big for a float
+        self.bridge.add("pointer", u=0.4, v=0.3, t=1002.7)
+        wait_for(lambda: self.gaze.track.latest_time == 1002.7)
+        self.assertEqual(len(self.gaze.track.between(0, 2000)), 1)
+        self.bridge.add("ptt", state="down", t=1002.0)
+        self.bridge.add("ptt", state="up", t=1003.0)
+        wait_for(lambda: self.service.recent and self.last_record()["stage"] == "done")
+
+    def test_pointer_events_are_dropped_when_nothing_listens_to_them(self):
+        self.build(gaze_mode="off", gaze_source="mouse").start()
+        self.bridge.add("pointer", u=0.4, v=0.3, t=1002.5)
+        self.bridge.add("ptt", state="down", t=1002.0)
+        self.bridge.add("ptt", state="up", t=1003.0)
+        wait_for(lambda: self.service.recent and self.last_record()["stage"] == "done")
 
 
 if __name__ == "__main__":

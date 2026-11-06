@@ -155,7 +155,7 @@ class ControlCenter:
     def _voice_config_now(self, sources: dict[str, str | None]) -> tuple:
         s = self.ctx.settings
         return (s.voice_host, s.unity_mcp_command, s.unity_mcp_args,
-                sources["refiner"], sources["editor"], s.stt_engine, s.mic_device,
+                sources["refiner"], sources["editor"], s.stt_engine, s.mic_device, s.gaze_mode, s.gaze_source,
                 s.editor_model, s.editor_effort, s.editor_api_model, s.editor_api_thinking,
                 s.refiner_model, s.refiner_effort, s.refiner_api_model, s.refiner_api_thinking,
                 json.dumps(s.providers, sort_keys=True))

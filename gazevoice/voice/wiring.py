@@ -14,7 +14,7 @@ from .api_brain import ApiSession, host_mcp
 from .audio import MicError, MicStream, mic_argv
 from .brains import BrainError, ClaudeSession, CodexSession, claude_session_argv
 from .commands import EDITOR_PROMPT, REFINER_PROMPT, UNITY_EDITOR_PROMPT, UNITY_REFINER_PROMPT
-from .service import EDITOR_WARMUP, REFINER_WARMUP, Factories, VoiceService
+from .service import EDITOR_WARMUP, REFINER_WARMUP, Factories, PointerTracker, VoiceService
 from .stt import SpeechService
 
 # unit id, the healths that are good enough, what to call it
@@ -166,6 +166,10 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
                           warmup=REFINER_WARMUP, timeout=90)
         return provider("refiner", source)
 
+    # Gaze is for Blender. The mouse needs no setup; the camera has no part yet, so voice uses the selection.
+    gaze_mode = settings.gaze_mode if host == "blender" else "off"
+    gaze = PointerTracker if gaze_mode != "off" and settings.gaze_source == "mouse" else None
+
     factories = Factories(
         bridge=bridge_factory,
         mic=mic,
@@ -173,5 +177,7 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
         stt=lambda: SpeechService(speech.python, WORKER, engine.key, engine.model, env={"HF_HUB_OFFLINE": "1"}),
         refiner=refiner,
         editor=editor,
+        gaze=gaze,
     )
-    return VoiceService(paths.logs, bus, factories, engine=engine.key, brain=sources["editor"], host=host)
+    return VoiceService(paths.logs, bus, factories, engine=engine.key, brain=sources["editor"], host=host,
+                        gaze_mode=gaze_mode, gaze_source=settings.gaze_source)

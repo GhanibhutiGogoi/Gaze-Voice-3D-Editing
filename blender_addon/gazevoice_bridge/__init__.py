@@ -34,6 +34,8 @@ from . import protocol
 HOST = "127.0.0.1"
 POLL_SECONDS = 0.1
 MAX_HOLD_SECONDS = 60.0
+# Seconds between mouse reports while the key is held. A little over 1/MAX_POINTER_RATE, so none is dropped.
+POINTER_TICK = 0.06
 FRESH_STATUS_SECONDS = 6.0  # a status set this recently shows even while voice is off (the Test key's)
 DEFAULT_KEY = "⌥ Space"
 VOICE_OFF = "Voice is off. Turn it on in the GazeVoice dashboard."
@@ -422,26 +424,45 @@ class GAZEVOICE_OT_push_to_talk(bpy.types.Operator):
         self._key = event.type
         self._started = time.time()
         _queue("ptt", state="down")
-        context.window_manager.modal_handler_add(self)
+        self._report_pointer(context, event)  # where the mouse is as the key goes down
+        manager = context.window_manager
+        # A mouse resting on the part you mean sends no move events, so a timer reports it while the key is held.
+        self._timer = manager.event_timer_add(POINTER_TICK, window=context.window)
+        manager.modal_handler_add(self)
         return {"RUNNING_MODAL"}
+
+    @staticmethod
+    def _report_pointer(context, event):
+        position = _pointer_uv(context, event)
+        if position is not None:
+            _events.add_pointer(*position)  # the mouse stands in for gaze while the key is held
+
+    def _stop_timer(self, context):
+        timer, self._timer = getattr(self, "_timer", None), None
+        if timer is not None:
+            context.window_manager.event_timer_remove(timer)
 
     def modal(self, context, event):
         if event.type == self._key and event.value == "RELEASE":
+            self._stop_timer(context)
             _queue("ptt", state="up")
             return {"FINISHED"}
         if (event.type == "ESC" and event.value == "PRESS") or event.type == "WINDOW_DEACTIVATE":
+            self._stop_timer(context)
             _queue("ptt", state="cancel")  # Esc, or Blender lost focus (the release would never come)
             return {"CANCELLED"}
         if time.time() - self._started > MAX_HOLD_SECONDS:
+            self._stop_timer(context)
             _queue("ptt", state="cancel")  # a key stuck down mustn't send a minute of room audio
             return {"CANCELLED"}
         if event.type == self._key:
             return {"RUNNING_MODAL"}  # swallow key repeats (Space would play the animation)
-        if event.type == "MOUSEMOVE":
-            position = _pointer_uv(context, event)
-            if position is not None:
-                _events.add_pointer(*position)  # the mouse stands in for gaze while the key is held
+        if event.type in ("MOUSEMOVE", "TIMER"):
+            self._report_pointer(context, event)
         return {"PASS_THROUGH"}
+
+    def cancel(self, context):
+        self._stop_timer(context)  # Blender ended the hold some other way, say by loading a file
 
 
 class GAZEVOICE_OT_talk_toggle(bpy.types.Operator):

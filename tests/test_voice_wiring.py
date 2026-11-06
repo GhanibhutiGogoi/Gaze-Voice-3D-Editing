@@ -11,6 +11,7 @@ from gazevoice.voice.api_brain import ApiSession
 from gazevoice.components.microphone import LIST_DEVICES
 from gazevoice.events import EventBus
 from gazevoice.voice.audio import MicError
+from gazevoice.voice.service import PointerTracker
 from gazevoice.voice.wiring import build_voice, voice_readiness
 
 from .helpers import TempCtx
@@ -122,6 +123,38 @@ class BuildVoiceTest(unittest.TestCase):
         with patch("gazevoice.voice.wiring.host_mcp") as host_mcp:
             voice.factories.editor()
         self.assertGreaterEqual(host_mcp.call_args.kwargs["timeout"], 300)
+
+    # --- gaze ---------------------------------------------------------------------------------------
+    def gaze_voice(self, host="blender", **gaze):
+        self.t.ctx.settings = update_settings(self.t.ctx.settings, {"voice_host": host, **gaze})
+        return build_voice(self.t.ctx, EventBus(), {"refiner": "claude", "editor": "claude"})
+
+    def test_gaze_is_off_by_default_and_builds_no_gaze_part(self):
+        voice = build_voice(self.t.ctx, EventBus(), {"refiner": "claude", "editor": "claude"})
+        self.assertIsNone(voice.factories.gaze)
+        self.assertEqual((voice.gaze_mode, voice.gaze_source), ("off", "camera"))
+
+    def test_the_mouse_stands_in_for_gaze_in_both_watching_modes(self):
+        for mode in ("shadow", "on"):
+            voice = self.gaze_voice(gaze_mode=mode, gaze_source="mouse")
+            part = voice.factories.gaze()
+            self.assertIsInstance(part, PointerTracker)
+            self.assertEqual(part.radius, (0.02, 0.03))  # a mouse is nearly exact
+            self.assertEqual((voice.gaze_mode, voice.gaze_source), (mode, "mouse"))
+
+    def test_the_mouse_with_gaze_off_builds_nothing(self):
+        voice = self.gaze_voice(gaze_mode="off", gaze_source="mouse")
+        self.assertIsNone(voice.factories.gaze)
+
+    def test_camera_gaze_builds_no_gaze_part_until_the_camera_exists(self):
+        voice = self.gaze_voice(gaze_mode="on", gaze_source="camera")
+        self.assertIsNone(voice.factories.gaze)  # voice runs on the selection
+        self.assertEqual((voice.gaze_mode, voice.gaze_source), ("on", "camera"))
+
+    def test_unity_never_gets_gaze(self):
+        voice = self.gaze_voice(host="unity", gaze_mode="on", gaze_source="mouse")
+        self.assertIsNone(voice.factories.gaze)
+        self.assertEqual(voice.gaze_mode, "off")
 
     def test_unity_readiness_uses_unity_requirements_not_blender_units(self):
         settings = update_settings(self.t.ctx.settings, {"voice_host": "unity"})

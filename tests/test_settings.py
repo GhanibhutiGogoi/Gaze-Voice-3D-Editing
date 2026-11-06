@@ -31,6 +31,25 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(update_settings(Settings(), {"mic_device": "2"}).mic_device, "2")
         self.assertEqual(update_settings(Settings(mic_device="2"), {"mic_device": ""}).mic_device, "")
 
+    def test_settings_check_the_gaze_values(self):
+        self.assertEqual((Settings().gaze_mode, Settings().gaze_source), ("off", "camera"))
+        for mode in ("off", "shadow", "on"):
+            self.assertEqual(update_settings(Settings(), {"gaze_mode": mode}).gaze_mode, mode)
+        for source in ("camera", "mouse"):
+            self.assertEqual(update_settings(Settings(), {"gaze_source": source}).gaze_source, source)
+        for bad in ({"gaze_mode": "watch"}, {"gaze_mode": True}, {"gaze_source": "eyes"}, {"gaze_source": None}):
+            with self.assertRaises(ValueError, msg=bad):
+                update_settings(Settings(), bad)
+        saved = update_settings(Settings(), {"gaze_mode": "shadow", "gaze_source": "mouse"})
+        save_settings(self.path, saved)
+        self.assertEqual(load_settings(self.path), saved)
+
+    def test_a_bad_gaze_value_in_the_file_is_ignored(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({"gaze_mode": "sometimes", "gaze_source": "mouse"}))
+        loaded = load_settings(self.path)
+        self.assertEqual((loaded.gaze_mode, loaded.gaze_source), ("off", "mouse"))
+
     def test_unity_host_settings_round_trip_and_validate(self):
         settings = update_settings(Settings(), {
             "voice_host": "unity", "unity_mcp_command": "/opt/unity-mcp", "unity_mcp_args": ["serve", "--stdio"]
