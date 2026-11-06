@@ -766,6 +766,12 @@ class CalibrateTest(GazeCase):
         self.calibrate_now()
         self.assertIsNot(self.tracker, first)
 
+    def test_a_key_press_for_voice_survives_a_calibration(self):
+        self.blender.queue.add("ptt", state="down")  # voice with gaze off can run beside this, and it reads these
+        self.calibrate_now()
+        self.assertEqual([event["type"] for event in self.blender.queue.poll(0)], ["ptt"])
+        self.assertEqual(self.blender.dark, [])  # asking without taking still counts as the app being there
+
     def test_calibrating_refuses_while_voice_is_on(self):
         self.t.ctx.camera.take("voice")
         with self.assertRaises(JobError) as caught:
@@ -832,6 +838,11 @@ class RingTest(GazeCase):
         drawn = [e[2] for e in self.events if e[0] == "show"]
         self.assertEqual(drawn[-1], None)
         return drawn[:-1]
+
+    def test_a_key_press_for_voice_survives_a_test(self):
+        self.blender.queue.add("ptt", state="down")
+        self.run_test()
+        self.assertEqual([event["type"] for event in self.blender.queue.poll(0)], ["ptt"])
 
     def test_the_test_ring_follows_the_track(self):
         # Looking at one place, then another, with now and then a stray reading and a blink in between.

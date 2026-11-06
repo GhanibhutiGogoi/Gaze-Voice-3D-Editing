@@ -268,9 +268,26 @@ class BuildVoiceTest(unittest.TestCase):
         self.assertEqual(voice.factories.gaze().view, (1840, 1100))  # the voice loop compares it with Blender's, per command
         self.assertIsNone(self.gaze_voice(gaze_mode="on", gaze_source="mouse").factories.gaze().view)
 
-    def test_voice_and_gaze_calibration_share_one_claim_on_the_camera(self):
+    def test_camera_gaze_shares_one_claim_on_the_camera_with_calibration(self):
+        self.set_up_gaze()
         voice = self.gaze_voice(gaze_mode="on", gaze_source="camera")
         self.assertIs(voice.camera, self.t.ctx.camera)  # the same object the Gaze unit takes before it opens the camera
+
+    def test_voice_that_never_opens_the_camera_makes_no_claim_on_it(self):
+        self.set_up_gaze()
+        for name, chosen in {"gaze off": dict(gaze_mode="off", gaze_source="camera"),
+                             "the mouse": dict(gaze_mode="on", gaze_source="mouse"),
+                             "watching the mouse": dict(gaze_mode="shadow", gaze_source="mouse"),
+                             "unity": dict(host="unity", gaze_mode="on", gaze_source="camera")}.items():
+            with self.subTest(name):
+                self.assertIsNone(self.gaze_voice(**chosen).camera)
+
+    def test_camera_gaze_that_isnt_set_up_makes_no_claim_either(self):
+        self.assertIsNone(self.gaze_voice(gaze_mode="on", gaze_source="camera").camera)
+
+    def test_voice_can_always_see_when_calibration_is_drawing_in_the_viewport(self):
+        for chosen in (dict(gaze_mode="off"), dict(gaze_mode="on", gaze_source="mouse")):
+            self.assertIs(self.gaze_voice(**chosen).overlay, self.t.ctx.camera)
 
     def test_the_mouse_needs_no_calibration_camera_or_install(self):
         voice = self.gaze_voice(gaze_mode="on", gaze_source="mouse")

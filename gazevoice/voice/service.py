@@ -203,6 +203,7 @@ class VoiceService:
         gaze_mode: str = "off",
         gaze_source: str = "camera",
         camera=None,
+        overlay=None,
     ):
         self.logs_dir = Path(logs_dir)
         self.bus = bus
@@ -212,7 +213,11 @@ class VoiceService:
         self.host = host
         self.gaze_mode = gaze_mode  # "off", "shadow" (record only) or "on" (tell the brains)
         self.gaze_source = gaze_source
-        self.camera = camera  # a CameraClaim shared with gaze calibration: voice holds it from start to stop
+        # A CameraClaim shared with gaze calibration, passed only when voice opens the camera: held from start to stop.
+        self.camera = camera
+        # The same claim, only ever read. Voice that doesn't open the camera can run beside a Calibrate or Test, and
+        # they draw in the same viewport, so while one is running voice leaves the drawing alone.
+        self.overlay = overlay
         self.host_label = "Unity" if host == "unity" else "Blender"
         self.busy_wait = UNITY_BUSY_WAIT if host == "unity" else BUSY_WAIT
         self.choice_seconds = CHOICE_SECONDS
@@ -451,6 +456,7 @@ class VoiceService:
         if run.stop.is_set():  # it was stopped while starting, which is why it failed
             raise _Cancelled() from exc
         self._gaze_problem = str(exc) or type(exc).__name__
+        self._give_back_camera()  # nothing has it open now, so Calibrate mustn't be told voice is using it
 
     def _step(self, run: _Run, reason: str) -> None:
         with self._lock:
@@ -1103,15 +1109,21 @@ class VoiceService:
             return None
         return {k: v for k, v in reply.items() if k != "ok"}
 
+    def _calibration_drawing(self) -> bool:
+        """Whether a Calibrate or Test has the viewport: what it draws there isn't voice's to cover or clear."""
+        return self.overlay is not None and self.overlay.holder == "gaze"
+
     def _hide_gaze(self) -> None:
         """Take everything gaze drew (the dot, the ring and the numbers) off the viewport."""
-        self._bridge_call({"cmd": "gaze_show", "dot": None, "ring": None, "marks": []})
+        if not self._calibration_drawing():
+            self._bridge_call({"cmd": "gaze_show", "dot": None, "ring": None, "marks": []})
 
     def _ask_which(self, record: dict, grounding: Grounding, run: _Run) -> Candidate | None:
         """Number the first target's guesses in the viewport and wait for the person to say which one.
 
         Returns the guess they picked. Returns None when they didn't: nothing said within `choice_seconds`, "stop",
-        voice turning off, or Blender unable to draw the numbers. The numbers always come down again.
+        voice turning off, a Calibrate or Test using the viewport, or Blender unable to draw the numbers. The numbers
+        always come down again.
         """
         candidates = grounding.targets[0].candidates[:MAX_CANDIDATES]
         marks = [{"n": n, "u": c.u, "v": c.v, "name": c.name} for n, c in enumerate(candidates, 1)]
@@ -1122,6 +1134,8 @@ class VoiceService:
         try:
             if record["_stop"] or run.stop.is_set():  # looked at after the choice is open, so a stop can't slip between
                 return None
+            if self._calibration_drawing():
+                return None  # the numbers would go over its dot, and its next redraw would take them away
             shown = self._bridge_call({"cmd": "gaze_show", "dot": None, "ring": None, "marks": marks})
             if not (shown and shown.get("ok")):
                 return None  # nobody can answer numbers they can't see

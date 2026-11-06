@@ -156,7 +156,7 @@ Gaze is new. Its accuracy hasn't been measured on a real face yet, and the camer
 
 1. **Update the Bridge.** Press *Update add-on* on the Bridge unit (or *Install add-on*, if it isn't there yet), then restart Blender. Gaze needs Bridge v0.3.0.
 2. **Install gaze.** Press *Install gaze* on the Gaze unit. It asks first, then sets up its own Python environment and downloads about 340 MB (MediaPipe and its face model). It needs `uv`. Seeing the camera also needs ffmpeg, which the Microphone unit installs.
-3. **Calibrate.** Open Blender with a 3D viewport showing, make sure voice is off, then press *Calibrate*. It asks first, then opens the camera for about 40 seconds.
+3. **Calibrate.** Open Blender with a 3D viewport showing, then press *Calibrate*. If voice is on and using the camera, turn it off first. It asks first, then opens the camera for about 40 seconds.
    - Look at each dot in Blender until it moves. Nine dots teach it, then five more check how well it learned.
    - Sit about an arm's length from the screen and keep your head fairly still.
    - The first time, macOS may ask to allow the camera.
@@ -186,7 +186,7 @@ Stop and start voice after you change any of them.
 
 ### The camera
 
-- **When it's on.** While voice is on with **Gaze** set to Watch only or On and **Gaze source** set to Camera. Also for the length of *Calibrate* or *Test*, once you've confirmed. Those two won't run while voice is on. With Gaze Off, or on Mouse, voice never opens it.
+- **When it's on.** While voice is on with **Gaze** set to Watch only or On and **Gaze source** set to Camera. Also for the length of *Calibrate* or *Test*, once you've confirmed. Those two won't run while voice is using the camera. With Gaze Off, or on Mouse, voice never opens it, and they can run while voice is on. Voice then doesn't draw over them: if it would need to ask you to pick a number, it uses your selection instead.
 - **What stays on this Mac.** Frames are processed on this Mac and aren't saved or sent. GazeVoice reads one at a time, finds where your eyes point and drops it. It keeps only the last 30 seconds of where you looked, as screen positions in memory, and your calibration, which is numbers only.
 - **What leaves.** What you looked at reaches the editor as text with your command: object and part names, and how sure gaze was. It goes where your commands go, so with an API provider it goes to that company's servers, as your selection does. Command records on this Mac keep what gaze found, as names and numbers, never an image.
 

@@ -2,9 +2,10 @@
 Its card also holds the check that pictures of the viewport get cleaned up (see voice/picture.py).
 
 The unit never opens the camera to check on it. It lists the cameras through the Microphone unit's cached
-listing, which only reads the names. The camera is opened by the gaze worker, and only while voice runs, or
-while the person presses Calibrate or Test and has confirmed it. Those two take the camera for the length of
-the job and give it back whatever happens, and they can't run while voice is on (see CameraClaim).
+listing, which only reads the names. The camera is opened by the gaze worker, and only while voice runs with
+camera gaze, or while the person presses Calibrate or Test and has confirmed it. Those two take the camera for the
+length of the job and give it back whatever happens, and they can't run while voice is using it (see CameraClaim).
+Voice that isn't using the camera can run beside them, and leaves their drawing alone (see VoiceService.overlay).
 """
 
 from __future__ import annotations
@@ -335,8 +336,9 @@ class Gaze(Component):
 
     def _poll(self, client) -> None:
         """Tell the add-on the app is here. It draws gaze dots and rings only while it is being polled (the way voice
-        polls it), so that nothing is left on the viewport with nobody to take it down. Voice is off now, so we poll."""
-        self._ask_blender(client, {"cmd": "poll"})
+        polls it), so that nothing is left on the viewport with nobody to take it down. Voice may be on as well, if it
+        isn't using the camera, so this acknowledges nothing: key presses stay queued for voice to read."""
+        self._ask_blender(client, {"cmd": "poll", "ack": 0})
 
     def _show(self, client, dot: list[float] | None = None, ring: list[float] | None = None) -> None:
         """Ask Blender to show a dot and/or a ring on its viewport; with neither, to clear it."""

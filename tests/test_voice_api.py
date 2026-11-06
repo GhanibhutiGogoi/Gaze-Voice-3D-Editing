@@ -230,20 +230,48 @@ class VoiceApiTest(unittest.TestCase):
     def test_changing_the_camera_while_voice_is_on_asks_for_a_restart(self):
         self.asks_for_a_restart_after({"camera_device": "MacBook Air Camera"})
 
-    def test_gaze_becoming_usable_while_voice_is_on_asks_for_a_restart(self):
-        self.start_server()
-        _, body = self.post("/api/voice/start")
-        self.center.jobs.wait(body["job"]["id"], 5)
-        self.assertFalse(self.get("/api/state")[1]["voice"]["needs_restart"])
+    def install_gaze_but_for_the_calibration(self):
         paths = self.t.paths
         python = paths.venvs / "gaze" / "bin" / "python"
         python.parent.mkdir(parents=True)
         python.write_text("")
         paths.gaze_model_file.parent.mkdir(parents=True, exist_ok=True)
         paths.gaze_model_file.write_bytes(b"model")
+
+    def test_gaze_becoming_usable_while_voice_is_on_asks_for_a_restart(self):
+        self.start_server()
+        self.center.update_settings({"gaze_mode": "on"})
+        _, body = self.post("/api/voice/start")
+        self.center.jobs.wait(body["job"]["id"], 5)
+        self.assertFalse(self.get("/api/state")[1]["voice"]["needs_restart"])
+        self.install_gaze_but_for_the_calibration()
         self.assertFalse(self.get("/api/state")[1]["voice"]["needs_restart"])  # not calibrated yet
-        paths.gaze_calibration.write_text("{}")  # installed and calibrated: gaze can join voice now
+        self.t.paths.gaze_calibration.write_text("{}")  # installed and calibrated: gaze can join voice now
         self.assertTrue(self.get("/api/state")[1]["voice"]["needs_restart"])
+
+    def calibrating_beside_voice_asks_for_no_restart(self, chosen):
+        self.start_server()
+        self.center.update_settings(chosen)
+        self.install_gaze_but_for_the_calibration()
+        _, body = self.post("/api/voice/start")
+        self.center.jobs.wait(body["job"]["id"], 5)
+        self.t.paths.gaze_calibration.write_text("{}")  # what a finished Calibrate leaves
+        self.assertFalse(self.get("/api/state")[1]["voice"]["needs_restart"])
+
+    def test_a_calibrate_beside_gaze_off_voice_asks_for_no_restart(self):
+        self.calibrating_beside_voice_asks_for_no_restart({"gaze_mode": "off"})
+
+    def test_a_calibrate_beside_mouse_voice_asks_for_no_restart(self):
+        self.calibrating_beside_voice_asks_for_no_restart({"gaze_mode": "on", "gaze_source": "mouse"})
+
+    def test_a_calibration_means_nothing_to_unity_voice(self):
+        self.start_server()
+        self.center.update_settings({"voice_host": "unity", "gaze_mode": "on"})
+        self.install_gaze_but_for_the_calibration()
+        sources = {"refiner": "claude", "editor": "claude"}
+        before = self.center._voice_config_now(sources)
+        self.t.paths.gaze_calibration.write_text("{}")
+        self.assertEqual(self.center._voice_config_now(sources), before)
 
     def test_changing_a_source_asks_for_a_restart(self):
         self.start_server()

@@ -208,4 +208,5 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
         pictures=pictures if host == "blender" else None,
     )
     return VoiceService(paths.logs, bus, factories, engine=engine.key, brain=sources["editor"], host=host,
-                        gaze_mode=gaze_mode, gaze_source=settings.gaze_source, camera=ctx.camera)
+                        gaze_mode=gaze_mode, gaze_source=settings.gaze_source,
+                        camera=ctx.camera if gaze is camera_gaze else None, overlay=ctx.camera)

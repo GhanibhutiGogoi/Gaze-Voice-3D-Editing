@@ -737,6 +737,25 @@ class CameraSharingTest(VoiceTestBase):
         except VoiceError:
             pass
 
+    def test_a_gaze_that_cant_start_leaves_the_camera_free_to_calibrate(self):
+        self.gaze = FakeGaze(fail=True)
+        self.build(gaze_mode="on", gaze_source="camera", camera=self.camera).start()
+        self.assertEqual(self.service.state, "ready")
+        self.assertIsNone(self.camera.holder)  # or Calibrate would say voice is using a camera nothing has open
+        self.assertIsNone(self.camera.take("gaze"))
+        self.service.stop()
+        self.assertEqual(self.camera.holder, "gaze")  # stopping voice leaves a Calibrate that started since alone
+
+    def test_a_gaze_part_that_cant_be_built_leaves_the_camera_free_too(self):
+        def no_camera():
+            raise OSError("That camera isn't connected.")
+
+        self.gaze = FakeGaze()
+        self.make_gaze = no_camera
+        self.build(gaze_mode="on", gaze_source="camera", camera=self.camera).start()
+        self.assertEqual(self.service.state, "ready")
+        self.assertIsNone(self.camera.holder)
+
     def test_stopping_after_a_failed_start_gives_nothing_back_twice(self):
         self.mic = FakeMic(fail=True)
         with self.assertRaises(VoiceError):
@@ -1917,6 +1936,42 @@ class GazeChoiceTest(VoiceTestBase):
         wait_for(lambda: spoken["stage"] == "done")
         self.assertEqual(self.bridge.shows[-1], CLEARED)
         self.assertEqual(len(self.labelled()), 1)
+
+    # --- beside a Calibrate or a Test, which voice on the mouse doesn't have to wait for ---------------------
+    def beside_calibration(self, seconds=30.0):
+        self.claim = CameraClaim()
+        self.claim.take("gaze")  # a Calibrate or a Test is running, and drawing in the viewport
+        self.bridge.selected = ["Chair"]
+        service = self.build(gaze_mode="on", gaze_source="mouse", overlay=self.claim)
+        service.choice_seconds = seconds
+        service.start()
+        self.gaze.look(0.5, 0.5, start=1001.6, count=30)
+
+    def test_numbers_are_not_drawn_over_a_calibrate_or_a_test(self):
+        self.beside_calibration()
+        record = self.speak()  # it doesn't sit out the 30 seconds either: nobody could answer
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertEqual(self.bridge.shows, [])  # its dot was neither covered, nor cleared
+        self.assertIn("Focus: selected Chair", self.editor.sent[0])
+
+    def test_voice_starting_during_a_calibrate_leaves_its_dot_on_screen(self):
+        self.beside_calibration()
+        self.assertEqual(self.bridge.shows, [])
+
+    def test_numbers_are_back_once_the_calibrate_is_over(self):
+        self.beside_calibration()
+        self.claim.release("gaze")
+        self.hold()
+        self.wait_for_labels()
+
+    def test_camera_gaze_holding_the_camera_itself_still_gets_its_numbers(self):
+        claim = CameraClaim()
+        service = self.build(gaze_mode="on", gaze_source="camera", camera=claim, overlay=claim)
+        service.start()
+        self.assertEqual(claim.holder, "voice")
+        self.gaze.look(0.5, 0.5, start=1001.6, count=30)
+        self.hold()
+        self.wait_for_labels()
 
     # --- watching only -----------------------------------------------------------------------------------
     def test_shadow_mode_never_asks(self):
