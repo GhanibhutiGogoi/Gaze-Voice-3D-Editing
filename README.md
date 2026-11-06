@@ -1,16 +1,17 @@
 # Gaze-Voice-3D-Editing
 
-GazeVoice lets you edit Blender or Unity scenes by talking now, and by looking later, without an AI chat window.
+GazeVoice lets you edit Blender or Unity scenes by talking, and in Blender by looking too, without an AI chat window.
 
 - **Voice:** your speech is transcribed on your Mac and cleaned up into one clear instruction. Claude Code, Codex or a configured API provider edits the selected host through MCP.
-- **Focus:** each command carries what you're focused on, so edits stay scoped to it. For now that's your selection; later it will be your gaze.
+- **Focus:** each command carries what you're focused on, so edits stay scoped to it. That's your selection, or in Blender, what you were looking at when you said "this" or "there" (see [Use gaze](#use-gaze)).
 
-**Status:** two stages are built:
+**Status:** three stages are built:
 
 - **The control center:** a local dashboard that installs each piece, connects them and checks that the whole workflow is ready.
 - **The voice loop:** hold to talk in Blender or Unity, say what you want, and release to edit. The chain runs hold-to-talk → speech-to-text → cleanup → editor → one undo step.
+- **Gaze in Blender:** look at what you mean and say "this" or "there". It's built, but it hasn't been run with a real camera yet, so how accurate it is on a real face isn't known. Unity doesn't have it.
 
-Gaze comes later. See [the design](docs/superpowers/specs/2026-10-18-gazevoice-design.md), [the control center plan](docs/superpowers/plans/2026-10-18-control-center.md) and [the voice loop plan](docs/superpowers/plans/2026-10-19-voice-loop.md).
+See [the design](docs/superpowers/specs/2026-10-18-gazevoice-design.md), [the control center plan](docs/superpowers/plans/2026-10-18-control-center.md), [the voice loop plan](docs/superpowers/plans/2026-10-19-voice-loop.md), [the gaze plan](docs/superpowers/plans/2026-11-06-gaze-blender.md) and [the gaze proposal](docs/gaze/Gaze_Recommended_Solution.md).
 
 ## Start the control center
 
@@ -23,17 +24,18 @@ It needs only macOS on Apple silicon and Python 3.12 or newer. Nothing gets inst
 
 ## Setting up, unit by unit
 
-Every unit shows its real state on this Mac. Nothing installs, records audio or uses your Claude/Codex plan until you press its key. Keys that need consent ask first, right on the unit.
+Every unit shows its real state on this Mac. Nothing installs, records audio, opens the camera or uses your Claude/Codex plan until you press its key. Keys that need consent ask first, right on the unit.
 
 1. **Blender:** *Install Blender* (Homebrew), then *Launch*. Launch turns on online access, which the MCP add-on needs to start.
 2. **Blender MCP add-on:** *Install add-on* downloads Blender Lab's official add-on (v1.0.3). After installing, quit Blender and *Launch* it again.
 3. **Blender MCP server:** *Install server* downloads Blender Lab's server and installs its packages with `uv`. *Test* lists its tools and, if Blender is open, reads the scene.
-4. **GazeVoice Bridge:** *Install add-on* adds our small Blender add-on (v0.3.0). It gives Blender the hold-to-talk key and a GazeVoice tab in the sidebar, shares your selection, and shows a status line in the viewport. If you installed an older version, the unit says *Update add-on*. Restart Blender after installing or updating.
+4. **GazeVoice Bridge:** *Install add-on* adds our small Blender add-on (v0.3.0). It gives Blender the hold-to-talk key and a GazeVoice tab in the sidebar, shares your selection, shows a status line in the viewport, and for gaze says what's under a point in the viewport and draws the dot, ring and numbered labels. If you installed an older version, the unit says *Update add-on*. Restart Blender after installing or updating.
 5. **Speech-to-text:** *Install* sets up Parakeet (or Whisper, chosen in Routing) in its own Python environment and downloads the model. *Test* transcribes a clip spoken by macOS.
 6. **Microphone:** *Test* records 3 seconds. If it hears silence, allow the app you started GazeVoice from in System Settings › Privacy & Security › Microphone.
 7. **Claude Code / Codex:** detected automatically, using whatever login they already have. GazeVoice never asks for a key for these two. *Test* and *Connect to Blender* each spend a little of your plan.
 8. **DeepSeek, Qwen or a custom API** (optional): see [Use DeepSeek, Qwen or another API](#use-deepseek-qwen-or-another-api).
-9. **Check everything** runs every test from left to right and lights up the signal path.
+9. **Gaze** (optional, Blender only): *Install gaze* sets up gaze tracking in its own Python environment and downloads about 340 MB. *Calibrate* and *Test* open the camera after you confirm. See [Use gaze](#use-gaze).
+10. **Check everything** runs every test from left to right and lights up the signal path. It doesn't include the Gaze unit.
 
 ## Talk to Blender
 
@@ -127,6 +129,7 @@ For animals, people and other organic shapes, the editor can build the model in 
 
 - The mic is open only while voice is on.
 - Audio and command records are saved in GazeVoice's local logs folder.
+- The camera is used only by gaze: while voice is on with gaze turned on, and while you calibrate or test it. See [Use gaze](#use-gaze).
 - Claude Code runs with session saving off, so your commands don't appear in its history.
 - Codex keeps its own history of the commands it handled.
 
@@ -142,6 +145,67 @@ On an M4 MacBook Air, measured outside Blender:
 | Editor reply for a lookup | a few seconds |
 
 Real edits take longer with bigger models.
+
+## Use gaze
+
+Gaze lets you look at what you mean, say "make this bigger", and skip the selecting. It's for Blender only for now. Unity, and voice without gaze, work as before.
+
+Gaze is new. Its accuracy hasn't been measured on a real face yet, and the camera, a real calibration and a spoken session with gaze on haven't been run yet. So what follows about how well it will do is what to expect, not a result.
+
+### Set it up
+
+1. **Update the Bridge.** Press *Update add-on* on the Bridge unit (or *Install add-on*, if it isn't there yet), then restart Blender. Gaze needs Bridge v0.3.0.
+2. **Install gaze.** Press *Install gaze* on the Gaze unit. It asks first, then sets up its own Python environment and downloads about 340 MB (MediaPipe and its face model). It needs `uv`. Seeing the camera also needs ffmpeg, which the Microphone unit installs.
+3. **Calibrate.** Open Blender with a 3D viewport showing, make sure voice is off, then press *Calibrate*. It asks first, then opens the camera for about 40 seconds.
+   - Look at each dot in Blender until it moves. Nine dots teach it, then five more check how well it learned.
+   - Sit about an arm's length from the screen and keep your head fairly still.
+   - The first time, macOS may ask to allow the camera.
+   - The unit then shows how far off it typically was, as a share of the viewport. That's measured on five dots you stared at, so real use will probably be looser. A calibration that's typically off by more than a quarter of the viewport isn't saved. Try again.
+4. **Test** (optional). *Test* shows a ring in Blender that follows where you look for about ten seconds.
+5. **Start with Watch only.** In Routing, set **Gaze** to **Watch only**, then start voice. These rows show only when **3D host** is Blender.
+
+Routing has three gaze settings:
+
+- **Gaze:**
+  - **Off** is the default. The camera stays off.
+  - **Watch only** records what you were looking at when you said a pointing word and compares it with your selection. Edits land exactly as they do without gaze, and no pictures are taken. The Voice panel shows how often gaze picked what you had selected, and each command's `record.json` in the logs folder holds what it would have picked. Switch to On once it agrees with you often enough to trust.
+  - **On** passes what you looked at to the editor, along with your command.
+- **Gaze source:** **Camera** is the default. **Mouse** uses the pointer over Blender's 3D viewport while you hold the key. It needs no install or calibration, so it's a way to try gaze first.
+- **Camera:** Auto uses the Mac's own camera, never a phone's. Pick another camera here.
+
+Stop and start voice after you change any of them.
+
+### What to expect from gaze
+
+- **Rough, not a mouse.** A webcam is far less exact than a pointer. Expect a few centimetres on screen at best. That is an expectation, not a measurement.
+- **Objects and big parts.** It's good enough to tell objects apart, and big parts of a model that have a vertex group or a material to call them by. It can't pick a small detail like one vertex, an edge or a small face.
+- **Numbers when it isn't sure.** If two guesses are too close to call, numbered labels appear on the likeliest ones in the viewport and the status line says "Which one? Say the number." Say "two" within eight seconds. Say nothing and the command uses your selection. With nothing selected, the command doesn't run and the status line says "Couldn't tell what you meant. Select it or say its name."
+- **Only pointing words.** "this", "that", "these", "those", "it", "them", "here" and "there" use gaze, and only in a command you speak while holding the talk key. Look at the thing as you say the word. Each pointing word takes its own look, so "move this over there" uses two. A command without a pointing word doesn't use gaze, and if it names something, the name wins.
+- **It falls back, and says so.** If gaze can't help (it couldn't start, lost track of your eyes, found nothing where you looked, or the viewport changed size), the command runs on your selection and the status line says why, such as "Gaze lost, using your selection". Gaze never stops voice and never edits anything itself. Each edit is still one undo step.
+- **Calibrated for one viewport size.** Resize the viewport and the Gaze unit asks you to calibrate again. Until you do, voice uses your selection.
+
+### The camera
+
+- **When it's on.** While voice is on with **Gaze** set to Watch only or On and **Gaze source** set to Camera. Also for the length of *Calibrate* or *Test*, once you've confirmed. Those two won't run while voice is on. With Gaze Off, or on Mouse, voice never opens it.
+- **What stays on this Mac.** Frames are processed on this Mac and aren't saved or sent. GazeVoice reads one at a time, finds where your eyes point and drops it. It keeps only the last 30 seconds of where you looked, as screen positions in memory, and your calibration, which is numbers only.
+- **What leaves.** What you looked at reaches the editor as text with your command: object and part names, and how sure gaze was. It goes where your commands go, so with an API provider it goes to that company's servers, as your selection does. Command records on this Mac keep what gaze found, as names and numbers, never an image.
+
+### Pictures (optional, off by default)
+
+A big part of a model with no vertex group or material has nothing to call it by. With pictures on, gaze takes a closer look at it.
+
+- **What's sent.** A small picture (512 pixels on its long side at most) of just that spot in Blender's 3D viewport, with a ring drawn on it. With it goes a short question holding the pointing word you said and the object's name. It's the viewport, never your camera.
+- **When.** Only with **Gaze** set to On, never in Watch only. Only when you look at a connected piece of 500 or more faces with nothing to name it. Only after you've set **Pictures** to On in Routing and the check below has passed for the Claude Code you have installed.
+- **To whom.** One short-lived Claude Code process, on Haiku 5.5 and with session saving off. It says in a few words what's inside the ring, then exits. Only those words reach the editor, cut to one short plain line. No other step sees a picture, so Codex and API providers behave as before. Pictures go through Claude Code even if another brain does your editing, and need Claude Code logged in.
+- **What it costs.** Each picture uses a little of your Claude plan, and adds time to that command. The picture step gets 20 seconds in all. After that, or if anything about it fails, the command goes on with text only.
+- **How it's cleaned up.** Pictures are deleted from this Mac right after use. Anthropic keeps what's sent under your account's terms. GazeVoice never writes a picture to a file: Blender makes it in memory and drops one nobody reads after 30 seconds, and it goes straight to Claude Code. Pictures never go into logs, command records or the Blender file.
+
+To turn pictures on, set **Pictures** to On in Routing, then press *Check pictures get cleaned up* on the Gaze unit. It asks first and uses a little of your plan. It sends one small random picture the way a real one is sent, waits for Claude Code to exit, then searches this Mac for a copy: Claude Code's folder (`~/.claude`), the temp folders, GazeVoice's folder and wider parts of `~/Library` and `~/.local`. If it finds a copy it says where, leaves the file alone (it may be Claude Code's own) and records no pass. If it can't look somewhere it has to, it records no pass either.
+
+**The limits:**
+
+- The check can't find a copy that has been re-encoded (a JPEG or a resized picture), compressed, wrapped over several lines or escaped. It can't read other users' files or places macOS keeps private, and in the wider places it reads only what it's allowed to, so a copy kept in one it can't read isn't found. A pass means no plain copy turned up where it could look. It doesn't prove none exists.
+- A pass is for one Claude Code version. After `claude update`, pictures turn off by themselves until you check again, and the Gaze unit says so. If a check finds a copy, leave pictures off.
 
 ## Use DeepSeek, Qwen or another API
 
@@ -171,6 +235,8 @@ Good to know:
 | Speech models | `~/.cache/huggingface/` (or `$HF_HOME` if you set it) |
 | Spoken commands (audio.wav + record.json each) | `…/GazeVoice/logs/commands/<time>-<n>/` |
 | Blender add-ons | Blender's `extensions/user_default/` (`mcp`, `gazevoice_bridge`) |
+| Gaze's Python environment | `…/GazeVoice/venvs/gaze/` |
+| Gaze's face model, your calibration (numbers only) and the picture check | `…/GazeVoice/state/` (`face_landmarker.task`, `gaze-calibration.json`, `gaze-picture-check.json`) |
 | API keys for DeepSeek, Qwen and custom providers | macOS Keychain, service "GazeVoice" |
 
 ## Good to know
