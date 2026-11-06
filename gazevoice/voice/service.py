@@ -264,6 +264,7 @@ class VoiceService:
                     "mode": self.gaze_mode,
                     "source": self.gaze_source,
                     "live": self._gaze is not None and bool(self._gaze.alive),
+                    "problem": self._gaze_sentence(),
                     "checked": self._gaze_checked,
                     "matched": self._gaze_matched,
                 },
@@ -314,8 +315,13 @@ class VoiceService:
             if not (busy or reloading) or time.monotonic() > deadline or run.stop.wait(0.25):
                 return reply
 
+    def _camera_on(self) -> bool:
+        gaze = self._gaze
+        return self.gaze_source == "camera" and gaze is not None and bool(gaze.alive)
+
     def _idle_hint(self) -> str:
-        return f"Ready · hold {self.key} to talk"
+        hint = f"Ready · hold {self.key} to talk"
+        return f"{hint} · gaze on" if self._camera_on() else hint
 
     def _status(self, text: str, state: str = "working", revert: bool = False) -> None:
         with self._lock:
@@ -381,8 +387,7 @@ class VoiceService:
         self._publish_state()
         self._status(self._idle_hint(), "idle")
         if self._gaze_problem:
-            problem = f"Gaze couldn't start ({self._gaze_problem}), so voice uses your selection."
-            self._status(problem, "error", revert=True)
+            self._status(self._gaze_sentence(), "error", revert=True)
 
     def _start_parts(self, run: _Run) -> None:
         bridge = self.factories.bridge()
@@ -451,6 +456,11 @@ class VoiceService:
         with self._lock:
             if not run.stop.is_set():
                 self._pictures = part
+
+    def _gaze_sentence(self) -> str:
+        """Why gaze didn't start, as the person reads it. Empty when it did, or wasn't asked to."""
+        problem = self._gaze_problem
+        return f"Gaze couldn't start ({problem}), so voice uses your selection." if problem else ""
 
     def _gaze_unavailable(self, run: _Run, exc: Exception) -> None:
         if run.stop.is_set():  # it was stopped while starting, which is why it failed

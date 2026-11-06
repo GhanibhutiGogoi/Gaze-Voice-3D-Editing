@@ -5,8 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from gazevoice.probes import ProbeTimedOut
 from gazevoice.providers import KeyStore, preset
+from gazevoice.runner import TIMED_OUT
 from gazevoice.settings import update_settings
 from gazevoice.voice.api_brain import ApiSession
 
@@ -23,6 +23,7 @@ from gazevoice.voice.wiring import build_voice, voice_readiness
 
 from .helpers import TempCtx
 from .test_gaze_tracker import a_calibration
+from .test_voice_service import FakeBridge, FakeMic, FakeSession, FakeStt
 
 
 def listing(*names, cameras=("FaceTime HD Camera",)):
@@ -154,7 +155,7 @@ class BuildVoiceTest(unittest.TestCase):
         voice = self.gaze_voice(gaze_mode="off", gaze_source="mouse")
         self.assertIsNone(voice.factories.gaze)
 
-    def test_camera_gaze_builds_no_gaze_part_until_the_camera_exists(self):
+    def test_camera_gaze_builds_no_gaze_part_until_gaze_is_installed(self):
         voice = self.gaze_voice(gaze_mode="on", gaze_source="camera")
         self.assertIsNone(voice.factories.gaze)  # voice runs on the selection
         self.assertEqual((voice.gaze_mode, voice.gaze_source), ("on", "camera"))
@@ -247,20 +248,58 @@ class BuildVoiceTest(unittest.TestCase):
                 self.set_up_gaze(**missing)
                 self.assertIsNone(self.gaze_voice(gaze_mode="on", gaze_source="camera").factories.gaze)
 
-    def test_without_a_camera_gaze_is_not_built(self):
+    def test_without_a_camera_gaze_is_built_and_says_why_when_voice_starts(self):
         self.set_up_gaze()
         for name, cameras in {"no camera": (), "only a phone": ("Nokia Unbreakable V Camera", "Capture screen 0")}.items():
             with self.subTest(name):
                 self.new_camera_listing(*cameras)
-                self.assertIsNone(self.gaze_voice(gaze_mode="on", gaze_source="camera").factories.gaze)
+                voice = self.gaze_voice(gaze_mode="on", gaze_source="camera")
+                with self.assertRaisesRegex(GazeError, "isn't connected"):
+                    voice.factories.gaze()
 
-    def test_a_slow_camera_listing_does_not_decide_it_gaze_is_asked_again_at_start(self):
+    def plugged_in_later(self):
+        """A voice built with no camera, then one plugged in, with no time for the cached listing to run out."""
         self.set_up_gaze()
-        self.t.runner.add(LIST_DEVICES, returncode=124, stderr="ffmpeg: timed out after 10s")
+        self.new_camera_listing()
+        voice = self.gaze_voice(gaze_mode="on", gaze_source="camera")
+        with self.assertRaises(GazeError):
+            voice.factories.gaze()
+        self.t.runner.add(LIST_DEVICES, stderr=listing("MacBook Air Microphone", cameras=("MacBook Air Camera",)))
+        return voice
+
+    def test_a_camera_plugged_in_after_the_build_is_found_when_voice_starts_again(self):
+        self.assertEqual(self.plugged_in_later().factories.gaze().argv[4], "0")
+
+    def fake_parts(self, voice):
+        bridge = FakeBridge()
+        voice.factories = dataclasses.replace(
+            voice.factories, bridge=lambda: bridge, mic=FakeMic, stt=lambda: FakeStt([]),
+            refiner=FakeSession, editor=FakeSession)
+        self.addCleanup(voice.stop)
+        return bridge
+
+    def test_voice_starts_without_gaze_when_the_camera_is_missing_and_says_why(self):
+        self.set_up_gaze()
+        self.new_camera_listing()
+        voice = self.gaze_voice(gaze_mode="on", gaze_source="camera")
+        bridge = self.fake_parts(voice)
+        voice.start()
+        self.assertEqual(voice.state, "ready")
+        self.assertFalse(voice.snapshot()["gaze"]["live"])
+        self.assertIn("isn't connected", voice.snapshot()["gaze"]["problem"])
+        self.assertIn("so voice uses your selection", voice.snapshot()["gaze"]["problem"])
+        self.assertTrue(any("isn't connected" in text for text, _ in bridge.statuses))
+        self.assertIsNone(self.t.ctx.camera.holder)  # free, so Calibrate isn't told voice is using it
+
+    def test_a_slow_camera_listing_stops_gaze_not_voice(self):
+        self.set_up_gaze()
+        self.t.runner.add(LIST_DEVICES, returncode=TIMED_OUT, stderr="ffmpeg: timed out after 10s")
         voice = self.gaze_voice(gaze_mode="on", gaze_source="camera")
         self.assertIsNotNone(voice.factories.gaze)
-        with self.assertRaises(ProbeTimedOut):  # the service turns this into "voice uses your selection"
-            voice.factories.gaze()
+        self.fake_parts(voice)
+        voice.start()
+        self.assertEqual(voice.state, "ready")
+        self.assertIn("cameras in time", voice.snapshot()["gaze"]["problem"])
 
     def test_the_viewport_a_camera_was_calibrated_on_goes_with_the_gaze_part(self):
         self.set_up_gaze({**a_calibration(), "view": {"width": 1840, "height": 1100}, "when": 1.0})

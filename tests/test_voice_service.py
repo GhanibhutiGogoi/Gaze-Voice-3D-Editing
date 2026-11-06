@@ -1267,7 +1267,7 @@ class GazeVoiceTest(VoiceTestBase):
         self.assertIsNone(record["gaze"])
         self.assertIn("Focus: nothing selected", self.editor.sent[0])
         self.assertEqual(self.service.snapshot()["gaze"],
-                         {"mode": "off", "source": "mouse", "live": False, "checked": 0, "matched": 0})
+                         {"mode": "off", "source": "mouse", "live": False, "problem": "", "checked": 0, "matched": 0})
 
     def test_on_mode_without_a_gaze_part_runs_on_the_selection(self):
         self.gaze = None  # the camera isn't built yet, so there is nothing to start
@@ -1384,6 +1384,52 @@ class GazeVoiceTest(VoiceTestBase):
         self.build(gaze_mode="on", gaze_source="mouse").start()
         self.assertEqual(self.service.state, "ready")
         self.assertEqual(self.speak()["stage"], "done")
+
+    def test_the_snapshot_says_why_gaze_didnt_start(self):
+        self.gaze = FakeGaze(fail=True)
+        self.build(gaze_mode="on", gaze_source="camera").start()
+        self.assertEqual(self.service.snapshot()["gaze"]["problem"],
+                         "Gaze couldn't start (the camera is busy), so voice uses your selection.")
+        self.service.stop()
+        self.gaze.fail = False
+        self.service.start()
+        self.assertEqual(self.service.snapshot()["gaze"]["problem"], "")  # a start that works clears it
+
+    def test_the_snapshot_has_no_problem_to_report_when_gaze_starts(self):
+        self.build(gaze_mode="on", gaze_source="camera").start()
+        self.assertEqual(self.service.snapshot()["gaze"]["problem"], "")
+
+    def idle_lines(self):
+        return [text for text, state in self.bridge.statuses if state == "idle"]
+
+    def test_the_status_line_says_while_the_camera_is_on(self):
+        self.build(gaze_mode="on", gaze_source="camera").start()
+        self.assertEqual(self.idle_lines()[-1], "Ready · hold ⌥ Space to talk · gaze on")
+
+    def test_watching_only_opens_the_camera_too_so_it_says_so_too(self):
+        self.build(gaze_mode="shadow", gaze_source="camera").start()
+        self.assertEqual(self.idle_lines()[-1], "Ready · hold ⌥ Space to talk · gaze on")
+
+    def test_the_status_line_stops_saying_so_once_the_camera_is_off(self):
+        self.build(gaze_mode="on", gaze_source="camera").start()
+        self.gaze.alive = False  # the worker died
+        self.service.ptt("down", 1002.0)
+        self.service.ptt("cancel", 1002.5)
+        self.assertEqual(self.idle_lines()[-1], "Ready · hold ⌥ Space to talk")
+
+    def test_the_status_line_says_nothing_about_a_camera_nothing_opened(self):
+        for name, kwargs in {"the mouse": dict(gaze_mode="on", gaze_source="mouse"),
+                             "gaze off": dict(gaze_mode="off", gaze_source="camera")}.items():
+            with self.subTest(name):
+                self.bridge.statuses.clear()
+                self.build(**kwargs).start()
+                self.assertEqual(self.idle_lines()[-1], "Ready · hold ⌥ Space to talk")
+                self.service.stop()
+
+    def test_gaze_that_failed_to_start_doesnt_claim_to_be_on(self):
+        self.gaze = FakeGaze(fail=True)
+        self.build(gaze_mode="on", gaze_source="camera").start()
+        self.assertEqual(self.idle_lines()[-1], "Ready · hold ⌥ Space to talk")
 
     def test_gaze_runs_while_voice_is_on_and_stops_with_it(self):
         self.build(gaze_mode="on", gaze_source="mouse").start()
@@ -1595,7 +1641,7 @@ class GazeVoiceTest(VoiceTestBase):
         self.bridge.selected = ["Eagle", "Perch"]
         self.build(gaze_mode="shadow", gaze_source="mouse").start()
         self.assertEqual(self.service.snapshot()["gaze"],
-                         {"mode": "shadow", "source": "mouse", "live": True, "checked": 0, "matched": 0})
+                         {"mode": "shadow", "source": "mouse", "live": True, "problem": "", "checked": 0, "matched": 0})
         self.gaze.look(0.5, 0.5)
         record = self.speak()
         self.assertIs(record["gaze"]["matched_selection"], True)

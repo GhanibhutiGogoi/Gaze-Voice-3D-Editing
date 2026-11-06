@@ -27,6 +27,55 @@ def result_line(result: dict) -> str:
     return json.loads(done.stdout)
 
 
+def run_function(name: str, call: str, stubs: str = ""):
+    """What the real function `name` in app.js returns for the JavaScript expression `call`."""
+    match = re.search(rf"^function {name}\(.*?^\}}\n", APP_JS.read_text(), re.DOTALL | re.MULTILINE)
+    assert match, f"{name} is not where this test expects it"
+    program = f"{stubs}\n{match.group(0)}\nconsole.log(JSON.stringify({call}));\n"
+    done = subprocess.run([NODE, "-e", program], capture_output=True, text=True, timeout=30)
+    assert done.returncode == 0, done.stderr
+    return json.loads(done.stdout)
+
+
+def privacy_note(voice: dict, sources=None) -> str:
+    stubs = (f"const S = {{ state: {{ sources: {json.dumps(sources or {'editor': 'claude'})} }} }};\n"
+             "const providerNames = () => [];\n")
+    return run_function("privacyNote", f"privacyNote({json.dumps(voice)})", stubs)
+
+
+@unittest.skipUnless(NODE, "node isn't installed")
+class PrivacyNoteTest(unittest.TestCase):
+    def test_it_names_the_camera_while_the_camera_is_on(self):
+        note = privacy_note({"gaze": {"live": True, "source": "camera"}})
+        self.assertTrue(note.startswith("The mic and camera are open while voice is on."), note)
+
+    def test_it_names_only_the_mic_otherwise(self):
+        for gaze in ({"live": False, "source": "camera"}, {"live": True, "source": "mouse"}, None):
+            with self.subTest(gaze):
+                voice = {} if gaze is None else {"gaze": gaze}
+                self.assertTrue(privacy_note(voice).startswith("The mic is open while voice is on."))
+
+
+@unittest.skipUnless(NODE, "node isn't installed")
+class GazeProblemTest(unittest.TestCase):
+    PROBLEM = "Gaze couldn't start (That camera isn't connected.), so voice uses your selection."
+
+    def problem(self, voice):
+        return run_function("gazeProblem", f"gazeProblem({json.dumps(voice)})")
+
+    def test_the_reason_gaze_didnt_start_is_shown_while_voice_is_on(self):
+        self.assertEqual(self.problem({"state": "ready", "gaze": {"problem": self.PROBLEM}}), self.PROBLEM)
+
+    def test_nothing_is_shown_with_no_problem_or_once_voice_is_off(self):
+        for voice in ({"state": "ready", "gaze": {"problem": ""}}, {"state": "off", "gaze": {"problem": self.PROBLEM}},
+                      {"state": "ready"}):
+            with self.subTest(voice):
+                self.assertIsNone(self.problem(voice))
+
+    def test_the_voice_panel_shows_it_as_a_warning(self):
+        self.assertRegex(APP_JS.read_text(), r'h\("p", \{ class: "voice-note", "data-tone": "warn", text: gazeProblem\(v\) \}\)')
+
+
 @unittest.skipUnless(NODE, "node isn't installed")
 class ResultLineTest(unittest.TestCase):
     def test_a_passed_picture_check_says_which_claude_code_it_was_for(self):

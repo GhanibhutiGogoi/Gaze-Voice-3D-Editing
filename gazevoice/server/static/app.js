@@ -811,6 +811,7 @@ function renderVoice() {
     if (v.needs_restart) {
       box.append(h("p", { class: "voice-note", "data-tone": "warn", text: "Settings changed. Stop and start voice to use them." }));
     }
+    if (gazeProblem(v)) box.append(h("p", { class: "voice-note", "data-tone": "warn", text: gazeProblem(v) }));
     const agreement = gazeAgreement(v);
     if (agreement) box.append(h("p", { class: "voice-note", text: agreement }));
 
@@ -868,6 +869,11 @@ function gazeAgreement(v) {
   return `Gaze picked what you had selected on ${gaze.matched} of ${plural(gaze.checked, "command")} (${share}%).`;
 }
 
+// Why gaze didn't start, for as long as voice runs without it. Blender's status line says so for only a few seconds.
+function gazeProblem(v) {
+  return (v.state !== "off" && v.state !== "error" && v.gaze && v.gaze.problem) || null;
+}
+
 function providerNames() {
   const sources = (S.state && S.state.sources) || {};
   return [...new Set(Object.values(sources))].map(component).filter((c) => c && c.provider).map((c) => c.name);
@@ -876,7 +882,8 @@ function providerNames() {
 function privacyNote(v) {
   const sources = (S.state && S.state.sources) || {};
   const providers = providerNames();
-  let note = "The mic is open while voice is on. Audio and command records are saved in the app's local logs folder.";
+  const camera = v.gaze && v.gaze.live && v.gaze.source === "camera";
+  let note = `${camera ? "The mic and camera are" : "The mic is"} open while voice is on. Audio and command records are saved in the app's local logs folder.`;
   if (Object.values(sources).includes("codex") || v.brain === "codex") note += " Codex keeps its own history of them.";
   if (providers.length) note += ` Your commands and scene details go to ${providers.join(" and ")}.`;
   return note;

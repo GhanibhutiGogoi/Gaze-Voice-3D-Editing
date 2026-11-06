@@ -138,7 +138,7 @@ class Microphone(Component):
         else:
             listing = self.runner.run(LIST_DEVICES, timeout=10)
             if listing.returncode == TIMED_OUT:
-                raise JobError("macOS didn't list the microphones in time. Try again in a moment.")
+                raise JobError("macOS didn't list the microphones and cameras in time. Try again in a moment.")
         return listing.stderr + listing.stdout
 
     def devices(self, fresh: bool = False) -> list[tuple[str, str]]:
