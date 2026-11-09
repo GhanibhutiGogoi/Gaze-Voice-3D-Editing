@@ -1,14 +1,16 @@
 """Describing a part of the model that has no name, from a picture.
 
 Gaze can tell which object you looked at and, when it has vertex groups or materials, which part. A big mesh with
-neither gives the editor nothing to go on, so a picture of the spot (a crop Blender made in memory, ring drawn on it)
-goes to one short-lived `claude -p` process, which says in a few words what is inside the ring and exits. Only that
-sentence goes any further: the editor, the refiner and every long session never see an image, so Codex and the API
-providers work as before, and nothing is ever resent on a later turn.
+neither gives the editor nothing to go on, so a picture of the spot (a crop Blender made in memory, the gaze bubble
+drawn on it) goes to one short-lived `claude -p` process, which says in a few words what is inside the bubble and
+exits. Only that sentence goes any further: the editor, the refiner and every long session never see an image, so Codex
+and the API providers work as before, and nothing is ever resent on a later turn.
 
-The picture is never written to disk by GazeVoice. It goes to the process over its stdin, as a base64 image block, and
-it lives in this process's memory for as long as the call takes. Anything a model says about a picture is untrusted,
-since the viewport can show any text, so `clean_description` reduces it to a short plain line before it is used.
+The picture is never written to disk by GazeVoice. It goes to the process over its stdin, as a base64 image block. The
+control center also keeps the last 20 pictures it sent (`SentPictures`), in memory only, so the dashboard can show what
+the AI was shown. They are not in any record, log or file. A command's pictures go when it leaves the list of recent
+commands, and all of them when the control center stops. Anything a model says about a picture is untrusted, since the
+viewport can show any text, so `clean_description` reduces it to a short plain line before it is used.
 
 Pictures run only while a check has passed for the installed Claude Code (see leftovers.py): it sends a random picture
 through this same route and searches this Mac for any copy Claude Code kept. The flag that keeps nothing has regressed
@@ -23,6 +25,7 @@ import os
 import tempfile
 import threading
 import time
+from collections import OrderedDict
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
@@ -38,6 +41,9 @@ PICTURE_SECONDS = 20.0  # the whole picture step: the crop and the describer sha
 PICTURE_MODEL = "claude-haiku-5-5"
 PICTURE_RULES = Path(__file__).parent / "prompts" / "picture_rules.md"  # the describer's fixed system prompt
 PICTURE_PROMPT = Path(__file__).parent / "prompts" / "picture.md"  # the question about one picture, with blanks to fill
+PICTURES_KEPT = 20  # how many sent pictures the dashboard can still show; the oldest goes first
+PICTURE_KEEP_BYTES = 2 * 1024 * 1024  # the most one may be: a 512 pixel crop is about 1 MB at most, so this only stops a freak
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 OBJECT_NAME_CHARS = 40  # as much of an object's name as the question carries (the bridge cuts labels at 40 too)
 WORD_CHARS = 20
 
@@ -65,6 +71,48 @@ def _scrub(text: str) -> str:
     """What a process said, fit for a message: one line, with anything that could be a picture cut out."""
     words = (word if len(word) < 40 else "…" for word in one_line(text, 10_000).split())
     return " ".join(words)[:MESSAGE_CHARS]
+
+
+class SentPictures:
+    """The pictures that went to the describer, held in memory so the dashboard can show what the AI was shown.
+
+    Each is filed under the command it came from and which of that command's pointing words it was for. The newest
+    `limit` stay; keeping one more lets the oldest go. They are never written to disk, and they are gone when the control
+    center stops. Several threads may keep and read at once.
+    """
+
+    def __init__(self, limit: int = PICTURES_KEPT):
+        self._limit = limit
+        self._pictures: OrderedDict[tuple[str, int], bytes] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def keep(self, command_id: str, number: int, png: bytes) -> bool:
+        """Hold `png` as the picture for pointing word `number` of command `command_id`. False, keeping nothing, when it
+        isn't PNG bytes of a sensible size."""
+        if not isinstance(png, bytes) or not png.startswith(PNG_SIGNATURE) or len(png) > PICTURE_KEEP_BYTES:
+            return False
+        key = (command_id, number)
+        with self._lock:
+            self._pictures.pop(key, None)  # kept again: it counts once, as the newest
+            self._pictures[key] = png
+            while len(self._pictures) > self._limit:
+                self._pictures.popitem(last=False)
+        return True
+
+    def get(self, command_id: str, number: int) -> bytes | None:
+        """The picture kept for that command and pointing word, or None once it is gone (or never was)."""
+        with self._lock:
+            return self._pictures.get((command_id, number))
+
+    def drop(self, command_id: str) -> None:
+        """Let go of every picture kept for this command. Nothing kept for it is not an error."""
+        with self._lock:
+            for key in [key for key in self._pictures if key[0] == command_id]:
+                del self._pictures[key]
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._pictures)
 
 
 def needs_picture(target: Target) -> bool:
@@ -171,7 +219,7 @@ def describe_crop(
     command: Sequence[str] = ("claude",),
     env: Mapping[str, str] | None = None,
 ) -> str | None:
-    """One short sentence saying what is inside the ring of `png_base64`, a PNG as base64, or None.
+    """One short sentence saying what is inside the bubble of `png_base64`, a PNG as base64, or None.
 
     `word` is what was said and `object_name` what it was looking at. The sentence has been through
     `clean_description`; None also means the describer said "unclear", said nothing, failed, ran out of `timeout`

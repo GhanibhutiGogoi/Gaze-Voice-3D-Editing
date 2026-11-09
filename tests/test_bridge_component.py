@@ -213,6 +213,10 @@ class ManifestTest(unittest.TestCase):
             self.assertIn(needle, text)
         json.dumps(text)  # plain text, no surprises
 
+    def test_the_app_expects_the_version_the_add_on_says_it_is(self):
+        # The app wants an exact match, so a version raised on one side only would ask for an update nobody can make.
+        self.assertEqual(protocol.handle({"cmd": "ping"}, FakeScene(), protocol.EventQueue())["bridge"], BRIDGE_VERSION)
+
 
 if __name__ == "__main__":
     unittest.main()

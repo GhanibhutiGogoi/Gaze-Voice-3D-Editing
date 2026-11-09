@@ -46,8 +46,8 @@ LLM 3D editing today works from the prompt alone. GazeVoice also passes focus co
 - **Consent:**
   - Installs, downloads, mic recordings, camera use and model calls only happen when the user clicks.
   - Actions marked "uses your plan" spend Claude or Codex usage.
-- **Camera:** it's open only while voice is on with gaze turned on, and during a confirmed Calibrate or Test. Frames are processed on the Mac and aren't saved or sent.
-- **Pictures:** off by default. A picture of the Blender viewport (never the camera) goes only to Claude Code, and only after a check that it gets cleaned up has passed for the installed Claude Code version.
+- **Camera:** it's open only while voice is on with gaze turned on, and during a Calibrate you start on its page or a confirmed Test. Frames are processed on the Mac and aren't saved or sent.
+- **Pictures:** off by default. A picture of the Blender viewport (never the camera) goes only to Claude Code, and only after a check that it gets cleaned up has passed for the installed Claude Code version. The dashboard keeps the last 20 in memory to show you what the AI saw, never on disk.
 - **Gaze is rough:** we expect it to tell objects and big parts apart, not small details. When it isn't sure it numbers its guesses, and when it can't help the command uses the selection.
 - **No key prompts:** it never asks for an API key.
 - **Self-contained:** the server uses only Python's standard library. The page uses no CDN and no web fonts, so it works offline.
@@ -60,7 +60,7 @@ None yet. The user wants it to "feel more like a plugin tool instead of bare bon
 
 ## Evidence on Hand
 
-There are no logos, screenshots or brand assets. Don't invent users, metrics, testimonials or capabilities. Gaze accuracy hasn't been measured on a real face yet, so don't quote a figure for it.
+There are no logos, screenshots or brand assets. Don't invent users, metrics, testimonials or capabilities. The latest real gaze calibration (2026-11-09) measured about 23% of the screen, so don't quote an accuracy figure for it as if it were settled.
 
 ## Product Principles
 

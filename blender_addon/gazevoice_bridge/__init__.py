@@ -10,9 +10,11 @@
 - Answers what is under a point in the largest 3D viewport and what part of the model
   that is, draws the app's gaze dot, ring and numbered marks there, and while the key is
   held reports the mouse as a stand-in for gaze. None of that edits the scene.
+- Shows a see-through, gliding bubble in that viewport wherever the app says the person is looking, while voice
+  runs with camera gaze. It is drawn on top of the viewport and edits nothing.
 - Can hand the app a picture of the part of the viewport around a target that has no name,
-  with a ring drawn on it. It is taken from the GPU's memory, held in memory until the app reads
-  it once, and never written to a file.
+  with the same bubble drawn on it. It is taken from the GPU's memory, held in memory until the app
+  reads it once, and never written to a file.
 
 Listens on 127.0.0.1 only. A bpy timer polls a non-blocking socket, so all
 scene access happens on Blender's main thread.
@@ -21,6 +23,7 @@ scene access happens on Blender's main thread.
 from __future__ import annotations
 
 import math
+import os
 import socket
 import time
 
@@ -62,6 +65,22 @@ MARK_RADIUS = 12
 RING_WIDTH = 2.5
 CIRCLE_STEPS = 48
 CROP_TICK = 0.05  # seconds between repaint requests while a crop waits for the viewport to draw
+# The live gaze marker: a see-through bubble that glides after the eyes, like the ones in eye-tracking videos. All of
+# its look is here and in _draw_marker.
+MARKER_SIZE = 90  # points across: the same on any display
+MARKER_COLOR = tuple(c / 255 for c in protocol.BUBBLE_COLOR)  # aqua, the same as the bubble on a picture
+# A deep teal just outside the rim: it shows on a light part of the scene, and on a dark one it all but disappears,
+# where the aqua shows instead.
+MARKER_EDGE_COLOR = (0.0, 0.30, 0.26)
+# How the bubble looks from its middle out to its edge, as (share of the radius, colour, opacity), blended smoothly
+# from one to the next: faint all over, a faint rim near the edge, and fading to nothing at the edge itself, so it is
+# soft. Nowhere strong enough to hide the model under it.
+MARKER_PROFILE = ((0.0, MARKER_COLOR, 0.05), (0.60, MARKER_COLOR, 0.07), (0.82, MARKER_COLOR, 0.24),
+                  (0.89, MARKER_COLOR, 0.28), (0.95, MARKER_EDGE_COLOR, 0.16), (1.0, MARKER_EDGE_COLOR, 0.0))
+MARKER_STEPS = 96  # points round its outline: it is big enough that fewer would show corners
+MARKER_STRETCH_POINTS = 90.0  # moving this many points a step (its own width) stretches it to twice as long
+MARKER_MAX_STRETCH = 0.45  # and it never gets more than this much longer
+MARKER_TRAIL = 0.4  # how far back along its way a stretched bubble reaches, as a share of the stretch
 
 _server: socket.socket | None = None
 _clients: dict[socket.socket, bytearray] = {}
@@ -69,8 +88,11 @@ _events = protocol.EventQueue()
 _status = {"text": "", "state": "idle", "last": "", "at": 0.0}
 _changed = {"since_mark": True}
 _shown = {"status": False, "live": False}  # what the viewport and sidebar last showed
-_gaze = {"dot": None, "ring": None, "marks": []}  # what the app asked to have drawn
+_gaze = {"dot": None, "ring": None, "marks": [], "marker": None}  # what the app asked to have drawn
+_marker_glide = protocol.MarkerGlide()  # where the marker is drawn now, on its way to _gaze["marker"]
+_marker_repaints = protocol.Repaints()  # when it may ask the viewport to repaint
 _draw_handle = None
+_marker_fault = {"said": False}  # whether a failure to draw the marker has been printed yet
 _crop = protocol.CropSlot()  # the picture asked for with gaze_crop, until the app reads it
 _crop_job = {"handle": None, "wanted": None}  # its one-off draw handler, and (u, v, radius, size)
 _addon_keymaps: list = []
@@ -152,6 +174,12 @@ def _target():
     return best
 
 
+def _pixels_per_point(window) -> int:
+    """How many pixels make one point of the window's own size: 2 on a Retina screen."""
+    across = max(area.x + area.width for area in window.screen.areas)  # in pixels; window.width is in points
+    return max(1, round(across / window.width))
+
+
 def _mirrored_points(obj, local: Vector) -> list[Vector]:
     """`local` (a point in obj's space) and where it lands reflected across the planes of obj's Mirror modifiers,
     in every combination: a mirrored copy of the mesh is where the evaluated surface is, not the original's."""
@@ -195,9 +223,32 @@ def _crop_tick() -> float | None:
     return POLL_SECONDS if state == "ready" else None  # None unregisters the timer
 
 
+def _marker_tick() -> float | None:
+    """A timer, alive only while the gaze marker is showing, fading or waiting for its last repaint: it moves the marker
+    one step towards where the app says the eyes are, and asks the gaze viewport (only that one, and only its main
+    region) to repaint when what is drawn has changed. A repaint draws the whole 3D view again, so `_marker_repaints`
+    lets only one wait at a time, and no sooner after one than that one took to draw."""
+    if not _events.live():  # the app is gone: it isn't there to say the eyes have moved on
+        _gaze["marker"] = None
+        _marker_glide.reset()
+        changed = True
+    else:
+        changed = _marker_glide.step(_gaze["marker"])
+    target = _target()
+    if target is not None:
+        if changed:
+            _marker_repaints.want()
+        if _marker_repaints.ask(time.monotonic()):
+            target[2].tag_redraw()
+    if _gaze["marker"] is not None or _marker_glide.showing or (target is not None and _marker_repaints.pending):
+        return protocol.MARKER_TICK
+    return None  # unregisters the timer
+
+
 def _crop_png(context, u: float, v: float, radius: list[float], size: int) -> bytes:
-    """Draw the viewport into an offscreen buffer, cut out the box around the ring, scale it so its long side is `size`,
-    draw the ring on it and encode it as PNG. All in memory; call it from a draw handler."""
+    """Draw the viewport into an offscreen buffer, cut out the box around the target, scale it so its long side is
+    `size`, draw the gaze bubble on it and encode it as PNG. All in memory; call it from a draw handler. The live
+    marker is not in it: drawing the viewport offscreen leaves out what add-ons draw on top."""
     import numpy as np  # Blender bundles it; imported here so that a missing one fails this crop, not the add-on
 
     region, region_3d = context.region, context.region_data
@@ -226,8 +277,8 @@ def _crop_png(context, u: float, v: float, radius: list[float], size: int) -> by
     rows = (np.arange(out_height) * 2 + 1) * (bottom - top) // (2 * out_height)  # nearest neighbour
     columns = (np.arange(out_width) * 2 + 1) * (right - left) // (2 * out_width)
     pixels = bytearray(piece[rows][:, columns].tobytes())
-    ring = protocol.ring_in_crop(u, v, radius, width, height, box, (out_width, out_height))
-    protocol.draw_ring(pixels, out_width, out_height, *ring)
+    bubble = protocol.bubble_in_crop(u, v, radius, width, height, box, (out_width, out_height))
+    protocol.draw_bubble(pixels, out_width, out_height, *bubble)
     return protocol.encode_png(out_width, out_height, bytes(pixels))
 
 
@@ -309,6 +360,14 @@ class BpyScene:
         target = _target()
         return (target[2].width, target[2].height) if target else None
 
+    def gaze_place(self) -> dict | None:
+        target = _target()
+        if target is None:
+            return None
+        window, _area, region = target
+        return {"x": region.x, "y": region.y, "scale": _pixels_per_point(window),
+                "window_width": window.width, "window_height": window.height, "pid": os.getpid()}
+
     def gaze_pick(self, points: list[tuple[float, float]]) -> list[dict | None] | None:
         target = _target()
         if target is None:
@@ -388,6 +447,11 @@ class BpyScene:
     def gaze_show(self, dot: list | None, ring: list | None, marks: list[dict]) -> None:
         _gaze.update(dot=dot, ring=ring, marks=marks)
         _redraw()
+
+    def gaze_marker(self, at: list | None) -> None:
+        _gaze["marker"] = at
+        if (at is not None or _marker_glide.showing) and not bpy.app.timers.is_registered(_marker_tick):
+            bpy.app.timers.register(_marker_tick, first_interval=0.0, persistent=True)
 
     def gaze_crop(self, u: float, v: float, radius: list[float], size: int) -> str | None:
         if _target() is None:
@@ -628,6 +692,58 @@ def _disc(x: float, y: float, radius: float) -> list[tuple[float, float]]:
     return [(x, y)] + rim + [rim[0]]
 
 
+def _oval(x: float, y: float, along: float, across: float, cos_t: float, sin_t: float) -> list[tuple[float, float]]:
+    """MARKER_STEPS points round an oval: half-length `along` in the direction (cos_t, sin_t), half-width `across`."""
+    rim = []
+    for i in range(MARKER_STEPS):
+        angle = 2.0 * math.pi * i / MARKER_STEPS
+        ex, ey = along * math.cos(angle), across * math.sin(angle)
+        rim.append((x + ex * cos_t - ey * sin_t, y + ex * sin_t + ey * cos_t))
+    return rim
+
+
+def _draw_marker() -> None:
+    """The live gaze marker: a see-through bubble, faint all over with a faint rim, soft at its edge and with no core,
+    so the model shows through every part of it. While it travels it stretches along its way, its rim trailing a
+    little behind, and when it stops it relaxes into a round drop. This is the one place that decides what it looks
+    like. POST_PIXEL only, and in the gaze viewport only, like the dot."""
+    glide = _marker_glide
+    if not (glide.showing or _marker_repaints.waiting):  # the common case, on every repaint: nothing to do
+        return
+    target, area = _target(), bpy.context.area
+    if target is None or area is None or target[1].as_pointer() != area.as_pointer():
+        return
+    _marker_repaints.drawn(time.monotonic())
+    if not glide.showing or not _events.live():
+        return
+    region = bpy.context.region
+    width, height = region.width, region.height
+    scale = _pixels_per_point(target[0])
+    x, y = glide.x * width, (1.0 - glide.y) * height  # pixels from the region's bottom left
+    moved_x, moved_y = glide.vx * width, -glide.vy * height  # its way over the last steps, up being positive
+    speed = math.hypot(moved_x, moved_y)
+    stretch = min(MARKER_MAX_STRETCH, speed / (MARKER_STRETCH_POINTS * scale))
+    cos_t, sin_t = (moved_x / speed, moved_y / speed) if speed > 0 else (1.0, 0.0)
+    radius = MARKER_SIZE / 2 * scale
+    rings = []  # one oval for each step of MARKER_PROFILE, with its colour
+    for share, rgb, opacity in MARKER_PROFILE:
+        r = radius * share
+        along, across = r * (1.0 + stretch), r / math.sqrt(1.0 + stretch)
+        back = (along - r) * MARKER_TRAIL * share  # the further out, the further it trails, so the rim lags behind
+        rings.append((_oval(x - cos_t * back, y - sin_t * back, along, across, cos_t, sin_t),
+                      (*rgb, opacity * glide.alpha)))
+    points, colors = [], []
+    for (inner, inner_color), (outer, outer_color) in zip(rings, rings[1:]):  # the band between each two ovals
+        for i in range(MARKER_STEPS):
+            j = (i + 1) % MARKER_STEPS
+            points += (inner[i], outer[i], outer[j], inner[i], outer[j], inner[j])
+            colors += (inner_color, outer_color, outer_color, inner_color, outer_color, inner_color)
+    gpu.state.blend_set("ALPHA")
+    shader = gpu.shader.from_builtin("SMOOTH_COLOR")  # blends each band's colours smoothly from its inside out
+    batch_for_shader(shader, "TRIS", {"pos": points, "color": colors}).draw(shader)
+    gpu.state.blend_set("NONE")
+
+
 def _draw_gaze() -> None:
     """The dot, ring and numbered marks, in the gaze viewport only and only while the app is there to clear them."""
     if not (_gaze["dot"] or _gaze["ring"] or _gaze["marks"]) or not _events.live():
@@ -668,6 +784,16 @@ def _draw_gaze() -> None:
 
 
 def _draw_status() -> None:
+    try:
+        _draw_marker()
+    except Exception as exc:  # noqa: BLE001 - the marker is a nicety: it mustn't stop the dot, ring, numbers and status line
+        try:
+            gpu.state.blend_set("NONE")  # it may have stopped half way through, with blending on
+        except Exception:  # noqa: BLE001
+            pass
+        if not _marker_fault["said"]:  # this runs on every redraw: say it once
+            _marker_fault["said"] = True
+            print(f"GazeVoice Bridge: the marker failed to draw ({exc!r}). The rest still draws.")
     _draw_gaze()
     if not _status_visible():
         return
@@ -725,7 +851,10 @@ def unregister() -> None:
     _end_crop()
     _crop.drop()  # a picture nobody read goes with the add-on
     _crop_job["wanted"] = None
-    _gaze.update(dot=None, ring=None, marks=[])
+    if bpy.app.timers.is_registered(_marker_tick):
+        bpy.app.timers.unregister(_marker_tick)
+    _gaze.update(dot=None, ring=None, marks=[], marker=None)
+    _marker_glide.reset()
     _unregister_keymap()
     if _on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph_update)

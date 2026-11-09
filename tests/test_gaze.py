@@ -9,20 +9,30 @@ from gazevoice.voice.gaze import (
     CONFIDENT_SCORE,
     DEFAULT_RADIUS,
     LONE_GUESS_FLOOR,
+    MARKER_MIN_SAMPLES,
+    MARKER_WINDOW,
     MAX_CANDIDATES,
     MIN_CONFIDENCE,
     MIN_SAMPLES,
     POINTING_WORDS,
     RAYS,
+    Area,
     Fixation,
     GazeSample,
     GazeTrack,
+    Window,
+    area_from,
     fixate,
     ground,
+    marker_point,
+    mostly_off_screen,
+    on_viewport,
+    reach_on_viewport,
     pointing_words,
     ray_points,
     score_hits,
-    viewport_size,
+    track_on_viewport,
+    viewport_area,
 )
 from gazevoice.voice.service import MAX_HOLD
 
@@ -351,6 +361,38 @@ class GroundTest(unittest.TestCase):
         self.assertIsNone(target.picture)
         self.assertEqual(grounding.radius, DEFAULT_RADIUS)
 
+    def test_each_pointing_word_records_how_many_readings_it_had_and_how_many_were_good(self):
+        # "this" is said 0.4 s to 0.6 s into the clip, so its window is the clip's 99.8 s to 100.8 s (see BEFORE_WORD)
+        words = said(("make", 0.0, 0.3), ("this", 0.4, 0.6), ("blue", 0.7, 1.0), ("there", 20.0, 20.3))
+        track = track_of(
+            *steady(100.0, 0.4, 0.6, count=8),  # eight good readings, inside the window
+            *steady(100.45, 0.4, 0.6, count=4, confidence=MIN_CONFIDENCE / 2),  # four blinks, inside it too
+            *steady(90.0, 0.4, 0.6, count=3),  # three before the window, which don't count
+        )
+        grounding = self.look([(CHAIR, 20)], words=words, track=track)
+        self.assertEqual(grounding.windows, [Window("this", 100.4, readings=12, good=8, off_screen=0),
+                                             Window("there", 120.0, readings=0, good=0, off_screen=0)])
+
+    def test_a_word_with_no_good_reading_still_records_its_window(self):
+        track = track_of(*steady(100.0, 0.4, 0.6, count=20, confidence=0.0))
+        grounding = self.look([(CHAIR, 20)], track=track)
+        self.assertEqual(grounding.status, "none")
+        self.assertEqual(grounding.windows, [Window("this", 100.4, readings=17, good=0, off_screen=0)])  # 100.0 to 100.8 s
+
+    def test_readings_the_tracker_zeroed_as_off_the_screen_are_counted_apart_from_blinks(self):
+        track = track_of(
+            *[GazeSample(100.0 + i * 0.05, 3.0, 0.5, 0.0, away=True) for i in range(10)],
+            *steady(100.5, 0.4, 0.6, count=2, confidence=0.0),
+        )
+        grounding = self.look([(CHAIR, 20)], track=track)
+        self.assertEqual(grounding.windows, [Window("this", 100.4, readings=12, good=0, off_screen=10)])
+
+    def test_the_window_counts_go_into_the_dict(self):
+        track = track_of(*steady(100.0, 0.4, 0.6, count=8))
+        data = self.look([(CHAIR, 20)], track=track).to_dict()
+        self.assertEqual(data["windows"], [{"word": "this", "at": 100.4, "readings": 8, "good": 8, "off_screen": 0}])
+        self.assertEqual(json.loads(json.dumps(data)), data)
+
     def test_the_host_is_asked_about_the_rays_for_the_fixation(self):
         self.look([(CHAIR, 20)])
         self.assertEqual(self.picks, [ray_points(Fixation(0.4, 0.6, 8), DEFAULT_RADIUS)])
@@ -560,7 +602,8 @@ class ToDictTest(unittest.TestCase):
 
     def test_no_gaze_still_says_so(self):
         data = ground([], 0.0, GazeTrack(), DEFAULT_RADIUS, lambda p: None, lambda c: None).to_dict()
-        self.assertEqual(data, {"status": "none", "targets": [], "radius": list(DEFAULT_RADIUS), "misses": []})
+        self.assertEqual(data, {"status": "none", "targets": [], "radius": list(DEFAULT_RADIUS), "misses": [],
+                                "windows": []})
         self.assertEqual(json.loads(json.dumps(data)), data)
 
     def test_changing_the_dict_leaves_the_grounding_alone(self):
@@ -577,16 +620,191 @@ class ToDictTest(unittest.TestCase):
         self.assertEqual(grounding.to_dict()["targets"][0]["picture"], "a wing tip")
 
 
-class ViewportSizeTest(unittest.TestCase):
-    def test_a_width_and_height_in_pixels_make_a_size(self):
-        self.assertEqual(viewport_size({"width": 1840, "height": 1100}), (1840, 1100))
-        self.assertEqual(viewport_size({"ok": True, "width": 1840, "height": 1100}), (1840, 1100))  # a gaze_view reply
+# Measured on a real Blender 5.2 window on this project's Mac: macOS said the window filled this frame, title bar
+# included, and Blender reported the rest, its regions in double-density pixels from the window's bottom left.
+FRAME = (120, 390, 900, 632)
+REPLY = {"ok": True, "width": 1471, "height": 1043, "x": 4, "y": 104, "scale": 2, "pid": 7,
+         "window_width": 900, "window_height": 600}
+PLACED = Area(122.0, 448.5, 735.5, 521.5)
 
-    def test_anything_else_is_no_size_at_all(self):
-        for report in (None, {}, [], "1840x1100", {"width": 1840}, {"width": 0, "height": 1100},
-                       {"width": -5, "height": 10}, {"width": 18.4, "height": 1100}, {"width": True, "height": 1},
-                       {"width": "1840", "height": "1100"}, {"width": None, "height": None}):
-            self.assertIsNone(viewport_size(report), report)
+
+class AreaTest(unittest.TestCase):
+    def test_four_numbers_make_an_area(self):
+        self.assertEqual(area_from({"left": 0, "top": 38, "width": 1710, "height": 1074}), Area(0, 38, 1710, 1074))
+        self.assertEqual(area_from({"left": -1710.5, "top": 0, "width": 1, "height": 1}), Area(-1710.5, 0, 1, 1))
+
+    def test_anything_else_is_no_area_at_all(self):
+        whole = {"left": 0, "top": 0, "width": 100, "height": 100}
+        for report in (None, {}, [], "area", {**whole, "width": 0}, {**whole, "height": -1}, {"left": 0},
+                       {**whole, "left": "0"}, {**whole, "top": True}, {**whole, "left": float("nan")},
+                       {**whole, "width": float("inf")}):
+            self.assertIsNone(area_from(report), report)
+
+    def test_it_says_whether_it_holds_most_of_another_by_its_middle(self):
+        screen = Area(0, 0, 1000, 1000)
+        self.assertTrue(screen.holds(Area(100, 100, 200, 200)))
+        self.assertTrue(screen.holds(Area(900, 0, 150, 100)))  # hangs off the edge, but its middle is on this screen
+        self.assertFalse(screen.holds(Area(1000, 0, 800, 600)))  # on the screen beside it
+
+
+class ViewportAreaTest(unittest.TestCase):
+    def frame(self, pid, width, height):
+        self.asked = (pid, width, height)
+        return FRAME
+
+    def test_the_viewport_is_placed_from_its_window_and_where_it_sits_inside(self):
+        self.assertEqual(viewport_area(REPLY, self.frame), PLACED)
+        self.assertEqual(self.asked, (7, 900, 600))
+
+    def test_a_window_macos_cant_find_has_no_place(self):
+        self.assertIsNone(viewport_area(REPLY, lambda pid, width, height: None))
+
+    def test_a_reply_without_the_window_has_no_place(self):
+        for reply in (None, {}, {"ok": False, "error": "no 3D viewport"}, {"ok": True, "width": 1840, "height": 1100},
+                      {**REPLY, "scale": 0}, {**REPLY, "pid": "7"}, {**REPLY, "width": 0}, {**REPLY, "x": None}):
+            self.assertIsNone(viewport_area(reply, self.frame), reply)
+
+
+class OntoTheViewportTest(unittest.TestCase):
+    SCREEN = Area(0, 0, 1000, 800)
+    VIEW = Area(500, 200, 400, 400)  # a viewport in the right half of the screen
+
+    def test_a_place_on_the_screen_becomes_a_place_in_the_viewport(self):
+        self.assertEqual(on_viewport(0.7, 0.5, self.SCREEN, self.VIEW), (0.5, 0.5))
+        self.assertEqual(on_viewport(0.5, 0.25, self.SCREEN, self.VIEW), (0.0, 0.0))
+        self.assertEqual(on_viewport(0.9, 0.75, self.SCREEN, self.VIEW), (1.0, 1.0))
+
+    def test_a_screen_that_doesnt_start_at_the_corner_is_allowed_for(self):
+        self.assertEqual(on_viewport(0.0, 0.0, Area(100, 38, 800, 800), Area(100, 38, 400, 400)), (0.0, 0.0))
+
+    def test_a_patch_grows_as_the_viewport_gets_smaller_than_the_screen(self):
+        self.assertEqual(reach_on_viewport((0.1, 0.2), self.SCREEN, self.VIEW), (0.25, 0.4))
+
+    def test_a_track_moves_onto_the_viewport_with_its_times_and_confidence(self):
+        track = GazeTrack()
+        track.add(GazeSample(1.0, 0.7, 0.5, 0.9))
+        moved = track_on_viewport(track, self.SCREEN, self.VIEW)
+        self.assertEqual(moved.between(0, 2), [GazeSample(1.0, 0.5, 0.5, 0.9)])
+        self.assertEqual(track.between(0, 2), [GazeSample(1.0, 0.7, 0.5, 0.9)])  # the track it came from is untouched
+
+    def test_a_look_well_outside_the_viewport_is_not_a_look_at_it(self):
+        track = GazeTrack()
+        track.add(GazeSample(1.0, 0.1, 0.5, 0.9))  # the left half of the screen: nowhere near the viewport
+        track.add(GazeSample(2.0, 0.91, 0.5, 0.9))  # just past its edge: noise, kept as before
+        moved = track_on_viewport(track, self.SCREEN, self.VIEW).between(0, 3)
+        self.assertEqual([s.confidence for s in moved], [0.0, 0.9])
+
+
+class OffScreenTest(unittest.TestCase):
+    def test_moving_a_track_onto_the_viewport_keeps_which_readings_were_off_the_screen(self):
+        screen, view = Area(0, 0, 1000, 800), Area(100, 100, 500, 400)
+        track = track_of(GazeSample(1.0, 3.0, 0.5, 0.0, away=True), GazeSample(2.0, 0.5, 0.5, 0.9))
+        moved = track_on_viewport(track, screen, view).between(0, 3)
+        self.assertEqual([s.away for s in moved], [True, False])
+
+    def test_nearly_all_readings_off_the_screen_is_reading_off_the_screen(self):
+        def windows(readings, off):
+            return [Window("this", 1.0, readings=readings, good=readings - off, off_screen=off)]
+
+        self.assertTrue(mostly_off_screen(windows(30, 30)))
+        self.assertTrue(mostly_off_screen(windows(30, 24)))  # four in five is the least that counts
+        self.assertFalse(mostly_off_screen(windows(30, 23)))
+        self.assertFalse(mostly_off_screen(windows(30, 0)))
+        self.assertFalse(mostly_off_screen(windows(0, 0)))  # nothing read at all is lost gaze, not gaze off the screen
+        self.assertFalse(mostly_off_screen([]))
+
+    def test_one_look_off_the_screen_among_lost_face_frames_is_not_reading_off_the_screen(self):
+        # One confident glance away, then 29 frames with no face (the worker says the last place again at confidence 0).
+        track = track_of(GazeSample(100.0, 2.0, 0.5, 0.0, away=True),
+                         *[GazeSample(100.0 + i * 0.02, 2.0, 0.5, 0.0) for i in range(1, 30)])
+        grounding = ground(said(("this", 0.4, 0.6)), 100.0, track, DEFAULT_RADIUS, lambda points: None, lambda c: None)
+        self.assertEqual(grounding.windows, [Window("this", 100.4, readings=30, good=0, off_screen=1)])
+        self.assertFalse(mostly_off_screen(grounding.windows))
+
+    def test_the_readings_of_all_the_pointing_words_count_together(self):
+        words = [Window("this", 1.0, readings=10, good=0, off_screen=10), Window("there", 2.0, readings=10, good=8, off_screen=0)]
+        self.assertFalse(mostly_off_screen(words))
+
+
+class MarkerPointTest(unittest.TestCase):
+    """Where the marker goes: the middle of the last moment's good readings, on the viewport."""
+
+    SCREEN = Area(0, 0, 1000, 800)
+    VIEW = Area(500, 200, 400, 400)  # a viewport in the right half of the screen: screen u 0.5 to 0.9, v 0.25 to 0.75
+
+    def track(self, *looks, now=10.0, spread=0.01):
+        """A track with one reading per look, `spread` apart, the last at `now`. A look is (u, v) or (u, v, confidence)."""
+        track = GazeTrack()
+        for i, look in enumerate(looks):
+            u, v, confidence = look if len(look) == 3 else (*look, 0.9)
+            track.add(GazeSample(now - (len(looks) - 1 - i) * spread, u, v, confidence))
+        return track
+
+    def point(self, track, now=10.0):
+        return marker_point(track, now, self.SCREEN, self.VIEW)
+
+    def test_the_numbers_are_the_ones_the_marker_was_designed_with(self):
+        self.assertEqual((MARKER_WINDOW, MARKER_MIN_SAMPLES), (0.2, 3))
+
+    def test_it_is_the_median_of_the_last_moment_on_the_viewport(self):
+        track = self.track((0.7, 0.5), (0.7, 0.5), (0.95, 0.3), (0.7, 0.5), (0.7, 0.5))
+        self.assertEqual(self.point(track), (0.5, 0.5))  # the one stray reading doesn't pull it
+
+    def test_it_follows_the_eyes(self):
+        self.assertEqual(self.point(self.track(*[(0.6, 0.5)] * 4)), (0.25, 0.5))
+        self.assertEqual(self.point(self.track(*[(0.8, 0.6)] * 4)), (0.75, 0.7))
+
+    def test_readings_older_than_the_window_are_left_out(self):
+        old = [(0.9, 0.7)] * 6  # a look that ended before the window began
+        track = GazeTrack()
+        for i, (u, v) in enumerate(old):
+            track.add(GazeSample(9.0 + i * 0.01, u, v, 0.9))
+        for i in range(3):
+            track.add(GazeSample(9.85 + i * 0.05, 0.7, 0.5, 0.9))
+        self.assertEqual(self.point(track), (0.5, 0.5))
+        self.assertIsNone(self.point(track, now=10.5))  # and by then there is nothing new
+
+    def test_readings_from_after_now_are_not_known_yet(self):
+        track = self.track((0.7, 0.5), (0.7, 0.5), now=10.0)
+        track.add(GazeSample(10.1, 0.7, 0.5, 0.9))
+        self.assertIsNone(self.point(track))
+
+    def test_fewer_than_three_good_readings_show_nothing(self):
+        self.assertIsNone(self.point(self.track((0.7, 0.5), (0.7, 0.5))))
+        self.assertIsNone(self.point(GazeTrack()))
+        self.assertIsNotNone(self.point(self.track((0.7, 0.5), (0.7, 0.5), (0.7, 0.5))))
+
+    def test_a_blink_or_a_lost_face_does_not_count(self):
+        blink = MIN_CONFIDENCE - 0.01
+        self.assertIsNone(self.point(self.track((0.7, 0.5), (0.7, 0.5), (0.7, 0.5, blink), (0.7, 0.5, 0.0))))
+        self.assertIsNotNone(self.point(self.track((0.7, 0.5), (0.7, 0.5), (0.7, 0.5, MIN_CONFIDENCE))))
+
+    def test_looking_well_off_the_viewport_shows_nothing(self):
+        for u, v in ((0.2, 0.5),   # the left half of the screen
+                     (0.98, 0.5),  # 20% of the viewport's width past its right edge
+                     (0.3, 0.5),   # and past its left edge
+                     (0.7, 0.9),   # below it
+                     (0.7, 0.05)):  # above it
+            with self.subTest(u=u, v=v):
+                self.assertIsNone(self.point(self.track(*[(u, v)] * 4)))
+
+    def test_a_little_past_the_edge_is_noise_and_the_marker_stays_on_the_edge(self):
+        self.assertEqual(self.point(self.track(*[(0.93, 0.5)] * 4)), (1.0, 0.5))  # 7% past
+        self.assertEqual(self.point(self.track(*[(0.47, 0.5)] * 4)), (0.0, 0.5))
+        self.assertEqual(self.point(self.track(*[(0.7, 0.77)] * 4)), (0.5, 1.0))
+        self.assertEqual(self.point(self.track(*[(0.7, 0.23)] * 4)), (0.5, 0.0))
+
+    def test_the_answer_is_always_inside_zero_to_one(self):
+        for u in (0.46, 0.5, 0.7, 0.9, 0.94):
+            for v in (0.21, 0.25, 0.5, 0.75, 0.79):
+                point = self.point(self.track(*[(u, v)] * 4))
+                self.assertTrue(point is None or all(0.0 <= share <= 1.0 for share in point), (u, v, point))
+
+    def test_the_track_is_left_as_it_was(self):
+        track = self.track(*[(0.7, 0.5)] * 4)
+        before = track.between(0, 20)
+        self.point(track)
+        self.assertEqual(track.between(0, 20), before)
 
 
 if __name__ == "__main__":

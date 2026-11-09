@@ -29,9 +29,11 @@ class ActionSpec:
     label: str
     confirm: str | None = None
     uses_plan: bool = False  # spends some of the user's Claude/Codex usage
+    href: str | None = None  # the key opens this page, and the action is started from there
 
     def to_dict(self) -> dict:
-        return {"id": self.id, "label": self.label, "confirm": self.confirm, "uses_plan": self.uses_plan}
+        return {"id": self.id, "label": self.label, "confirm": self.confirm, "uses_plan": self.uses_plan,
+                "href": self.href}
 
 
 @dataclass(frozen=True)

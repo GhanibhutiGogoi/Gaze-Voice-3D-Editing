@@ -1,3 +1,4 @@
+import base64
 import contextlib
 import io
 import json
@@ -19,20 +20,24 @@ from gazevoice.events import EventBus
 from gazevoice.voice.audio import MicError, RingBuffer
 from gazevoice.voice.brains import BrainError, TurnResult
 from gazevoice.paths import AppPaths
+from gazevoice.server.app import _PICTURE_PATH
 from gazevoice.runner import FakeRunner
-from gazevoice.voice.gaze import GazeSample, GazeTrack
+from gazevoice.voice import service as voice_service
+from gazevoice.voice.gaze import Area, GazeSample, GazeTrack
 from gazevoice.voice.gaze_tracker import GazeTracker
 from gazevoice.voice.leftovers import make_noise_picture
-from gazevoice.voice.picture import Describer, clear_leftover_images, write_picture_check
+from gazevoice.voice.picture import PICTURES_KEPT, Describer, clear_leftover_images, write_picture_check
 from gazevoice.voice.service import (
     CHOICE_LIMIT_SECONDS,
     CHOICE_SECONDS,
+    NOT_ON_SCREEN,
     Factories,
     PointerTracker,
     VoiceError,
     VoiceService,
 )
 from gazevoice.voice.stt import SpeechError
+from tests.test_gaze_tracker import a_calibration
 
 
 def wait_for(predicate, timeout=5.0):
@@ -69,8 +74,13 @@ class FakeBridge:
         self.pick_reply = lambda points: [EAGLE] * len(points)  # what is under each gaze ray; None = no 3D viewport
         self.piece_reply = WING_PIECE  # what gaze_piece says about the top guess; None = no such mesh object
         self.gaze_error: Exception | None = None  # every gaze request raises this (a dead socket)
-        self.view_reply = {"ok": True, "width": 1840, "height": 1100}  # what gaze_view says the viewport is
+        # What gaze_view says about the viewport: its size and place in its window, here all of a window of 920 by 550.
+        self.view_reply = {"ok": True, "width": 1840, "height": 1100, "x": 0, "y": 0, "scale": 2,
+                           "window_width": 920, "window_height": 550, "pid": 7}
         self.picks, self.pieces, self.shows = [], [], []
+        self.polls = []  # every poll request that came, as it was sent
+        self.marker_views = 0  # how many gaze_view requests were the live marker's, which come with a deadline
+        self.drop_marker = None  # a poll that carries this marker times out, once
         # gaze_crop: what it answers (an add-on from before pictures knows no such command), the picture the next
         # crop will make (None: it fails), and how many more times gaze_crop_result says "pending" first.
         self.crop_start = {"ok": False, "error": "unknown command"}
@@ -93,9 +103,15 @@ class FakeBridge:
             raise TimeoutError("timed out")
         cmd = req["cmd"]
         self.calls.append(cmd)
+        if cmd == "gaze_view" and timeout:
+            self.marker_views += 1
         if cmd == "ping":
             return {"ok": True, "bridge": "0.2.0", "blender": "5.2.2", "key": self.key}
         if cmd == "poll":
+            self.polls.append(dict(req))
+            if self.drop_marker is not None and req.get("marker") == self.drop_marker:
+                self.drop_marker = None
+                raise TimeoutError("timed out")
             if self.poll_error is not None:
                 error, self.poll_error = self.poll_error, None
                 raise error
@@ -135,6 +151,10 @@ class FakeBridge:
             setattr(self, cmd + "s", getattr(self, cmd + "s") + 1)
             return {"ok": True}
         return {"ok": False}
+
+    def command_views(self):
+        """How many times a command asked where the viewport is. The live marker asks too, and those are not these."""
+        return self.calls.count("gaze_view") - self.marker_views
 
     def gaze(self, cmd, req):
         if self.gaze_error is not None:
@@ -282,10 +302,10 @@ class FakeSession:
 class FakeGaze:
     """A gaze part (a camera, or the mouse). Tests drop samples into its track with look()."""
 
-    def __init__(self, fail=False, radius=(0.10, 0.15), view=None):
+    def __init__(self, fail=False, radius=(0.10, 0.15), screen=None):
         self.fail = fail
         self.radius = radius
-        self.view = view  # the viewport size it was calibrated on; None for the mouse, which needs no calibration
+        self.screen = screen  # the part of the screen it was calibrated on; None for the mouse, which needs no calibration
         self.alive = False
         self.starts = self.stops = 0
         self.track_reads = 0
@@ -368,6 +388,7 @@ class VoiceTestBase(unittest.TestCase):
         self.editors_made = 0
         self.engine = "parakeet"
         self.gaze = None  # set a gaze part before build() to give the service one
+        self.frame = (0.0, 0.0, 920.0, 550.0)  # where macOS says Blender's window is
         self.gazes_made = 0
         self.pictures = None  # set a picture part before build() to give the service one
         self.pictures_made = 0
@@ -395,6 +416,7 @@ class VoiceTestBase(unittest.TestCase):
             refiner=lambda: self.refiner, editor=self.make_editor,
             gaze=self.make_gaze if self.gaze is not None else None,
             pictures=self.make_pictures if self.pictures is not None else None,
+            window_frame=lambda pid, width, height: self.frame,
         )
         # The fake mic's audio is stamped 1000.1–1010 and speak() presses at 1002, so the service's
         # clock starts there too; on the real clock every hold would look decades long.
@@ -1339,6 +1361,92 @@ class GazeVoiceTest(VoiceTestBase):
         self.run_gaze("on", look=False)
         self.assertEqual(self.bridge.statuses[-1], ("✓ Made Chair blue. · Gaze lost, using your selection", "done"))
 
+    def look_off_the_screen(self, count=8, start=1002.5):
+        """Readings the tracker zeroed because they landed well off the screen (what a calibration that reads wrong gives)."""
+        for i in range(count):
+            self.gaze._track.add(GazeSample(start + i * 0.05, 3.0, 0.5, 0.0, away=True))
+
+    def test_gaze_that_reads_off_the_screen_says_so_and_to_calibrate_again(self):
+        self.bridge.selected = ["Chair"]
+        self.editor = FakeSession([TurnResult("Made Chair blue.", False, ["execute_blender_code"])])
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.look_off_the_screen()
+        record = self.speak()
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertIn("Focus: selected Chair", self.editor.sent[0])  # it still runs, on the selection
+        self.assertEqual(record["gaze"]["status"], "none")
+        self.assertEqual(self.asked_gaze(), [])
+        wording = "Gaze reads off the screen, using your selection. If you were looking at Blender, calibrate gaze again"
+        self.assertEqual(record["_gaze_note"], wording)
+        texts = [text for text, _ in self.bridge.statuses]
+        self.assertTrue(any(t.startswith("Understanding") and t.endswith(" · " + wording) for t in texts), texts)
+        self.assertEqual(self.bridge.statuses[-1], ("✓ Made Chair blue. · " + wording, "done"))
+        self.assertFalse(any("Gaze lost" in t for t in texts), texts)
+
+    def test_a_command_records_how_many_readings_each_pointing_word_had_and_how_many_were_good(self):
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.gaze.look(0.5, 0.5, count=8)
+        self.gaze.look(0.5, 0.5, start=1002.9, count=3, confidence=0.1)  # a blink, inside the window too
+        self.look_off_the_screen(count=2, start=1002.95)
+        record = self.speak()
+        window, = record["gaze"]["windows"]
+        self.assertEqual({k: v for k, v in window.items() if k != "at"},
+                         {"word": "there", "readings": 13, "good": 8, "off_screen": 2})
+        self.assertEqual(record["gaze"]["status"], "resolved")
+
+    def test_a_look_that_found_something_is_not_reported_as_off_the_screen(self):
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.gaze.look(0.5, 0.5)
+        record = self.speak()
+        self.assertEqual(record["_gaze_note"], "")
+        self.assertEqual(record["gaze"]["windows"][0]["off_screen"], 0)
+
+    def test_blinks_without_a_good_reading_are_still_lost_gaze_not_off_the_screen(self):
+        self.bridge.selected = ["Chair"]
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.gaze.look(0.5, 0.5, confidence=0.1)
+        record = self.speak()
+        self.assertEqual(record["_gaze_note"], "Gaze lost, using your selection")
+        self.assertEqual((record["gaze"]["windows"][0]["readings"], record["gaze"]["windows"][0]["good"]), (8, 0))
+
+    def test_a_camera_look_off_the_screen_says_so_after_it_is_moved_onto_the_viewport(self):
+        self.bridge.selected = ["Chair"]
+        self.calibrated_on(width=1840)
+        self.build(gaze_mode="on", gaze_source="camera").start()
+        self.look_off_the_screen()
+        record = self.speak()
+        self.assertEqual(record["gaze"]["windows"][0]["off_screen"], 8)
+        self.assertIn("calibrate gaze again", record["_gaze_note"])
+
+    def test_one_look_off_the_screen_then_a_lost_face_stays_gaze_lost(self):
+        self.bridge.selected = ["Chair"]
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.gaze._track.add(GazeSample(1002.5, 3.0, 0.5, 0.0, away=True))  # one real glance away
+        for i in range(1, 8):  # then no face: the worker says that place again at confidence 0, and it isn't marked
+            self.gaze._track.add(GazeSample(1002.5 + i * 0.05, 3.0, 0.5, 0.0))
+        record = self.speak()
+        self.assertEqual(record["gaze"]["windows"][0]["off_screen"], 1)
+        self.assertEqual(record["_gaze_note"], "Gaze lost, using your selection")
+
+    def test_the_off_the_screen_note_survives_a_long_reply_on_the_status_line(self):
+        self.bridge.selected = ["Chair"]
+        self.editor = FakeSession([TurnResult("Made " + "very " * 60 + "blue.", False, ["execute_blender_code"])])
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.look_off_the_screen()
+        self.speak()
+        text = self.bridge.statuses[-1][0]
+        self.assertLessEqual(len(text), 200)
+        self.assertTrue(text.endswith(" · Gaze reads off the screen, using your selection. "
+                                      "If you were looking at Blender, calibrate gaze again"), text)
+
+    def test_watching_only_records_the_counts_and_says_nothing_on_the_status_line(self):
+        self.bridge.selected = ["Chair"]
+        self.build(gaze_mode="shadow", gaze_source="mouse").start()
+        self.look_off_the_screen()
+        record = self.speak()
+        self.assertEqual(record["gaze"]["windows"][0]["off_screen"], 8)
+        self.assertEqual(record["_gaze_note"], "")
+
     def test_a_long_reply_doesnt_push_the_note_off_the_status_line(self):
         self.bridge.selected = ["Chair"]
         self.editor = FakeSession([TurnResult("Made " + "very " * 60 + "blue.", False, ["execute_blender_code"])])
@@ -1606,100 +1714,111 @@ class GazeVoiceTest(VoiceTestBase):
         self.assertFalse([c for c in self.bridge.calls if c.startswith("gaze_")])
         self.assertIn("Focus: nothing selected", self.editor.sent[0])
 
-    # --- a resized viewport ------------------------------------------------------------------------
-    def saved_for(self, width=1840, height=1100):
-        self.gaze = FakeGaze(view=(width, height))
+    # --- where Blender is on the screen -------------------------------------------------------------
+    def calibrated_on(self, left=0, top=0, width=920, height=550):
+        self.gaze = FakeGaze(screen=Area(left, top, width, height))
 
-    def test_a_resized_viewport_means_no_gaze_for_that_command_and_says_to_calibrate_again(self):
-        self.saved_for(1500, 1100)  # calibrated on a narrower viewport than Blender has now
-        self.bridge.selected = ["Chair"]
-        record = self.run_gaze("on", source="camera")
-        self.assertEqual(record["stage"], "done", record["error"])
-        self.assertEqual(self.asked_gaze(), [])  # no ray was cast with a mapping that no longer fits
-        self.assertIn("Focus: selected Chair", self.editor.sent[0])  # it ran on the selection
-        self.assertNotIn("(gaze)", self.editor.sent[0])
-        self.assertEqual(record["gaze"]["status"], "none")
-        self.assertIs(record["gaze"]["viewport_changed"], True)
-        self.assertIsNone(record["gaze"]["matched_selection"])
-        texts = [text for text, _ in self.bridge.statuses]
-        self.assertTrue(any(t.startswith("Understanding") and "Viewport changed" in t and "calibrate gaze again" in t
-                            for t in texts), texts)
-        self.assertTrue(any(t.startswith("Working:") and "Viewport changed" in t for t in texts), texts)
+    def test_a_look_at_the_screen_is_moved_onto_the_viewport(self):
+        self.calibrated_on(width=1840)  # the viewport fills the left half of the screen it was calibrated on
+        self.build(gaze_mode="on", gaze_source="camera").start()
+        self.gaze.look(0.25, 0.5)
+        record = self.speak()
+        self.assertEqual(record["gaze"]["status"], "resolved")
+        self.assertEqual(self.bridge.picks[0][0], [0.5, 0.5])  # the middle of the viewport
+        self.assertEqual(record["gaze"]["radius"], [0.2, 0.15])  # the patch is twice as wide across a viewport half as wide
+        self.assertEqual(self.gaze.track.between(0, 2000)[0].u, 0.25)  # what the camera saw isn't touched
 
-    def test_the_same_size_viewport_uses_gaze_as_usual(self):
-        self.saved_for(1840, 1100)
+    def test_a_viewport_filling_the_screen_it_was_calibrated_on_leaves_the_look_alone(self):
+        self.calibrated_on()
         record = self.run_gaze("on", source="camera")
         self.assertEqual(record["gaze"]["status"], "resolved")
-        self.assertNotIn("viewport_changed", record["gaze"])
-        self.assertTrue(self.asked_gaze())
+        self.assertEqual(self.bridge.picks[0][0], [0.5, 0.5])
         self.assertIn("(gaze)", self.editor.sent[0])
 
-    def test_the_viewport_is_checked_for_every_command_not_once_when_voice_starts(self):
+    def test_blender_can_be_moved_or_resized_between_commands_with_no_new_calibration(self):
         self.stt = FakeStt(["add blue color there", "and there"], words=THERE_WORDS)
         self.refiner = FakeSession([TurnResult(THERE_REFINED, False)] * 2)
         self.editor = FakeSession([TurnResult("Made the wing blue.", False, ["execute_blender_code"])] * 2)
-        self.saved_for(1840, 1100)
+        self.calibrated_on(width=1840)
         self.build(gaze_mode="on", gaze_source="camera").start()
-        self.gaze.look(0.5, 0.5)
-        first = self.speak()
-        self.assertEqual(first["gaze"]["status"], "resolved")
-        self.bridge.view_reply = {"ok": True, "width": 1840, "height": 900}  # the person resized it between commands
+        self.gaze.look(0.25, 0.5)
+        self.assertEqual(self.speak()["gaze"]["status"], "resolved")
+        self.assertEqual(self.bridge.picks[-1][0], [0.5, 0.5])
+        self.frame = (460.0, 0.0, 920.0, 550.0)  # the person dragged the window across
         self.gaze.look(0.5, 0.5, start=1004.5)
         second = self.speak(down=1004.0, up=1005.0)
         self.assertEqual(second["stage"], "done", second["error"])
-        self.assertIs(second["gaze"]["viewport_changed"], True)
-        self.assertEqual(self.bridge.calls.count("gaze_view"), 2)
+        self.assertEqual(second["gaze"]["status"], "resolved")
+        self.assertEqual(self.bridge.picks[-1][0], [0.5, 0.5])  # still the middle of the viewport, which is now here
+        self.assertEqual(self.bridge.command_views(), 2)  # asked for each command
 
-    def test_watch_only_records_nothing_from_a_resized_viewport_and_says_why(self):
-        self.saved_for(1500, 1100)
+    def test_blender_on_another_screen_means_no_gaze_for_that_command_and_says_so(self):
+        self.calibrated_on(left=-2000)  # calibrated on the screen to the left of the one Blender is on
         self.bridge.selected = ["Chair"]
-        record = self.run_gaze("shadow", source="camera")
-        self.assertEqual(self.asked_gaze(), [])
-        self.assertIs(record["gaze"]["viewport_changed"], True)
-        self.assertEqual(self.service.snapshot()["gaze"]["checked"], 0)  # it can't count towards agreement with the selection
-        self.assertTrue(any("Viewport changed" in text for text, _ in self.bridge.statuses))
-
-    def test_the_mouse_has_no_calibration_so_the_viewport_is_never_checked(self):
-        self.gaze = PointerTracker()
-        self.bridge.view_reply = {"ok": True, "width": 10, "height": 10}
-        self.build(gaze_mode="on", gaze_source="mouse").start()
-        self.gaze.feed(0.5, 0.5, 1002.5)
-        self.gaze.feed(0.5, 0.5, 1002.6)
-        self.assertIsNone(self.gaze.view)
-        record = self.speak()
+        record = self.run_gaze("on", source="camera")
         self.assertEqual(record["stage"], "done", record["error"])
-        self.assertNotIn("gaze_view", self.bridge.calls)
-        self.assertNotIn("viewport_changed", record["gaze"])
+        self.assertEqual(self.asked_gaze(), [])  # no ray was cast with a mapping that doesn't fit
+        self.assertIn("Focus: selected Chair", self.editor.sent[0])  # it ran on the selection
+        self.assertNotIn("(gaze)", self.editor.sent[0])
+        self.assertEqual(record["gaze"]["status"], "none")
+        self.assertIs(record["gaze"]["not_on_screen"], True)
+        self.assertIsNone(record["gaze"]["matched_selection"])
+        texts = [text for text, _ in self.bridge.statuses]
+        self.assertTrue(any(t.startswith("Understanding") and NOT_ON_SCREEN in t for t in texts), texts)
+        self.assertTrue(any(t.startswith("Working:") and NOT_ON_SCREEN in t for t in texts), texts)
 
-    def test_if_blender_cant_say_the_size_gaze_goes_ahead_and_copes_as_before(self):
-        self.saved_for(1500, 1100)
-        for reply in ({"ok": False, "error": "unknown command"}, {"ok": False, "error": "no 3D viewport"}, {}, None):
+    def test_when_blender_cant_be_found_on_the_screen_the_selection_is_used_and_says_so(self):
+        self.calibrated_on()
+        old_add_on = {"ok": True, "width": 1840, "height": 1100}
+        for reply in ({"ok": False, "error": "unknown command"}, {"ok": False, "error": "no 3D viewport"}, {}, None, old_add_on):
             self.bridge.view_reply = reply
-            self.bridge.picks.clear()
+            self.bridge.statuses.clear()
             self.stt = FakeStt(["add blue color there"], words=THERE_WORDS)
             self.refiner = FakeSession([TurnResult(THERE_REFINED, False)])
             self.editor = FakeSession([TurnResult("Made the wing blue.", False, ["execute_blender_code"])])
             record = self.run_gaze("on", source="camera")
-            self.assertNotIn("viewport_changed", record["gaze"], reply)
-            self.assertTrue(self.bridge.picks, reply)
+            self.assertEqual(record["stage"], "done", record["error"])
+            self.assertIs(record["gaze"]["not_on_screen"], True, reply)
+            self.assertEqual(self.bridge.picks, [], reply)
+            self.assertTrue(any(NOT_ON_SCREEN in text for text, _ in self.bridge.statuses), reply)
             self.service.stop()
 
-    def test_a_command_with_no_pointing_word_is_checked_too_and_says_so_when_the_viewport_changed(self):
-        self.stt = FakeStt(["add a cube"], words=[{"text": "add", "start": 0.1, "end": 0.3},
-                                                  {"text": "cube", "start": 0.4, "end": 0.7}])
-        self.saved_for(1500, 1100)
+    def test_a_window_macos_cant_find_is_treated_the_same(self):
+        self.calibrated_on()
+        self.frame = None
         record = self.run_gaze("on", source="camera")
-        self.assertIs(record["gaze"]["viewport_changed"], True)
+        self.assertIs(record["gaze"]["not_on_screen"], True)
         self.assertEqual(self.asked_gaze(), [])
-        self.assertTrue(any("Viewport changed" in text for text, _ in self.bridge.statuses))
 
-    def test_a_command_with_no_pointing_word_leaves_no_gaze_record_when_the_viewport_is_the_same(self):
+    def test_watch_only_records_nothing_when_blender_cant_be_placed_and_says_why(self):
+        self.calibrated_on(left=-2000)
+        self.bridge.selected = ["Chair"]
+        record = self.run_gaze("shadow", source="camera")
+        self.assertEqual(self.asked_gaze(), [])
+        self.assertIs(record["gaze"]["not_on_screen"], True)
+        self.assertEqual(self.service.snapshot()["gaze"]["checked"], 0)  # it can't count towards agreement with the selection
+        self.assertTrue(any(NOT_ON_SCREEN in text for text, _ in self.bridge.statuses))
+
+    def test_the_mouse_is_already_in_the_viewports_terms_so_blender_is_never_placed(self):
+        self.gaze = PointerTracker()
+        self.bridge.view_reply = {"ok": True, "width": 10, "height": 10}
+        self.frame = None
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.gaze.feed(0.5, 0.5, 1002.5)
+        self.gaze.feed(0.5, 0.5, 1002.6)
+        self.assertIsNone(self.gaze.screen)
+        record = self.speak()
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertNotIn("gaze_view", self.bridge.calls)
+        self.assertNotIn("not_on_screen", record["gaze"])
+
+    def test_a_command_with_no_pointing_word_doesnt_ask_where_blender_is(self):
         self.stt = FakeStt(["add a cube"], words=[{"text": "add", "start": 0.1, "end": 0.3},
                                                   {"text": "cube", "start": 0.4, "end": 0.7}])
-        self.saved_for(1840, 1100)
+        self.calibrated_on(left=-2000)
         record = self.run_gaze("on", source="camera")
         self.assertIsNone(record["gaze"])
-        self.assertEqual(self.bridge.calls.count("gaze_view"), 1)
+        self.assertEqual(self.bridge.command_views(), 0)  # the live marker may ask, but the command doesn't
         self.assertEqual(self.asked_gaze(), [])
 
     # --- commands that never use it -----------------------------------------------------------------
@@ -1841,6 +1960,362 @@ THIS_AND_THERE = [
 ]
 
 
+class GazeMarkerTest(VoiceTestBase):
+    """A see-through bubble in Blender's viewport wherever the camera says the person is looking, on the poll request."""
+
+    def setUp(self):
+        super().setUp()
+        self.now = 1003.5  # a fixed clock, so a look stays fresh for as long as a test wants it to
+        self.gaze = FakeGaze(screen=Area(0, 0, 920, 550))  # the screen it was calibrated on is exactly the viewport
+
+    def start(self, mode="on", source="camera", look=(0.25, 0.5), **kwargs):
+        if look:
+            self.look_at(*look)
+        self.build(gaze_mode=mode, gaze_source=source, clock=lambda: self.now, **kwargs).start()
+
+    def look_at(self, u, v, confidence=0.9):
+        """The eyes have just spent a moment at (u, v), shares of the screen."""
+        track = GazeTrack()
+        for i in range(6):
+            track.add(GazeSample(self.now - 0.1 + i * 0.02, u, v, confidence))
+        self.gaze._track = track
+
+    def fresh_parts(self):
+        """New fakes for another start, in the same test."""
+        self.bridge = FakeBridge()
+        self.mic, self.stt = FakeMic(), FakeStt([])
+        self.refiner, self.editor, self.editors_made = FakeSession(), FakeSession(), 0
+
+    def make_viewport_question_raise(self):
+        real = self.bridge.gaze
+
+        def gaze(cmd, req):
+            if cmd == "gaze_view":
+                raise RuntimeError("surprise")
+            return real(cmd, req)
+
+        self.bridge.gaze = gaze
+
+    def markers(self):
+        """What each poll said about the marker, in order; polls that said nothing are left out."""
+        return [poll["marker"] for poll in list(self.bridge.polls) if "marker" in poll]
+
+    def settle(self, polls=8):
+        """Wait for more polls: the ones after a change, so that a wrong marker has had its chance to appear."""
+        target = len(self.bridge.polls) + polls
+        wait_for(lambda: len(self.bridge.polls) >= target)
+
+    # --- when it shows -------------------------------------------------------------------------
+    def test_the_marker_goes_where_the_eyes_are_on_the_poll_that_is_going_anyway(self):
+        self.start()
+        wait_for(lambda: [0.25, 0.5] in self.markers())
+        carrying = [poll for poll in self.bridge.polls if "marker" in poll]
+        self.assertTrue(all("ack" in poll and "boot" in poll for poll in carrying))  # the poll as ever, one key more
+        # and no request of its own: these are the ones voice always made
+        self.assertEqual(set(self.bridge.calls), {"ping", "poll", "status", "gaze_show", "gaze_view"})
+
+    def test_it_is_shown_with_watch_only_too(self):
+        self.start("shadow")
+        wait_for(lambda: [0.25, 0.5] in self.markers())
+
+    def test_a_viewport_that_is_part_of_a_larger_screen_gets_the_place_on_it(self):
+        self.gaze = FakeGaze(screen=Area(0, 0, 1840, 550))  # the screen is twice as wide as the viewport
+        self.start(look=(0.25, 0.5))
+        wait_for(lambda: [0.5, 0.5] in self.markers())
+        self.look_at(0.75, 0.25)  # past the right of the viewport, which only fills the left half
+        wait_for(lambda: self.markers()[-1] is None)
+
+    def test_it_is_not_shown_when_gaze_is_off(self):
+        self.start("off")
+        self.settle()
+        self.assertEqual((self.gazes_made, self.markers()), (0, []))
+        self.assertNotIn("gaze_view", self.bridge.calls)
+
+    def test_the_mouse_gets_no_marker(self):
+        for gaze in (PointerTracker(), FakeGaze(screen=None)):
+            with self.subTest(gaze=type(gaze).__name__):
+                self.fresh_parts()
+                self.gaze = gaze
+                self.start("on", source="mouse", look=None)
+                if isinstance(gaze, PointerTracker):
+                    gaze.feed(0.5, 0.5, self.now)
+                else:
+                    gaze.look(0.5, 0.5, start=self.now - 0.1)
+                self.settle()
+                self.assertEqual(self.markers(), [])
+                self.assertNotIn("gaze_view", self.bridge.calls)
+                self.service.stop()
+
+    def test_nobody_looking_means_no_marker_and_no_question_to_blender(self):
+        self.start(look=None)
+        self.settle()
+        self.assertEqual(self.markers(), [None])  # said once, so that nothing stale is left from an earlier run
+        self.assertNotIn("gaze_view", self.bridge.calls)
+
+    def test_it_is_sent_when_it_moves_and_not_over_again_while_it_doesnt(self):
+        self.start()
+        wait_for(lambda: [0.25, 0.5] in self.markers())
+        self.settle(12)
+        self.assertEqual(self.markers(), [None, [0.25, 0.5]])
+        self.look_at(0.5, 0.5)
+        wait_for(lambda: [0.5, 0.5] in self.markers())
+        self.settle(6)
+        self.assertEqual(self.markers(), [None, [0.25, 0.5], [0.5, 0.5]])
+
+    def test_it_goes_away_with_one_null_when_the_eyes_are_lost(self):
+        self.start()
+        wait_for(lambda: [0.25, 0.5] in self.markers())
+        self.now += 5  # nothing new has come in since
+        wait_for(lambda: self.markers()[-1] is None)
+        self.settle(10)
+        self.assertEqual(self.markers(), [None, [0.25, 0.5], None])
+
+    def test_a_blink_is_not_a_place(self):
+        self.start(look=(0.25, 0.5))
+        wait_for(lambda: [0.25, 0.5] in self.markers())
+        self.look_at(0.9, 0.9, confidence=0.1)
+        wait_for(lambda: self.markers()[-1] is None)
+
+    def test_it_goes_away_when_the_camera_stops(self):
+        self.start()
+        wait_for(lambda: [0.25, 0.5] in self.markers())
+        self.gaze.alive = False
+        wait_for(lambda: self.markers()[-1] is None)
+        self.settle(10)
+        self.assertEqual(self.markers().count(None), 2)
+
+    def test_stopping_voice_takes_it_away(self):
+        self.start()
+        wait_for(lambda: [0.25, 0.5] in self.markers())
+        self.service.stop()
+        self.assertIn("marker", self.bridge.polls[-1])
+        self.assertIsNone(self.bridge.polls[-1]["marker"])
+        self.assertIn("ack", self.bridge.polls[-1])  # a poll like the others: it drops no key presses
+
+    def test_stopping_with_nothing_shown_says_nothing_more(self):
+        self.start(look=None)
+        self.settle()
+        self.service.stop()
+        self.assertEqual(self.markers(), [None])  # the one at the start, and nothing to take away at the end
+
+    def test_stopping_while_blender_is_gone_is_not_held_up(self):
+        self.start()
+        wait_for(lambda: [0.25, 0.5] in self.markers())
+        self.bridge.down = True
+        began = time.monotonic()
+        self.service.stop()
+        self.assertLess(time.monotonic() - began, 3.0)
+
+    # --- finding Blender on the screen -----------------------------------------------------------
+    def test_where_blender_is_asked_at_most_once_a_second(self):
+        self.assertEqual(voice_service.MARKER_PLACE_SECONDS, 1.0)
+        self.start()
+        wait_for(lambda: [0.25, 0.5] in self.markers())
+        self.settle(10)  # half a second or more of polling
+        self.assertEqual(self.bridge.calls.count("gaze_view"), 1)
+
+    def test_it_is_asked_again_to_notice_a_window_that_moved(self):
+        self.gaze = FakeGaze(screen=Area(0, 0, 1840, 550))
+        with patch.object(voice_service, "MARKER_PLACE_SECONDS", 0.1):
+            self.start(look=(0.25, 0.5))
+            wait_for(lambda: [0.5, 0.5] in self.markers())
+            self.frame = (460.0, 0.0, 920.0, 550.0)  # the person dragged the window across
+            wait_for(lambda: [0.0, 0.5] in self.markers())
+            self.assertGreater(self.bridge.calls.count("gaze_view"), 1)
+
+    def test_the_marker_is_gone_while_blender_is_on_another_screen(self):
+        with patch.object(voice_service, "MARKER_PLACE_SECONDS", 0.1):
+            self.start()
+            wait_for(lambda: [0.25, 0.5] in self.markers())
+            self.frame = (-2000.0, 0.0, 920.0, 550.0)  # onto the screen to the left of the calibrated one
+            wait_for(lambda: self.markers()[-1] is None)
+            self.frame = (0.0, 0.0, 920.0, 550.0)  # and back
+            wait_for(lambda: self.markers()[-1] == [0.25, 0.5])
+
+    def test_it_waits_for_blender_to_be_found(self):
+        def replies(reply):
+            return lambda: setattr(self.bridge, "view_reply", reply)
+
+        for what, setup in (
+            ("an add-on from before this", replies({"ok": False, "error": "unknown command"})),
+            ("no viewport", replies({"ok": False, "error": "no 3D viewport"})),
+            ("an empty reply", replies(None)),
+            ("a reply with no window", replies({"ok": True, "width": 10, "height": 10})),
+            ("macOS can't find the window", lambda: setattr(self, "frame", None)),
+            ("the socket is dead", lambda: setattr(self.bridge, "gaze_error", OSError("reset"))),
+            ("a bug", self.make_viewport_question_raise),
+        ):
+            with self.subTest(what):
+                self.fresh_parts()
+                self.frame = (0.0, 0.0, 920.0, 550.0)
+                setup()
+                self.start()
+                wait_for(lambda: self.bridge.calls.count("gaze_view") >= 1)
+                self.settle(6)
+                self.assertEqual(self.markers(), [None], what)  # said once, and never a place
+                self.service.stop()
+
+    def test_a_window_macos_cant_be_asked_about_does_not_stop_the_poll(self):
+        def broken(pid, width, height):
+            raise OSError("no window server")
+
+        self.start(look=None)
+        self.service.factories.window_frame = broken
+        self.look_at(0.25, 0.5)
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            wait_for(lambda: self.bridge.calls.count("gaze_view") >= 1)
+            self.settle(8)
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(self.markers(), [None])
+
+    def test_blender_found_again_after_not_being_found_shows_it_again(self):
+        self.bridge.view_reply = {"ok": False, "error": "no 3D viewport"}
+        with patch.object(voice_service, "MARKER_PLACE_SECONDS", 0.1):
+            self.start()
+            wait_for(lambda: self.bridge.calls.count("gaze_view") >= 2)
+            self.assertEqual(self.markers(), [None])
+            self.bridge.view_reply = {"ok": True, "width": 1840, "height": 1100, "x": 0, "y": 0, "scale": 2,
+                                      "window_width": 920, "window_height": 550, "pid": 7}
+            wait_for(lambda: [0.25, 0.5] in self.markers())
+
+    def test_one_question_that_failed_or_ran_late_does_not_blank_the_marker(self):
+        real = self.bridge.gaze
+        asked = []
+
+        def gaze(cmd, req):
+            if cmd == "gaze_view":
+                asked.append(cmd)
+                if len(asked) == 2:  # the second time, Blender is too busy to answer in time
+                    return {"ok": False, "error": "busy"}
+            return real(cmd, req)
+
+        self.bridge.gaze = gaze
+        with patch.object(voice_service, "MARKER_PLACE_SECONDS", 0.5):  # so it is stale after 1 s, not before
+            self.start()
+            wait_for(lambda: [0.25, 0.5] in self.markers())
+            wait_for(lambda: len(asked) >= 2)
+            self.settle(4)  # a fifth of a second: well before the answer it already has is too old to use
+            self.assertEqual(self.markers(), [None, [0.25, 0.5]])
+
+    def test_a_viewport_not_heard_about_for_two_seconds_is_not_used_any_longer(self):
+        real = self.bridge.gaze
+        answers = {"on": True}
+
+        def gaze(cmd, req):
+            if cmd == "gaze_view" and not answers["on"]:
+                return {"ok": False, "error": "busy"}
+            return real(cmd, req)
+
+        self.bridge.gaze = gaze
+        with patch.object(voice_service, "MARKER_PLACE_SECONDS", 0.1):  # so "two seconds" is a fifth of one
+            self.start()
+            wait_for(lambda: [0.25, 0.5] in self.markers())
+            answers["on"] = False  # and never again
+            wait_for(lambda: self.markers()[-1] is None)
+
+    # --- nothing here may cost the talk key ---------------------------------------------------------
+    def test_a_gaze_part_that_breaks_costs_the_poll_nothing(self):
+        class Breaks(FakeGaze):
+            broken = False
+
+            @property
+            def track(self):
+                if self.broken:
+                    raise RuntimeError("the worker is gone")
+                return super().track
+
+        self.gaze = Breaks(screen=Area(0, 0, 920, 550))
+        self.start()
+        wait_for(lambda: [0.25, 0.5] in self.markers())
+        errors = io.StringIO()
+        began = len(self.bridge.polls)
+        with contextlib.redirect_stderr(errors):
+            self.gaze.broken = True  # from now on, asking it where the eyes are fails, in both places it is asked
+            wait_for(lambda: self.markers()[-1] is None)
+            self.settle(10)
+        self.assertEqual(errors.getvalue(), "")  # not even a line about it: the loop didn't stop to wait
+        self.assertGreaterEqual(len(self.bridge.polls) - began, 10)
+        self.assertEqual(self.markers(), [None, [0.25, 0.5], None])
+
+    def test_a_gaze_part_that_is_broken_from_the_start_costs_the_poll_nothing(self):
+        class Broken(FakeGaze):
+            @property
+            def track(self):
+                raise RuntimeError("the worker is gone")
+
+        self.gaze = Broken(screen=Area(0, 0, 920, 550))
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            self.start(look=None)
+            began = len(self.bridge.polls)
+            self.settle(10)
+        self.assertEqual(errors.getvalue(), "")
+        self.assertGreaterEqual(len(self.bridge.polls) - began, 10)
+        self.assertEqual(self.markers(), [None])
+
+    def test_turning_gaze_off_takes_it_away(self):
+        self.start()
+        wait_for(lambda: [0.25, 0.5] in self.markers())
+        self.service.gaze_mode = "off"
+        wait_for(lambda: self.markers()[-1] is None)
+        self.settle(8)
+        self.assertEqual(self.markers(), [None, [0.25, 0.5], None])
+
+    def test_the_question_to_blender_has_a_short_deadline(self):
+        timeouts = []
+        real = self.bridge.request
+
+        def request(req, timeout=None):
+            if req["cmd"] == "gaze_view":
+                timeouts.append(timeout)
+            return real(req, timeout=timeout)
+
+        self.bridge.request = request
+        self.start()
+        wait_for(lambda: timeouts)
+        self.assertTrue(0 < timeouts[0] <= 0.5, timeouts)
+
+    def test_a_poll_that_didnt_arrive_is_not_taken_for_one_that_did(self):
+        self.start()
+        wait_for(lambda: [0.25, 0.5] in self.markers())
+        self.bridge.drop_marker = [0.75, 0.5]  # the poll that carries this one times out
+        self.look_at(0.75, 0.5)
+        wait_for(lambda: self.markers().count([0.75, 0.5]) >= 2)  # so it is sent again
+
+    def test_a_blender_that_restarted_is_told_again(self):
+        self.start()
+        wait_for(lambda: [0.25, 0.5] in self.markers())
+        self.bridge.boot = "boot-2"  # a new session knows nothing about the marker
+        wait_for(lambda: self.markers().count([0.25, 0.5]) >= 2)
+
+    def test_the_real_gaze_part_with_its_fake_worker_moves_the_marker_on_the_real_clock(self):
+        # No camera: the fake worker walks around the screen. What it sends has the real clock's stamps, so this is
+        # also where the marker's window and the service's clock are shown to be the same clock.
+        screen = {"left": 0, "top": 0, "width": 920, "height": 550}
+        calibration = {**a_calibration(), "screen": screen}
+        worker = Path(gaze_worker.__file__)
+        self.gaze = GazeTracker(Path(sys.executable), worker, "0", calibration, extra_args=["--fake"])
+        self.addCleanup(self.gaze.stop)  # a failing run mustn't leave the worker behind
+        self.build(gaze_mode="on", gaze_source="camera", clock=time.time).start()
+        wait_for(lambda: len({tuple(m) for m in self.markers() if m}) >= 6, timeout=20)
+        points = [m for m in self.markers() if m]
+        self.assertTrue(all(0.0 <= u <= 1.0 and 0.0 <= v <= 1.0 for u, v in points))
+        self.assertTrue(all(0.1 <= u <= 0.9 and 0.1 <= v <= 0.9 for u, v in points), points)  # it stays near the middle
+        self.service.stop()
+        self.assertIsNone(self.markers()[-1])
+
+    def test_voice_goes_on_working_with_the_marker_showing(self):
+        self.stt = FakeStt(["add a cube"], words=[{"text": "add", "start": 0.1, "end": 0.3},
+                                                  {"text": "cube", "start": 0.4, "end": 0.7}])
+        self.start()
+        wait_for(lambda: [0.25, 0.5] in self.markers())
+        record = self.speak()
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.look_at(0.5, 0.5)
+        wait_for(lambda: [0.5, 0.5] in self.markers())
+
+
 class NoLabelsBridge(FakeBridge):
     """A Blender that can't draw the numbers (an old add-on, or no 3D viewport)."""
 
@@ -1938,7 +2413,7 @@ class GazeChoiceTest(VoiceTestBase):
         wait_for(lambda: spoken["stage"] == "done")
         self.assertEqual([c["object"] for c in self.pictures.calls], ["Perch"])
         self.assertEqual(spoken["gaze"]["targets"][0]["picture"], "the perchs top")  # quote marks are dropped
-        self.assertIn('picture (only a description of what the ring shows): "the perchs top"', self.editor.sent[0])
+        self.assertIn('picture (only a description of what the bubble shows): "the perchs top"', self.editor.sent[0])
 
     def test_picking_the_first_one_keeps_the_guess_it_already_looked_at(self):
         self.stt = FakeStt(["add blue color there", "number 1"], words=THERE_WORDS)
@@ -2376,7 +2851,7 @@ class GazePictureTest(VoiceTestBase):
             'Heard: "add blue color there"',
             'Focus (gaze): "there" at 1.0 s → Eagle (79%), Perch (17%)',
             "  point (0.41, 0.12, 0.73) on face 3120 · connected piece of 4000 of 5120 faces",
-            '  picture (only a description of what the ring shows): "the left wing tip"',
+            '  picture (only a description of what the bubble shows): "the left wing tip"',
             "  gaze is accurate to about 10% of the viewport · selected: nothing · mode OBJECT",
         ]))
         self.assertIn("the left wing tip", json.loads(self.refiner.sent[0])["gaze"])
@@ -2399,6 +2874,165 @@ class GazePictureTest(VoiceTestBase):
         self.assertNotIn("iVBOR", everything)
         self.assertNotIn(self.picture.base64[:60], everything)
         self.assertNotIn(self.picture.base64, repr(record))
+
+    # --- what the dashboard can show of it --------------------------------------------------------------------
+    def test_the_picture_that_was_sent_is_kept_in_memory_for_the_dashboard(self):
+        record = self.run_it()
+        self.assertEqual(self.service.picture(record["id"], 0), self.picture.png)  # the very bytes the describer got
+        self.assertEqual(base64.b64encode(self.service.picture(record["id"], 0)).decode(), self.pictures.calls[0]["png"])
+
+    def test_the_record_notes_which_pointing_words_had_a_picture_shown_and_holds_no_image(self):
+        record = self.run_it()
+        self.assertEqual(record["gaze"]["pictures_sent"], [0])
+        saved = json.loads(saved_record_text(self.tmp.name, record))
+        self.assertEqual(saved["gaze"]["pictures_sent"], [0])
+        self.assertEqual(self.service.snapshot()["recent"][0]["gaze"]["pictures_sent"], [0])  # what the dashboard reads
+        self.assertNotIn("iVBOR", json.dumps(saved))
+
+    def test_a_command_with_no_picture_says_so_and_keeps_none(self):
+        self.pictures = None  # pictures are off
+        record = self.run_it()
+        self.assertEqual(record["gaze"]["pictures_sent"], [])
+        self.assertIsNone(self.service.picture(record["id"], 0))
+
+    def test_no_picture_is_written_anywhere_on_disk(self):
+        record = self.run_it()
+        saved_record_text(self.tmp.name, record)
+        files = [p for p in Path(self.tmp.name).rglob("*") if p.is_file()]
+        self.assertTrue(files)  # the record at least
+        for path in files:
+            data = path.read_bytes()
+            self.assertNotIn(b"\x89PNG", data, path)
+            self.assertNotIn(self.picture.base64[:60].encode(), data, path)
+        self.assertIsNotNone(self.service.picture(record["id"], 0))  # and it is in memory all the same
+
+    def test_each_pointing_word_has_its_own_picture(self):
+        self.stt = FakeStt(["move this there"], words=THIS_AND_THERE)
+        first, second = make_noise_picture(64), make_noise_picture(65)
+        self.bridge.crop_png = first.base64
+        real = self.bridge.gaze
+
+        def next_picture(cmd, req):
+            reply = real(cmd, req)
+            if cmd == "gaze_crop" and len(self.bridge.crops) == 2:
+                self.bridge._crop = second.base64
+            return reply
+
+        self.bridge.gaze = next_picture
+        record = self.run_it(start=1001.6, count=30)
+        self.assertEqual(record["gaze"]["pictures_sent"], [0, 1])
+        self.assertEqual((self.service.picture(record["id"], 0), self.service.picture(record["id"], 1)),
+                         (first.png, second.png))
+        self.assertIsNone(self.service.picture(record["id"], 2))
+
+    def test_a_picture_the_describer_could_not_read_is_still_there_to_see(self):
+        self.pictures.reply = None  # it said "unclear", or nothing
+        record = self.run_it()
+        self.assertEqual(record["gaze"]["pictures_sent"], [0])  # it went to the describer, so it is shown
+        self.assertEqual(self.service.picture(record["id"], 0), self.picture.png)
+
+    def test_a_picture_the_describer_broke_on_is_still_there_to_see(self):
+        self.pictures.reply = RuntimeError("boom")
+        with contextlib.redirect_stderr(io.StringIO()):
+            record = self.run_it()
+        self.assertEqual(record["gaze"]["pictures_sent"], [0])
+        self.assertEqual(self.service.picture(record["id"], 0), self.picture.png)
+
+    def test_a_picture_that_is_not_a_string_never_goes_to_the_describer_and_is_not_kept(self):
+        self.bridge.crop_png = {"nope": 1}
+        record = self.run_it()
+        self.assertEqual((record["gaze"]["pictures_sent"], self.pictures.calls), ([], []))
+        self.assertIsNone(self.service.picture(record["id"], 0))
+
+    def test_a_picture_that_never_came_is_not_kept(self):
+        self.bridge.crop_png = None
+        record = self.run_it()
+        self.assertEqual((record["gaze"]["pictures_sent"], self.pictures.calls), ([], []))
+        self.assertIsNone(self.service.picture(record["id"], 0))
+
+    def test_something_that_is_not_a_png_is_not_kept(self):
+        self.bridge.crop_png = base64.b64encode(b"<html>not a picture</html>").decode()
+        record = self.run_it()
+        self.assertEqual(record["gaze"]["pictures_sent"], [])
+        self.assertIsNone(self.service.picture(record["id"], 0))
+
+    def test_only_the_last_twenty_pictures_are_kept(self):
+        record = self.run_it()
+        for number in range(PICTURES_KEPT):
+            self.service._sent_pictures.keep(f"20261108-224739-{number}", 0, self.picture.png)
+        self.assertIsNone(self.service.picture(record["id"], 0))  # the oldest went when the twenty-first came
+        self.assertEqual(self.service.picture("20261108-224739-0", 0), self.picture.png)
+
+    def test_a_picture_stays_for_as_long_as_its_command_is_listed(self):
+        record = self.run_it()
+        self.service.stop()  # voice off: the list of commands is still there to look at
+        self.assertEqual([r["id"] for r in self.service.snapshot()["recent"]], [record["id"]])
+        self.assertEqual(self.service.picture(record["id"], 0), self.picture.png)
+
+    def test_the_ids_this_service_gives_commands_are_ones_the_pictures_route_takes(self):
+        # If the id format ever changed, every thumbnail would quietly turn into "the picture isn't kept any more".
+        record = self.run_it()
+        match = _PICTURE_PATH.fullmatch(f"/api/voice/pictures/{record['id']}/0")
+        self.assertIsNotNone(match, record["id"])
+        self.assertEqual((match.group(1), match.group(2)), (record["id"], "0"))
+        for clock in (time.time, lambda: 4102444800.0, lambda: 0.0):  # today, the year 2100, and the epoch
+            service = VoiceService(Path(self.tmp.name), EventBus(), Factories(None, None, None, None, None), clock=clock)
+            for source in ("voice", "typed", "button"):
+                made = service._new_record(source)
+                self.assertTrue(_PICTURE_PATH.fullmatch(f"/api/voice/pictures/{made['id']}/19"), made["id"])
+
+    def test_a_command_pushed_off_the_list_while_its_picture_is_being_made_leaves_no_picture_behind(self):
+        self.build(gaze_mode="on", gaze_source="mouse").start()
+        self.gaze.look(0.5, 0.5)
+        real, pushed = self.bridge.gaze, []
+
+        def twenty_newer_commands_arrive(cmd, req):
+            if cmd == "gaze_crop":  # this command is mid-picture; meanwhile the list moves on without it
+                pushed.append(self.service.recent[-1])
+                for _ in range(self.service.recent.maxlen):
+                    self.service._new_record("typed")
+            return real(cmd, req)
+
+        self.bridge.gaze = twenty_newer_commands_arrive
+        self.service.ptt("down", 1002.0)
+        self.service.ptt("up", 1003.0)
+        wait_for(lambda: pushed and pushed[0]["stage"] in ("done", "failed", "stopped"))
+        record = pushed[0]
+        self.assertNotIn(record["id"], [r["id"] for r in self.service.recent])
+        self.assertEqual(len(self.pictures.calls), 1)  # the command itself carried on, with its sentence
+        self.assertEqual(record["gaze"]["targets"][0]["picture"], "the left wing tip")
+        self.assertEqual(record["gaze"]["pictures_sent"], [])  # but no picture is kept, or noted, for a command not listed
+        self.assertIsNone(self.service.picture(record["id"], 0))
+
+    def test_the_snapshot_says_how_many_recent_commands_the_service_keeps(self):
+        # The dashboard lists them all and cuts its own copy at this number, so there is one number, here.
+        self.build()
+        snapshot = self.service.snapshot()
+        self.assertEqual(snapshot["recent_limit"], self.service.recent.maxlen)
+        self.assertEqual(snapshot["recent_limit"], 20)
+
+    def test_a_picture_goes_when_its_command_falls_off_the_list(self):
+        record = self.run_it()
+        self.service._sent_pictures.keep("20261108-224739-9", 0, self.picture.png)  # another command's, which stays
+        for _ in range(self.service.recent.maxlen - 2):  # the list now holds 19: this command and 18 that sent no picture
+            self.service._new_record("typed")
+        self.assertEqual(len(self.service.recent), self.service.recent.maxlen - 1)
+        self.assertEqual(self.service.picture(record["id"], 0), self.picture.png)  # still listed, still there
+        self.service._new_record("typed")  # the 20th: the list is full, and nothing is dropped yet
+        self.assertEqual(len(self.service.recent), self.service.recent.maxlen)
+        self.assertEqual(self.service.picture(record["id"], 0), self.picture.png)
+        self.service._new_record("typed")  # one more pushes this command off the list
+        self.assertNotIn(record["id"], [r["id"] for r in self.service.snapshot()["recent"]])
+        self.assertIsNone(self.service.picture(record["id"], 0))  # so its picture can't be fetched by its address any more
+        self.assertEqual(self.service.picture("20261108-224739-9", 0), self.picture.png)
+
+    def test_nothing_but_a_real_command_and_a_whole_number_finds_a_picture(self):
+        record = self.run_it()
+        self.assertIsNotNone(self.service.picture(record["id"], 0))
+        for command, number in (("../../etc/passwd", 0), ("", 0), (None, 0), (record["id"], -1), (record["id"], 1),
+                                (record["id"], "0"), (record["id"], False), (record["id"], 0.0), (record["id"], None)):
+            with self.subTest(command=command, number=number):
+                self.assertIsNone(self.service.picture(command, number))  # False and 0.0 are only equal to 0 in Python
 
     def test_the_sentence_goes_to_the_target_it_describes(self):
         self.stt = FakeStt(["move this there"], words=THIS_AND_THERE)
@@ -2754,7 +3388,7 @@ class GazePictureRealRouteTest(VoiceTestBase):
     def test_the_sentence_comes_from_a_process_that_has_exited(self):
         record = self.run_it()
         self.assertEqual(record["stage"], "done", record["error"])
-        self.assertIn('  picture (only a description of what the ring shows): "the left wing tip"', self.editor.sent[0])
+        self.assertIn('  picture (only a description of what the bubble shows): "the left wing tip"', self.editor.sent[0])
         self.assertTrue(wait_until_true(self.process_gone))  # its input was closed, and it leaves by itself
 
     def test_the_edit_isnt_held_up_while_the_describer_is_still_leaving(self):

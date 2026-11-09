@@ -43,7 +43,7 @@ class ComponentBaseTest(unittest.TestCase):
                 "health": "ready",
                 "summary": "All good",
                 "details": [["Version", "5.2.2"]],
-                "actions": [{"id": "install", "label": "Install", "confirm": None, "uses_plan": False}],
+                "actions": [{"id": "install", "label": "Install", "confirm": None, "uses_plan": False, "href": None}],
             },
         )
 

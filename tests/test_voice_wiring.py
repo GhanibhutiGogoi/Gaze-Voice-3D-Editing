@@ -14,6 +14,7 @@ from gazevoice.components.gaze import MODEL_SIZE, WORKER as GAZE_WORKER
 from gazevoice.components.microphone import LIST_DEVICES
 from gazevoice.events import EventBus
 from gazevoice.voice.audio import MicError
+from gazevoice.voice.gaze import Area
 from gazevoice.voice.gaze_tracker import GazeError, GazeTracker
 from gazevoice.components.brains import CLAUDE_ISOLATION
 from gazevoice.voice.brains import claude_session_argv
@@ -22,7 +23,7 @@ from gazevoice.voice.service import PointerTracker, VoiceError
 from gazevoice.voice.wiring import build_voice, voice_readiness
 
 from .helpers import TempCtx
-from .test_gaze_tracker import a_calibration
+from .test_gaze_tracker import a_calibration, an_old_calibration
 from .test_voice_service import FakeBridge, FakeMic, FakeSession, FakeStt
 
 
@@ -301,6 +302,22 @@ class BuildVoiceTest(unittest.TestCase):
         self.assertTrue(any("isn't connected" in text for text, _ in bridge.statuses))
         self.assertIsNone(self.t.ctx.camera.holder)  # free, so Calibrate isn't told voice is using it
 
+    def test_voice_starts_without_gaze_when_the_saved_calibration_reads_the_heads_place_and_says_to_calibrate_again(self):
+        self.set_up_gaze(an_old_calibration())
+        self.new_camera_listing("MacBook Air Camera")
+        voice = self.gaze_voice(gaze_mode="on", gaze_source="camera")
+        self.assertIsNotNone(voice.factories.gaze)  # a calibration file is there, so gaze is tried and fails plainly
+        bridge = self.fake_parts(voice)
+        voice.start()
+        self.assertEqual(voice.state, "ready")
+        self.assertFalse(voice.snapshot()["gaze"]["live"])
+        problem = voice.snapshot()["gaze"]["problem"]
+        self.assertIn("out of date", problem)
+        self.assertIn("Calibrate gaze again", problem)
+        self.assertIn("so voice uses your selection", problem)
+        self.assertTrue(any("Calibrate gaze again" in text for text, _ in bridge.statuses))
+        self.assertIsNone(self.t.ctx.camera.holder)  # the camera was never opened, so Calibrate isn't told voice has it
+
     def test_a_slow_camera_listing_stops_gaze_not_voice(self):
         self.set_up_gaze()
         self.t.runner.add(LIST_DEVICES, returncode=TIMED_OUT, stderr="ffmpeg: timed out after 10s")
@@ -311,11 +328,11 @@ class BuildVoiceTest(unittest.TestCase):
         self.assertEqual(voice.state, "ready")
         self.assertIn("cameras in time", voice.snapshot()["gaze"]["problem"])
 
-    def test_the_viewport_a_camera_was_calibrated_on_goes_with_the_gaze_part(self):
-        self.set_up_gaze({**a_calibration(), "view": {"width": 1840, "height": 1100}, "when": 1.0})
+    def test_the_screen_a_camera_was_calibrated_on_goes_with_the_gaze_part(self):
+        self.set_up_gaze({**a_calibration(), "when": 1.0})
         voice = self.gaze_voice(gaze_mode="on", gaze_source="camera")
-        self.assertEqual(voice.factories.gaze().view, (1840, 1100))  # the voice loop compares it with Blender's, per command
-        self.assertIsNone(self.gaze_voice(gaze_mode="on", gaze_source="mouse").factories.gaze().view)
+        self.assertEqual(voice.factories.gaze().screen, Area(0, 38, 1710, 1074))  # the voice loop compares it with Blender's, per command
+        self.assertIsNone(self.gaze_voice(gaze_mode="on", gaze_source="mouse").factories.gaze().screen)
 
     def test_camera_gaze_shares_one_claim_on_the_camera_with_calibration(self):
         self.set_up_gaze()

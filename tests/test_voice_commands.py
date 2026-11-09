@@ -185,11 +185,11 @@ class EditorMessageTest(unittest.TestCase):
         self.assertEqual(describe_focus(gaze_focus(looked_at)), "\n".join([
             'Focus (gaze): "there" at 1.2 s → Eagle (82%), Perch (14%)',
             "  point (0.41, 0.12, 0.73) on face 3120 · connected piece of 4000 of 5120 faces",
-            '  picture (only a description of what the ring shows): "the left wing tip"',
+            '  picture (only a description of what the bubble shows): "the left wing tip"',
             "  gaze is accurate to about 10% of the viewport · selected: nothing · mode OBJECT",
         ]))
         second = describe_focus(gaze_focus(gaze_target("this", 0.4), looked_at))
-        self.assertIn('\n    picture (only a description of what the ring shows): "the left wing tip"\n', second)
+        self.assertIn('\n    picture (only a description of what the bubble shows): "the left wing tip"\n', second)
         message = json.loads(refiner_message("add blue color there", gaze_focus(looked_at), ["Eagle"], []))
         self.assertIn("the left wing tip", message["gaze"])  # the refiner reads the same words
 

@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>GazeVoice · Calibrate gaze</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/calibrate.css">
+  <script src="/static/calibrate.js" defer></script>
+</head>
+<body data-stage="ready">
+  <main class="cal-card" id="cal-card">
+    <h1 id="cal-title">Calibrate gaze</h1>
+    <p id="cal-text">This page goes full screen. First you sit about 30 cm from the screen and line your head up with an
+      outline, then you look at 24 dots, one at a time, until each one moves. It takes about a minute. Your camera turns on when you click the circle, and it
+      stays on until the dots are done. No picture is saved, and the numbers from the run stay on this Mac.</p>
+    <ul class="cal-lines" id="cal-lines" hidden></ul>
+    <div class="cal-keys">
+      <button class="key key-primary" id="cal-start" type="button">Start</button>
+      <a class="key" href="/">Back to the dashboard</a>
+    </div>
+    <p class="cal-note" id="cal-note">Do this once, on the screen you use Blender on. Blender doesn't need to be open, and you
+      can move or resize it afterwards. Press Esc at any time to stop.</p>
+  </main>
+  <button class="cal-begin" id="cal-begin" type="button" hidden>Click here to begin</button>
+  <p class="cal-wait" id="cal-wait" role="status" hidden>Starting the camera…</p>
+  <section class="cal-guide" id="cal-guide" aria-label="Line your head up" hidden>
+    <p class="guide-advice" id="guide-advice" role="status"></p>
+    <svg class="guide-outline" viewBox="0 0 100 100" role="img" aria-label="Outline of a head and shoulders">
+      <ellipse class="guide-head" cx="50" cy="43" rx="18" ry="24"/>
+      <path class="guide-body" d="M 42 64.5 V 74 C 42 80 25 80 14 85 C 6 89 4 95 4 100 M 58 64.5 V 74 C 58 80 75 80 86 85 C 94 89 96 95 96 100"/>
+    </svg>
+    <div class="guide-ring" id="guide-ring" hidden></div>
+    <div class="guide-foot">
+      <p class="guide-hint">The ring is your head. Line it up with the outline.</p>
+      <button class="guide-skip" id="guide-skip" type="button">Start anyway</button>
+    </div>
+  </section>
+  <div class="cal-dot" id="cal-dot" hidden></div>
+  <div class="cal-progress" id="cal-progress" hidden><div class="cal-bar" id="cal-bar"></div></div>
+</body>
+</html>

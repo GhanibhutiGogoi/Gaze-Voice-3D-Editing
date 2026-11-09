@@ -30,6 +30,22 @@ class JobManagerTest(unittest.TestCase):
         self.assertEqual(done.state, JobState.FAILED)
         self.assertEqual(done.error, "Homebrew not found")
 
+    def test_a_failure_can_say_more_than_its_words(self):
+        def work(job):
+            raise JobError("Too loose.", result={"refused": True})
+
+        done = self.mgr.wait(self.mgr.start("gaze", "calibrate", work).id, 2)
+        self.assertEqual(done.state, JobState.FAILED)
+        self.assertEqual(done.error, "Too loose.")
+        self.assertEqual(done.result, {"refused": True})
+        self.assertEqual(done.to_dict()["result"], {"refused": True})
+
+    def test_a_failure_with_nothing_more_to_say_has_no_result(self):
+        def work(job):
+            raise JobError("Homebrew not found")
+
+        self.assertIsNone(self.mgr.wait(self.mgr.start("blender", "install", work).id, 2).result)
+
     def test_unexpected_exception_fails_with_traceback_lines(self):
         def work(job):
             raise ValueError("boom")

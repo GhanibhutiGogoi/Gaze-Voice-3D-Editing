@@ -3,7 +3,7 @@
 Newline-delimited JSON over a local TCP socket. This module never imports bpy,
 so it can be tested outside Blender.
 
-    {"cmd": "ping"}                -> {"ok": true, "bridge": "0.3.0", "blender": "5.2.2", "key": "⌥ Space"}
+    {"cmd": "ping"}                -> {"ok": true, "bridge": "0.3.3", "blender": "5.2.2", "key": "⌥ Space"}
     {"cmd": "selection"}           -> {"ok": true, "active": "Cube", "selected": ["Cube"], "mode": "OBJECT"}
     {"cmd": "status", "text": "…", -> {"ok": true}   (shown in the 3D viewport and sidebar)
      "state": "listening"}
@@ -13,6 +13,9 @@ so it can be tested outside Blender.
         Events stay until a later poll acknowledges them, so a reply lost to a timeout loses
         nothing. "boot" changes when Blender restarts, and an ack sent with an earlier boot
         acknowledges nothing. Without "ack", a poll drains everything.
+        A poll may also carry "marker": [u, v] (0 to 1 across the gaze viewport, from the top left) to show the
+        live gaze marker there, null to take it away, or no such key to leave it as it is. One that can't be drawn
+        is left out; the poll is answered all the same. An add-on from before the marker ignores the key.
     {"cmd": "scene_names"}         -> {"ok": true, "names": ["Cube", …]}
     {"cmd": "begin_edit"}          -> {"ok": true}   (undo_push can then tell whether the scene changed)
     {"cmd": "undo_push", "message": "…", "only_if_changed": true} -> {"ok": true, "pushed": true}
@@ -22,8 +25,12 @@ so it can be tested outside Blender.
 
 Gaze. The target is the largest 3D viewport in the first window. "u, v" are 0 to 1 across it, from the
 top left. Nothing here edits the scene.
-    {"cmd": "gaze_view"}           -> {"ok": true, "width": 1840, "height": 1100}
+    {"cmd": "gaze_view"}           -> {"ok": true, "width": 1840, "height": 1100, "x": 4, "y": 104, "scale": 2,
+                                       "window_width": 1000, "window_height": 650, "pid": 4242}
                                       or {"ok": false, "error": "no 3D viewport"}
+        The viewport's size and its place in its window ("x", "y" from the window's bottom left), in pixels. "scale" is
+        how many of those pixels make one point of the window's own size, which is in points. "pid" is Blender's, so
+        the app can ask macOS where the window is: the position Blender itself reports is off by some amount.
     {"cmd": "gaze_pick",           -> {"ok": true, "hits": [{"uid": 116, "name": "Eagle", "faces": 5120,
      "points": [[u, v], …]}                                   "point": [x, y, z]} or null, …]}
         One hit per point, in order; null is a miss. "uid" identifies the object for as long as Blender
@@ -50,7 +57,8 @@ top left. Nothing here edits the scene.
         A picture of the part of the viewport around a target that has no name, for the app to show a
         model. "u, v" and "radius" are as in gaze_show's ring. The picture is the box 2.5 radii each way
         from the point, cut to the viewport, scaled so its long side is "size" pixels (at most
-        MAX_CROP_SIZE), with the ring drawn on it and nothing else. It is a PNG in the reply, as base64 on
+        MAX_CROP_SIZE), with the gaze bubble drawn over the area the ring would cover (a light tint with a
+        clear rim) and nothing else: not the live marker. It is a PNG in the reply, as base64 on
         one line (replies may be long; only requests are limited by MAX_LINE). The viewport only draws
         when Blender repaints it, so gaze_crop returns at once and the picture follows a moment later;
         gaze_crop_result answers "pending" until it is ready, then hands it over exactly once: Blender keeps
@@ -74,7 +82,7 @@ import zlib
 from typing import Callable, Protocol
 
 BRIDGE_PORT = 9877
-BRIDGE_VERSION = "0.3.0"
+BRIDGE_VERSION = "0.3.3"
 MAX_STATUS = 200
 MAX_NAMES = 300
 MAX_LINE = 64 * 1024
@@ -86,15 +94,24 @@ MAX_PIECE_FACES = 200000  # above this many faces, counting a piece is skipped s
 MAX_MARKS = 20
 MAX_MARK_NAME = 40
 MAX_POINTER_RATE = 20  # pointer events a second, at most
+MARKER_TICK = 1 / 30  # seconds between steps of the gaze marker's motion
+MARKER_EASE = 0.3  # the share of the way to its point that the marker covers in each step: it glides, never jumps
+MARKER_FADE_IN = 0.15  # seconds to appear
+MARKER_FADE_OUT = 0.3  # and to go away
+MARKER_REST = 0.0004  # a marker nearer its point than this (a share of the viewport, about a pixel) is there
+MARKER_PATIENCE = 1.0  # seconds a repaint is waited for before another is asked for
 MAX_CROP_SIZE = 1024  # the long side of a gaze_crop picture, in pixels
 CROP_SECONDS = 3.0  # a crop whose viewport hasn't drawn by then is given up
 CROP_KEEP_SECONDS = 30.0  # a finished picture nobody has read by then is dropped
-CROP_MARGIN = 2.5  # a crop reaches this many ring radii out from the target, each way
-RING_COLOR = (90, 190, 255)  # the ring drawn on a crop: one bright colour...
-RING_EDGE_COLOR = (12, 12, 16)  # ...with a dark edge, so it shows on any background
-RING_HALF_WIDTH = 1.5  # pixels either side of the ring's line, bright
-RING_EDGE = 1.5  # more pixels beyond that on each side, dark
-MAX_RING_STEPS = 16384  # points along the ring that get a dab of colour
+CROP_MARGIN = 2.5  # a crop reaches this many radii out from the target, each way
+# The gaze bubble, in the viewport (the live marker) and on a crop. On a crop it covers the area gaze may mean.
+BUBBLE_COLOR = (77, 242, 204)  # aqua: not the blue of the dot and ring, nor the yellow of the numbered marks
+BUBBLE_TINT = 0.16  # how much of the bubble's colour lies over the picture inside it: a light tint, never a cover
+BUBBLE_RIM = 2.0  # pixels: the bright rim, just inside the bubble's outline...
+BUBBLE_RIM_OPACITY = 0.85
+BUBBLE_EDGE_COLOR = (12, 12, 16)  # ...and a dark edge just outside it, so the rim shows on a light background too
+BUBBLE_EDGE = 1.5  # pixels
+BUBBLE_EDGE_OPACITY = 0.6
 STATUS_STATES = ("idle", "listening", "working", "done", "error")
 INVALID = {"cmd": "__invalid__"}
 _KEY_NAMES = {"SPACE": "Space", "RET": "Return", "ESC": "Esc", "TAB": "Tab", "BACK_SPACE": "Delete"}
@@ -130,6 +147,9 @@ class SceneAccess(Protocol):
     def gaze_view(self) -> tuple[int, int] | None:
         """The target viewport's (width, height) in pixels, or None when there is no 3D viewport."""
 
+    def gaze_place(self) -> dict | None:
+        """Where the target viewport sits in its window (see gaze_view above), or None when there is no 3D viewport."""
+
     def gaze_pick(self, points: list[tuple[float, float]]) -> list[dict | None] | None:
         """One hit (uid, name, faces, point) or None for each (u, v); None when there is no 3D viewport."""
 
@@ -137,6 +157,9 @@ class SceneAccess(Protocol):
         """face, part, piece_faces and object_faces, or None when no mesh object has this uid."""
 
     def gaze_show(self, dot: list | None, ring: list | None, marks: list[dict]) -> None: ...
+
+    def gaze_marker(self, at: list | None) -> None:
+        """Show the live gaze marker at (u, v), 0 to 1 across the target viewport, or take it away with None."""
 
     def gaze_crop(self, u: float, v: float, radius: list[float], size: int) -> str | None:
         """Start taking the picture. None once it has started, else why it can't: no 3D viewport, or one is pending."""
@@ -254,9 +277,102 @@ class CropSlot:
         self._state, self._png, self._error = "idle", None, ""
 
 
+class MarkerGlide:
+    """How the gaze marker moves: it fades in where the first look is, glides after the eyes and fades out.
+
+    Nothing here draws. `step` is called on a timer, with the point the eyes are at or None, and says whether what
+    is drawn is different now. `x, y` are where the marker is drawn, `alpha` how visible it is (0 to 1), and `vx, vy`
+    how far it moved in the last steps (smoothed), which the drawing turns into a stretch along its way.
+    """
+
+    def __init__(self):
+        self.x = self.y = 0.5
+        self.alpha = 0.0
+        self.vx = self.vy = 0.0
+
+    @property
+    def showing(self) -> bool:
+        return self.alpha > 0.0
+
+    def reset(self) -> None:
+        """Gone at once."""
+        self.alpha = self.vx = self.vy = 0.0
+
+    def step(self, target) -> bool:
+        before = (self.x, self.y, self.alpha, self.vx, self.vy)
+        x, y = self.x, self.y
+        if target is None:
+            self.alpha = max(0.0, self.alpha - MARKER_TICK / MARKER_FADE_OUT)
+            if self.alpha < MARKER_REST:
+                self.alpha = 0.0
+        else:
+            to_x, to_y = float(target[0]), float(target[1])
+            appearing = self.alpha <= 0.0
+            if appearing:  # it comes up where the eyes are, not gliding in from wherever it last was
+                self.x, self.y = to_x, to_y
+            elif abs(to_x - x) < MARKER_REST and abs(to_y - y) < MARKER_REST:
+                self.x, self.y = to_x, to_y
+            else:
+                self.x, self.y = x + (to_x - x) * MARKER_EASE, y + (to_y - y) * MARKER_EASE
+            self.alpha = min(1.0, self.alpha + MARKER_TICK / MARKER_FADE_IN)
+            if appearing:
+                x, y = self.x, self.y
+        self.vx = self._relaxed(self.vx, self.x - x)
+        self.vy = self._relaxed(self.vy, self.y - y)
+        return before != (self.x, self.y, self.alpha, self.vx, self.vy)
+
+    @staticmethod
+    def _relaxed(speed: float, moved: float) -> float:
+        speed = (speed + moved) / 2
+        return 0.0 if abs(speed) < MARKER_REST / 10 else speed
+
+
+class Repaints:
+    """When the marker may ask the viewport to repaint. A repaint draws the whole 3D view again, so it is asked for
+    one at a time, and no sooner after one than that one took: a scene that is slow to draw is asked less often.
+    """
+
+    def __init__(self, patience: float = MARKER_PATIENCE):
+        self._patience = patience
+        self._wanted = False
+        self._asked: float | None = None
+        self._pause_until = -math.inf
+
+    @property
+    def pending(self) -> bool:
+        """Whether a change is still waiting to be asked for."""
+        return self._wanted
+
+    @property
+    def waiting(self) -> bool:
+        """Whether a repaint has been asked for and not yet happened."""
+        return self._asked is not None
+
+    def want(self) -> None:
+        """What is drawn has changed since the last repaint was asked for."""
+        self._wanted = True
+
+    def ask(self, now: float) -> bool:
+        """Whether to ask for a repaint now. If so, it counts as asked."""
+        if not self._wanted:
+            return False
+        if self._asked is not None and now - self._asked < self._patience:
+            return False  # the last one hasn't happened yet, and will show what is wanted now as well
+        if now < self._pause_until:
+            return False
+        self._wanted, self._asked = False, now
+        return True
+
+    def drawn(self, now: float) -> None:
+        """The viewport has drawn. If that was what was asked for, wait as long again as it took before asking."""
+        if self._asked is not None:
+            self._pause_until = now + (now - self._asked)
+            self._asked = None
+
+
 def crop_box(u: float, v: float, radius: list[float], width: int, height: int,
              margin: float = CROP_MARGIN) -> tuple[int, int, int, int]:
-    """The pixels (left, top, right, bottom) of a width x height image to crop for a ring at (u, v) with radii
+    """The pixels (left, top, right, bottom) of a width x height image to crop for a bubble at (u, v) with radii
     `radius` (shares of the width and height): `margin` radii out each way, cut off at the image's edges. The right and
     bottom are exclusive, and the box is never empty."""
     centre_x, centre_y = u * width, v * height
@@ -275,9 +391,9 @@ def crop_size(box: tuple[int, int, int, int], size: int) -> tuple[int, int]:
     return max(1, round(box_width * scale)), max(1, round(box_height * scale))
 
 
-def ring_in_crop(u: float, v: float, radius: list[float], width: int, height: int,
-                 box: tuple[int, int, int, int], out: tuple[int, int]) -> tuple[float, float, float, float]:
-    """Where the ring goes on the cropped, scaled picture: (cx, cy, rx, ry) in its pixels. `width, height` is the
+def bubble_in_crop(u: float, v: float, radius: list[float], width: int, height: int,
+                   box: tuple[int, int, int, int], out: tuple[int, int]) -> tuple[float, float, float, float]:
+    """Where the bubble goes on the cropped, scaled picture: (cx, cy, rx, ry) in its pixels. `width, height` is the
     image the box was cut from and `out` the picture's size."""
     scale_x, scale_y = out[0] / (box[2] - box[0]), out[1] / (box[3] - box[1])
     return (
@@ -288,30 +404,80 @@ def ring_in_crop(u: float, v: float, radius: list[float], width: int, height: in
     )
 
 
-def _dab(pixels: bytearray, width: int, height: int, x: float, y: float, radius: float, color: bytes) -> None:
-    """Colour every pixel of a width x height RGB buffer whose centre is within `radius` of (x, y)."""
-    radius_squared = radius * radius
-    for row in range(max(0, math.floor(y - radius)), min(height, math.ceil(y + radius))):
-        dy = row + 0.5 - y
-        for column in range(max(0, math.floor(x - radius)), min(width, math.ceil(x + radius))):
-            dx = column + 0.5 - x
-            if dx * dx + dy * dy <= radius_squared:
-                start = (row * width + column) * 3
-                pixels[start : start + 3] = color
+def _covered(d: float, start: float, end: float) -> float:
+    """How much of a pixel whose middle is `d` pixels out from the outline lies between `start` and `end` (0 to 1)."""
+    return max(0.0, min(end, d + 0.5) - max(start, d - 0.5))
 
 
-def draw_ring(pixels: bytearray, width: int, height: int, cx: float, cy: float, rx: float, ry: float) -> None:
-    """Draw an ellipse outline into a width x height RGB buffer (top row first), in place: RING_COLOR with a dark
-    edge either side. (cx, cy) and the radii are in pixels, a pixel being one unit square. Only the outline is
-    touched, and parts outside the picture are left out."""
+def _half_span(dy: float, rx: float, ry: float) -> float:
+    """How far either side of the middle an ellipse with radii (rx, ry) reaches on a row `dy` from its middle; -1 if
+    it doesn't reach that row."""
+    if rx <= 0 or ry <= 0 or abs(dy) >= ry:
+        return -1.0
+    return rx * math.sqrt(1.0 - (dy / ry) ** 2)
+
+
+def _outline_distance(dx: float, dy: float, rx: float, ry: float) -> float:
+    """About how many pixels the point (dx, dy) from an ellipse's middle is outside its outline (less than 0 inside).
+    Exact for a circle, and close for an ellipse near its outline, which is the only place it is used."""
+    x, y = dx / rx, dy / ry
+    f = math.hypot(x, y)
+    slope = math.hypot(x / rx, y / ry)
+    if slope == 0.0:
+        return -min(rx, ry)
+    return (f - 1.0) * f / slope
+
+
+def draw_bubble(pixels: bytearray, width: int, height: int, cx: float, cy: float, rx: float, ry: float) -> None:
+    """Draw the gaze bubble into a width x height RGB buffer (top row first), in place: a light tint of BUBBLE_COLOR
+    over everything inside the ellipse, a bright rim just inside its outline and a dark edge just outside it.
+    (cx, cy) and the radii are in pixels, a pixel being one unit square. The tint keeps what is under it plain to see,
+    and the rim and edge are smoothed over the pixels they half cover. Parts outside the picture are left out.
+
+    Most of the inside is one tint, laid on a whole run of a row at once, so a big bubble takes no longer than a
+    small one to speak of. Only the few pixels near the outline are worked out one by one.
+
+    A very thin oval (5 to 1 or more, either way) loses a little of the outer dark edge at its two ends, because the
+    row is cut off a little early there. Gaze's radius is nearly round, so this doesn't happen today. Up to 3 to 1 the
+    result is the same, pixel for pixel, as working every pixel out one by one (a test checks it)."""
     if not all(math.isfinite(n) for n in (cx, cy, rx, ry)) or rx <= 0 or ry <= 0:
         return
-    steps = min(MAX_RING_STEPS, max(16, math.ceil(2 * math.pi * max(rx, ry))))
-    angles = [2 * math.pi * i / steps for i in range(steps)]
-    points = [(cx + rx * math.cos(a), cy + ry * math.sin(a)) for a in angles]
-    for radius, color in ((RING_HALF_WIDTH + RING_EDGE, bytes(RING_EDGE_COLOR)), (RING_HALF_WIDTH, bytes(RING_COLOR))):
-        for x, y in points:
-            _dab(pixels, width, height, x, y, radius, color)
+    color, edge_color = BUBBLE_COLOR, BUBBLE_EDGE_COLOR
+    tint = [bytes(round(level + (color[c] - level) * BUBBLE_TINT) for level in range(256)) for c in range(3)]
+    reach = BUBBLE_EDGE + 1.0  # past this, outside the outline, nothing is touched
+    plain = BUBBLE_RIM + 1.5  # further than this inside the outline is only the tint
+    stride = width * 3
+    for row in range(max(0, math.floor(cy - ry - reach)), min(height, math.ceil(cy + ry + reach))):
+        dy = row + 0.5 - cy
+        outer = _half_span(dy, rx + reach, ry + reach)
+        if outer < 0:
+            continue
+        first = max(0, math.ceil(cx - outer - 0.5))
+        last = min(width - 1, math.floor(cx + outer - 0.5))
+        inner = _half_span(dy, rx - plain, ry - plain)
+        if inner >= 0:  # the run in the middle of this row gets the tint, and only the two ends are worked out
+            inner_first = max(first, math.ceil(cx - inner - 0.5))
+            inner_last = min(last, math.floor(cx + inner - 0.5))
+        else:
+            inner_first, inner_last = last + 1, last
+        if inner_first <= inner_last:
+            start, end = row * stride + inner_first * 3, row * stride + (inner_last + 1) * 3
+            for c in range(3):
+                pixels[start + c : end : 3] = pixels[start + c : end : 3].translate(tint[c])
+        for column in (*range(first, min(inner_first, last + 1)), *range(max(inner_last + 1, first), last + 1)):
+            d = _outline_distance(column + 0.5 - cx, dy, rx, ry)
+            inside = _covered(d, -math.inf, 0.0)
+            rim = _covered(d, -BUBBLE_RIM, 0.0) * BUBBLE_RIM_OPACITY
+            edge = _covered(d, 0.0, BUBBLE_EDGE) * BUBBLE_EDGE_OPACITY
+            if inside <= 0.0 and edge <= 0.0:
+                continue
+            at = row * stride + column * 3
+            for c in range(3):
+                level = pixels[at + c]
+                level += (color[c] - level) * BUBBLE_TINT * inside
+                level += (edge_color[c] - level) * edge
+                level += (color[c] - level) * rim
+                pixels[at + c] = min(255, max(0, round(level)))
 
 
 def _png_chunk(kind: bytes, body: bytes) -> bytes:
@@ -426,6 +592,7 @@ def handle(request: dict, scene: SceneAccess, events: EventQueue) -> dict:
         scene.set_status(text[:MAX_STATUS], state if state in STATUS_STATES else "idle")
         return {"ok": True}
     if command == "poll":
+        _gaze_marker(request, scene)
         ack = request.get("ack")
         ack = ack if isinstance(ack, int) and not isinstance(ack, bool) else None
         if ack is not None and request.get("boot") not in (None, events.boot):
@@ -456,7 +623,7 @@ def handle(request: dict, scene: SceneAccess, events: EventQueue) -> dict:
         view = scene.gaze_view()
         if view is None:
             return _no_viewport()
-        return {"ok": True, "width": view[0], "height": view[1]}
+        return {"ok": True, "width": view[0], "height": view[1], **(scene.gaze_place() or {})}
     if command == "gaze_pick":
         return _gaze_pick(request.get("points"), scene)
     if command == "gaze_piece":
@@ -481,6 +648,22 @@ def _real(value) -> bool:
 def _unit(value) -> bool:
     """A number from 0 to 1. NaN and infinity are not."""
     return _real(value) and 0.0 <= value <= 1.0
+
+
+def _gaze_marker(request: dict, scene: SceneAccess) -> None:
+    """The marker a poll may carry. It is a courtesy: one that can't be drawn is left out, and nothing here may stop
+    the poll from answering, because the poll is what brings the talk key."""
+    if "marker" not in request:
+        return
+    marker = request["marker"]
+    if marker is not None:
+        if not (isinstance(marker, (list, tuple)) and len(marker) == 2 and all(_unit(c) for c in marker)):
+            return
+        marker = [float(c) for c in marker]
+    try:
+        scene.gaze_marker(marker)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _gaze_pick(points, scene: SceneAccess) -> dict:

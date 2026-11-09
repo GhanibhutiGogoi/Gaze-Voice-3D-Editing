@@ -25,6 +25,10 @@ CONFIDENT_SCORE = 0.6  # the top guess needs at least this share of the rays
 CONFIDENT_GAP = 0.25  # and this much more than the next guess
 LONE_GUESS_FLOOR = 0.2  # when only one object was hit, this share of the rays is enough: the rest hit nothing
 DEFAULT_RADIUS = (0.10, 0.15)  # half the patch the rays cover, as a share of the viewport width and height
+LOOKING_AWAY_MARGIN = 0.1  # a reading this far or less outside the area is noise; further out is looking away
+OFF_SCREEN_SHARE = 0.8  # this share or more of the readings around a command zeroed as off the screen is "reading off the screen"
+MARKER_WINDOW = 0.2  # seconds of gaze the live marker is made from: short, so it follows the eyes
+MARKER_MIN_SAMPLES = 3  # and it needs at least this many good readings in that time to show at all
 MAX_CANDIDATES = 3
 TRACK_SECONDS = 90.0  # gaze kept in memory: more than the longest hold, so all of a clip is still here once it's heard
 PICTURE_MAX_CHARS = 120  # a picture's sentence is cut to this many characters
@@ -70,30 +74,79 @@ def clean_description(text: object) -> str | None:
     return None if not line or _UNCLEAR.fullmatch(line) else line
 
 
-def viewport_size(report: object) -> tuple[int, int] | None:
-    """The (width, height) in pixels that `report` says, or None if it isn't two positive whole numbers.
+@dataclass(frozen=True)
+class Area:
+    """A rectangle on this Mac's screens, in points from the top left of the main screen."""
 
-    `report` is a `gaze_view` reply or a calibration's "view". Gaze is calibrated for one viewport size: if
-    Blender's is a different size now, the same look lands somewhere else.
-    """
-    try:
-        width, height = report["width"], report["height"]  # type: ignore[index]
-    except (TypeError, KeyError):
+    left: float
+    top: float
+    width: float
+    height: float
+
+    def holds(self, other: Area) -> bool:
+        """Whether the middle of `other` is inside this area."""
+        x, y = other.left + other.width / 2, other.top + other.height / 2
+        return self.left <= x <= self.left + self.width and self.top <= y <= self.top + self.height
+
+
+def _number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def area_from(report: object) -> Area | None:
+    """The area `report` describes, or None unless it gives a place and a size above zero."""
+    if not isinstance(report, dict):
         return None
-    sizes = (width, height)
-    if all(isinstance(x, int) and not isinstance(x, bool) and x > 0 for x in sizes):
-        return width, height
-    return None
+    left, top, width, height = values = [report.get(key) for key in ("left", "top", "width", "height")]
+    if not all(_number(value) for value in values) or width <= 0 or height <= 0:
+        return None
+    return Area(left, top, width, height)
+
+
+def viewport_area(reply: object, frame_of: Callable[[int, int, int], Sequence[float] | None]) -> Area | None:
+    """Where Blender's viewport is on the screen; None when that can't be worked out.
+
+    `reply` is a gaze_view reply: the viewport's size and its place in its window, in the window's own pixels from
+    the bottom left. `frame_of(pid, width, height)` asks macOS where the window is, title bar included. It has to be
+    macOS: Blender gets the window's size right, but the height it reports for it on the screen is off by some amount.
+    """
+    if not isinstance(reply, dict):
+        return None
+    keys = ("width", "height", "x", "y", "scale", "window_width", "window_height", "pid")
+    width, height, x, y, scale, window_width, window_height, pid = values = [reply.get(key) for key in keys]
+    if not all(isinstance(value, int) and not isinstance(value, bool) for value in values):
+        return None
+    if min(width, height, scale, window_width, window_height) <= 0:
+        return None
+    frame = frame_of(pid, window_width, window_height)
+    if frame is None:
+        return None
+    left, top, _, frame_height = frame
+    bottom = top + frame_height - y / scale
+    return Area(left + x / scale, bottom - height / scale, width / scale, height / scale)
+
+
+def on_viewport(u: float, v: float, screen: Area, view: Area) -> tuple[float, float]:
+    """A place given as shares of `screen`, as shares of `view`. Outside 0 to 1 when it is outside the viewport."""
+    x, y = screen.left + u * screen.width, screen.top + v * screen.height
+    return (x - view.left) / view.width, (y - view.top) / view.height
+
+
+def reach_on_viewport(radius: Sequence[float], screen: Area, view: Area) -> tuple[float, float]:
+    """A patch's half-size given as shares of `screen`, as shares of `view`."""
+    return radius[0] * screen.width / view.width, radius[1] * screen.height / view.height
 
 
 @dataclass(frozen=True)
 class GazeSample:
-    """Where the eyes were at time `t` (`time.time()`). `u, v` run 0 to 1 across the viewport from the top left."""
+    """Where the eyes were at time `t` (`time.time()`). `u, v` run 0 to 1 from the top left of the viewport, or of the
+    screen a camera was calibrated on until `track_on_viewport` has moved them."""
 
     t: float
     u: float
     v: float
     confidence: float
+    away: bool = False  # the tracker zeroed `confidence` because the reading was well off the screen, not for a blink
 
 
 class GazeTrack:
@@ -128,6 +181,33 @@ class GazeTrack:
         """When the newest sample was taken, or None before the first one."""
         with self._lock:
             return self._samples[-1].t if self._samples else None
+
+
+def track_on_viewport(track: GazeTrack, screen: Area, view: Area) -> GazeTrack:
+    """A copy of `track` with its places as shares of `view`. A look well outside it isn't a look at it."""
+    moved = GazeTrack(track.seconds)
+    for sample in track.between(-math.inf, math.inf):
+        u, v = on_viewport(sample.u, sample.v, screen, view)
+        inside = all(-LOOKING_AWAY_MARGIN <= share <= 1 + LOOKING_AWAY_MARGIN for share in (u, v))
+        moved.add(GazeSample(sample.t, u, v, sample.confidence if inside else 0.0, sample.away))
+    return moved
+
+
+def marker_point(track: GazeTrack, now: float, screen: Area, view: Area) -> tuple[float, float] | None:
+    """Where the live marker goes: the middle of the last `MARKER_WINDOW` seconds of gaze, as shares of `view`.
+
+    Only readings at or above `MIN_CONFIDENCE` count, and there have to be `MARKER_MIN_SAMPLES` of them, else None:
+    there is no look to show. So is a middle further outside the viewport than `LOOKING_AWAY_MARGIN`, which is
+    looking away. One within the margin is noise at the edge, and it is put on the edge, because the bridge takes
+    0 to 1 only.
+    """
+    good = [s for s in track.between(now - MARKER_WINDOW, now) if s.confidence >= MIN_CONFIDENCE]
+    if len(good) < MARKER_MIN_SAMPLES:
+        return None
+    u, v = on_viewport(statistics.median(s.u for s in good), statistics.median(s.v for s in good), screen, view)
+    if not all(-LOOKING_AWAY_MARGIN <= share <= 1 + LOOKING_AWAY_MARGIN for share in (u, v)):
+        return None
+    return _on_viewport(u), _on_viewport(v)
 
 
 @dataclass
@@ -273,6 +353,28 @@ class Miss:
 
 
 @dataclass
+class Window:
+    """What the gaze held around one pointing word: `readings` taken in its window, `good` of them confident enough
+    to use, and `off_screen` of them zeroed by the tracker as well off the screen."""
+
+    word: str
+    at: float
+    readings: int
+    good: int
+    off_screen: int
+
+
+def mostly_off_screen(windows: list[Window]) -> bool:
+    """Whether OFF_SCREEN_SHARE or more of all the readings in `windows` were zeroed as off the screen.
+
+    That is what a calibration that reads wrong looks like: every reading lands off the screen, and none is left to
+    use. Windows with no readings at all say nothing, because that is gaze that was lost, not gaze that is off.
+    """
+    readings = sum(window.readings for window in windows)
+    return readings > 0 and sum(window.off_screen for window in windows) >= OFF_SCREEN_SHARE * readings
+
+
+@dataclass
 class Grounding:
     """What the pointing words in a sentence refer to.
 
@@ -284,10 +386,11 @@ class Grounding:
     targets: list[Target]
     radius: tuple[float, float]
     misses: list[Miss] = field(default_factory=list)
+    windows: list[Window] = field(default_factory=list)  # one for each pointing word, found or not
 
     def to_dict(self) -> dict:
         return {"status": self.status, "targets": [t.to_dict() for t in self.targets], "radius": list(self.radius),
-                "misses": [asdict(m) for m in self.misses]}
+                "misses": [asdict(m) for m in self.misses], "windows": [asdict(w) for w in self.windows]}
 
 
 def is_clear(target: Target) -> bool:
@@ -316,13 +419,18 @@ def ground(
     fixation, `pick` is asked what the rays across the patch hit, and the top guess is looked at closer with
     `piece`. A word that has no gaze gets no target, and one whose rays all hit nothing gets a Miss in its place.
     `pick` returns None when it couldn't ask. A `piece` that returns None or can't reach Blender (OSError or
-    ValueError) still leaves the object as a guess, with `piece=None`.
+    ValueError) still leaves the object as a guess, with `piece=None`. Each word also leaves a Window in
+    `windows`, found or not: how many readings it had, and how many of those were good enough to use.
     """
     radius = (float(radius[0]), float(radius[1]))
     targets = []
     misses = []
+    windows = []
     for word in pointing_words(words, clip_start):
-        fixation = fixate(track.between(word.start - BEFORE_WORD, word.end + AFTER_WORD))
+        around = track.between(word.start - BEFORE_WORD, word.end + AFTER_WORD)
+        windows.append(Window(word.text, word.start, len(around), sum(s.confidence >= MIN_CONFIDENCE for s in around),
+                              sum(s.away for s in around)))
+        fixation = fixate(around)
         if fixation is None:
             continue
         points = ray_points(fixation, radius)
@@ -339,5 +447,5 @@ def ground(
             looked_closer = None
         targets.append(Target(word.text, word.start, candidates, fixation, piece=looked_closer))
     if not targets:
-        return Grounding("none", [], radius, misses)
-    return Grounding("resolved" if all(is_clear(t) for t in targets) else "clarify", targets, radius, misses)
+        return Grounding("none", [], radius, misses, windows)
+    return Grounding("resolved" if all(is_clear(t) for t in targets) else "clarify", targets, radius, misses, windows)

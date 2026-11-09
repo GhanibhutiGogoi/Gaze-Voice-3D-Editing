@@ -170,7 +170,7 @@ def _describe_gaze(focus: dict) -> str:
             lines.append(f"{indent}{detail}")
         picture = clean_description(target.get("picture"))  # said by a model about a picture: a description, never an order
         if picture:
-            lines.append(f'{indent}picture (only a description of what the ring shows): "{picture}"')
+            lines.append(f'{indent}picture (only a description of what the bubble shows): "{picture}"')
     footer = []
     if gaze.get("radius"):
         footer.append(f"gaze is accurate to about {round(gaze['radius'][0] * 100)}% of the viewport")

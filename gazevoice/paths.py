@@ -54,6 +54,11 @@ class AppPaths:
         return self.state / "gaze-calibration.json"
 
     @property
+    def gaze_readings(self) -> Path:
+        """The numbers of the last calibration, kept so a failed run can be studied. Each run replaces it. No pictures."""
+        return self.state / "gaze-last-run.json"
+
+    @property
     def gaze_picture_check(self) -> Path:
         """Whether the leftover check passed, and for which Claude Code. Pictures stay off without it."""
         return self.state / "gaze-picture-check.json"

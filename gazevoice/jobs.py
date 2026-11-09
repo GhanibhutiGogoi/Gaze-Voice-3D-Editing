@@ -22,7 +22,15 @@ class JobState(str, Enum):
 
 
 class JobError(Exception):
-    """A failure whose message is shown to the user as-is."""
+    """A failure whose message is shown to the user as-is.
+
+    `result` is for a failure that has more to say than its words, so that a page need not read them to tell kinds
+    apart. It becomes the failed job's `result`.
+    """
+
+    def __init__(self, message: str = "", result: dict | None = None):
+        super().__init__(message)
+        self.result = result
 
 
 class JobAlreadyRunning(Exception):
@@ -43,6 +51,7 @@ class Job:
     finished_at: float | None = None
     error: str | None = None
     result: dict | None = None
+    params: dict = field(default_factory=dict)  # what the page that started it sent along
     _bus: EventBus | None = field(default=None, repr=False, compare=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
     _done: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
@@ -56,6 +65,11 @@ class Job:
             self._bus.publish(
                 "job.log", {"job_id": self.id, "component_id": self.component_id, "line": line}
             )
+
+    def publish(self, kind: str, data: dict) -> None:
+        """Tell the pages listening something about this job as it runs."""
+        if self._bus is not None:
+            self._bus.publish(kind, {"job_id": self.id, **data})
 
     def to_dict(self, tail: int | None = None) -> dict:
         with self._lock:
@@ -101,6 +115,7 @@ class JobManager:
             job.state = JobState.SUCCEEDED
         except JobError as exc:
             job.error = str(exc) or "Failed"
+            job.result = exc.result
             job.state = JobState.FAILED
         except Exception as exc:  # noqa: BLE001 - surface anything to the user
             for line in traceback.format_exc().rstrip().splitlines():

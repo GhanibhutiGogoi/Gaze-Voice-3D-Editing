@@ -19,9 +19,12 @@ what was under that spot and, in "on" mode, tells the brains in the focus. When 
 or the only one is very weak, the edit thread puts numbers on them in the viewport and waits for the person to say
 one; the stt thread keeps running, so the answer is heard. Gaze never edits anything, and whatever goes wrong with it,
 the command runs on the selection. A target that is a big stretch of mesh with nothing to name it can also be looked
-at closer, when the person has turned pictures on: a crop of the viewport goes from Blender's memory to one short-lived
-process that says in a few words what is inside the ring (see picture.py). Only that sentence joins the focus, and if
-anything about it fails or takes too long the command goes on without it.
+at closer, when the person has turned pictures on: a crop of the viewport, with the gaze bubble drawn on it, goes from
+Blender's memory to one short-lived process that says in a few words what is inside the bubble (see picture.py). Only
+that sentence joins the focus, and if anything about it fails or takes too long the command goes on without it. The
+picture itself is also held in this service's memory, for the last 20 pictures sent and only while its command is on the
+list of recent commands, so the dashboard can show what the AI was shown. It is never written to disk, and it is gone
+when the dashboard stops.
 
 Everything a command did is kept in a record (shown on the dashboard, saved to
 logs/commands/<time>-<n>/record.json next to its audio).
@@ -29,6 +32,7 @@ logs/commands/<time>-<n>/record.json next to its audio).
 
 from __future__ import annotations
 
+import base64
 import collections
 import itertools
 import json
@@ -43,13 +47,16 @@ from pathlib import Path
 from typing import Any, Callable, NoReturn
 
 from ..events import EventBus
+from ..mac_windows import window_frame
 from .audio import SILENCE_HELP, MicError, is_digital_silence, write_wav
 from .brains import BrainError
 from .commands import choice_number, editor_message, meta_command, parse_refined, refiner_message, vocabulary_prompt
 from .gaze import (
     AFTER_WORD,
     BEFORE_WORD,
+    MARKER_WINDOW,
     MAX_CANDIDATES,
+    Area,
     Candidate,
     GazeSample,
     GazeTrack,
@@ -58,10 +65,14 @@ from .gaze import (
     clean_description,
     ground,
     is_clear,
+    marker_point,
+    mostly_off_screen,
     pointing_words,
-    viewport_size,
+    reach_on_viewport,
+    track_on_viewport,
+    viewport_area,
 )
-from .picture import PICTURE_SECONDS, PICTURE_SIZE, needs_picture
+from .picture import PICTURE_SECONDS, PICTURE_SIZE, SentPictures, needs_picture
 from .stt import SpeechError
 
 PREROLL = 0.35  # seconds of audio kept from before the key went down
@@ -69,6 +80,9 @@ TAIL = 0.15  # and after it came up
 MIN_HOLD = 0.3
 MAX_HOLD = 60.0  # a key held longer than this is stuck: the command is dropped, not sent
 POLL_SECONDS = 0.05
+MARKER_PLACE_SECONDS = 1.0  # how often the live marker asks where Blender's viewport is, while someone is looking
+MARKER_ASK_SECONDS = 0.25  # the longest it waits for Blender to answer that, so a busy Blender can't hold up the poll
+MARKER_STOP_SECONDS = 0.5  # and for the last poll, the one that takes the marker away
 IDLE_AFTER = 5.0  # seconds a result stays on the status line
 JOIN_SECONDS = 10.0  # how long stop() waits for each loop (and for an interrupted start) to finish
 BUSY_WAIT = 10.0  # how long an undo operation waits for the host to finish an edit
@@ -83,7 +97,8 @@ EDITOR_WARMUP = "Warm-up, not a command: don't use any tools and don't change an
 READ_ONLY_TOOLS = ("get_", "search_", "render_viewport_to_path")
 POINTER_RADIUS = (0.02, 0.03)  # a mouse is nearly exact: the rays cover this share of the viewport's width and height
 GAZE_LOST = "Gaze lost, using your selection"
-VIEW_CHANGED = "Viewport changed, calibrate gaze again. Using your selection"
+GAZE_OFF_SCREEN = "Gaze reads off the screen, using your selection. If you were looking at Blender, calibrate gaze again"
+NOT_ON_SCREEN = "Blender isn't on your calibrated screen, using your selection"
 CAMERA_BUSY = "Gaze is using the camera to calibrate or test. Wait for it to finish, then turn voice on."
 CHOICE_SECONDS = 8.0  # how long numbers stay on screen waiting to be answered
 CHOICE_LIMIT_SECONDS = 20.0  # and the most they stay, in all, for an answer that is still being said or heard
@@ -94,6 +109,8 @@ NO_PICTURE = "GazeVoice: no picture, going on with text only"  # never says why:
 CROP_POLL_SECONDS = 0.05  # between asking Blender whether the crop is ready
 BRIDGE_REPLY_SECONDS = 2.0  # the longest Blender is given to answer one crop request
 COULDNT_TELL = "Couldn't tell what you meant. Select it or say its name."
+_NO_NEWS = object()  # a poll that says nothing about the marker leaves it as it is
+_UNKNOWN = object()  # what Blender was last told about the marker, when it may not have heard
 _COULDNT = re.compile(r"(?:could(?:n['’]t| not)|can(?:['’]t|not))\b", re.IGNORECASE)  # the editor saying it failed
 
 
@@ -129,9 +146,10 @@ class Factories:
     stt: Callable[[], Any]
     refiner: Callable[[], Any]
     editor: Callable[[], Any]
-    # Builds a gaze part: .start(), .stop(), .alive, .track (a GazeTrack), .radius and .view (the viewport size it was
-    # calibrated for, or None when it needs no calibration). None means no gaze.
+    # Builds a gaze part: .start(), .stop(), .alive, .track (a GazeTrack), .radius and .screen (the Area its positions
+    # are shares of, or None when they are shares of the viewport already). None means no gaze.
     gaze: Callable[[], Any] | None = None
+    window_frame: Callable[[int, int, int], Any] = window_frame  # where macOS says a window is; see viewport_area
     # Builds the picture part, or returns None when pictures are off: .refresh() starts finding out in the background
     # whether pictures may be used, .ready() answers from what it last found without ever waiting, and
     # .describe(png_base64, word, object_name, timeout=…, cancelled=…) gives one clean sentence, or None.
@@ -146,7 +164,7 @@ class PointerTracker:
     """
 
     radius = POINTER_RADIUS
-    view = None  # nothing was calibrated, so there is no viewport size to go out of date
+    screen = None  # its positions are shares of the viewport already
 
     def __init__(self):
         self.track = GazeTrack()
@@ -219,8 +237,8 @@ class VoiceService:
         self.gaze_source = gaze_source
         # A CameraClaim shared with gaze calibration, passed only when voice opens the camera: held from start to stop.
         self.camera = camera
-        # The same claim, only ever read. Voice that doesn't open the camera can run beside a Calibrate or Test, and
-        # they draw in the same viewport, so while one is running voice leaves the drawing alone.
+        # The same claim, only ever read. Voice that doesn't open the camera can run beside a Calibrate or Test, and a
+        # Test draws in the same viewport, so while one is running voice leaves the drawing alone.
         self.overlay = overlay
         self.host_label = "Unity" if host == "unity" else "Blender"
         self.busy_wait = UNITY_BUSY_WAIT if host == "unity" else BUSY_WAIT
@@ -245,7 +263,18 @@ class VoiceService:
         self._conversation_since = 0.0
         self._bridge = self._mic = self._stt = self._refiner = self._editor = self._gaze = None
         self._pictures = None  # describes big unnamed targets from a picture, when pictures are on
+        # The pictures that went to the describer, in memory only, for the dashboard to show. A command's pictures go when
+        # the command falls off the list of recent commands (see _new_record), or when twenty newer pictures have been
+        # sent. Voice turning off leaves both to be looked at, and neither outlives this service.
+        self._sent_pictures = SentPictures()
         self._gaze_problem = ""  # why gaze didn't start, if it didn't
+        # The live gaze marker, all of it touched only by the poll loop. What Blender was last told about it: a point,
+        # None, or _UNKNOWN. Whether it may be showing one. Where the viewport is on the screen, and when that was found.
+        self._marker_told: Any = _UNKNOWN
+        self._marker_shown = False
+        self._marker_view: Area | None = None
+        self._marker_placed_at = -math.inf  # when Blender was last asked, which paces the asking
+        self._marker_view_at = -math.inf  # when it last answered well: how old the viewport it gave us is
         # Commands whose gaze could be compared with the selection, and how many of those agreed with it.
         self._gaze_checked = self._gaze_matched = 0
         self._numbers = itertools.count(1)
@@ -275,6 +304,7 @@ class VoiceService:
                     "matched": self._gaze_matched,
                 },
                 "recent": [self._public(r) for r in reversed(self.recent)],
+                "recent_limit": self.recent.maxlen,  # how many it keeps: the dashboard lists them all, and keeps as many
             }
 
     def _derived_state(self) -> str:
@@ -369,6 +399,8 @@ class VoiceService:
             self._clips_coming = 0
             self._gaze_problem = ""
             self._gaze_checked = self._gaze_matched = 0
+            self._marker_told, self._marker_shown = _UNKNOWN, False
+            self._marker_view, self._marker_placed_at, self._marker_view_at = None, -math.inf, -math.inf
             self.state, self.reason = "starting", f"Connecting to {self.host_label}…"
         self._publish_state()
         try:
@@ -726,6 +758,17 @@ class VoiceService:
         self._status("Started a new conversation", "done", revert=True)
         self._publish_state()
 
+    def picture(self, command_id: object, number: object) -> bytes | None:
+        """The PNG that was sent for pointing word `number` of command `command_id`, or None once it is gone.
+
+        It is gone when twenty newer pictures have been sent since, when its command has fallen off the list of recent
+        commands, or when this service has been replaced (the control center holds the only copy, in memory). Only a
+        text id and a whole number can find one.
+        """
+        if not isinstance(command_id, str) or type(number) is not int:
+            return None
+        return self._sent_pictures.get(command_id, number)
+
     # --- records ------------------------------------------------------------------------------
     def _new_record(self, source: str) -> dict:
         number = next(self._numbers)
@@ -762,6 +805,8 @@ class VoiceService:
             "_stop": False,
         }
         with self._lock:
+            if len(self.recent) == self.recent.maxlen:  # this one pushes the oldest off the list, and its pictures go too
+                self._sent_pictures.drop(self.recent[0]["id"])
             self.recent.append(record)
         return record
 
@@ -844,13 +889,20 @@ class VoiceService:
                 run.stop.wait(0.5)
                 continue
             run.stop.wait(POLL_SECONDS)
+        self._take_marker_away(ack, boot)
 
     def _poll_once(self, run: _Run, ack: int, boot: str | None) -> tuple[int, str | None]:
         bridge = self._bridge
         if bridge is None:
             return ack, boot
+        request = {"cmd": "poll", "ack": ack, "boot": boot}
+        news = self._marker_news()
+        if news is not _NO_NEWS:  # the marker rides on this poll: there is no other request or thread for it
+            request["marker"] = None if news is None else list(news)
+            self._marker_told = _UNKNOWN  # until a reply says it arrived
+            self._marker_shown = self._marker_shown or news is not None
         try:
-            reply = bridge.request({"cmd": "poll", "ack": ack, "boot": boot})
+            reply = bridge.request(request)
         except TimeoutError:  # host is busy; its events wait for the next poll
             return ack, boot
         except (OSError, ValueError):
@@ -858,8 +910,12 @@ class VoiceService:
             run.stop.wait(1.0)
             return ack, boot
         self._set_connected(True)
+        if news is not _NO_NEWS and reply.get("ok"):
+            self._marker_told, self._marker_shown = news, news is not None
         if reply.get("boot") != boot:  # Blender restarted: its events count from 1 again
             ack, boot = 0, reply.get("boot")
+            if news is _NO_NEWS:
+                self._marker_told = _UNKNOWN  # and the new one has never heard of the marker
         for event in reply.get("events") or []:
             seq = event.get("seq")
             if isinstance(seq, int):
@@ -872,7 +928,74 @@ class VoiceService:
                 self.ptt("up" if self._listening else "down", event.get("t"), via="toggle")
             elif event.get("type") == "pointer":
                 self._pointer(event)
+        self._find_blender()  # after the events, so that the talk key never waits for it
         return ack, boot
+
+    # --- the live gaze marker ---------------------------------------------------------------------
+    def _marker_gaze(self):
+        """The gaze part the marker follows: the camera's, while it is alive and gaze isn't off. The mouse has none."""
+        gaze = self._gaze
+        try:
+            screen = getattr(gaze, "screen", None)  # a part with a screen is the camera; the mouse has none
+            if gaze is not None and self.gaze_mode != "off" and screen is not None and gaze.alive:
+                return gaze
+        except Exception:  # noqa: BLE001 - a marker is not worth a stopped poll loop
+            pass
+        return None
+
+    def _marker_news(self):
+        """What the next poll says about the marker: a (u, v), None to take it away, or _NO_NEWS.
+
+        None is said once, not on every poll, and only if there is a marker to take away or this is the first poll of
+        a camera run (so that nothing stale is left from an earlier one). Nothing here may raise: this runs in the
+        loop that carries the talk key.
+        """
+        gaze = self._marker_gaze()
+        point = None
+        if gaze is not None:
+            try:
+                point = self._marker_point(gaze)
+            except Exception:  # noqa: BLE001
+                point = None
+        elif not self._marker_shown:
+            return _NO_NEWS
+        return _NO_NEWS if point == self._marker_told else point
+
+    def _marker_point(self, gaze) -> tuple[float, float] | None:
+        """Where the eyes are on Blender's viewport, or None: not looking, or Blender isn't known to be on screen."""
+        screen, view = gaze.screen, self._marker_view
+        stale = time.monotonic() - self._marker_view_at >= 2 * MARKER_PLACE_SECONDS
+        if view is None or stale or not screen.holds(view):
+            return None
+        point = marker_point(gaze.track, self.clock(), screen, view)
+        return None if point is None else (round(point[0], 4), round(point[1], 4))
+
+    def _find_blender(self) -> None:
+        """Ask where Blender's viewport is on the screen, for the marker: at most every `MARKER_PLACE_SECONDS`, and
+        only while someone is looking. It asks Blender and macOS, so it has a short deadline, and if either fails the
+        last answer is kept, and used until it is twice `MARKER_PLACE_SECONDS` old. It runs after the poll was
+        answered, so a Blender that isn't answering isn't asked as well."""
+        try:
+            gaze = self._marker_gaze()
+            if gaze is None or time.monotonic() - self._marker_placed_at < MARKER_PLACE_SECONDS:
+                return
+            latest = gaze.track.latest_time
+            if latest is None or self.clock() - latest > MARKER_WINDOW:
+                return  # no one is looking, so there is nothing to place
+            self._marker_placed_at = asked = time.monotonic()
+            reply = self._bridge_call({"cmd": "gaze_view"}, timeout=MARKER_ASK_SECONDS)
+            view = viewport_area(reply, self.factories.window_frame)
+            if view is not None:  # a question that failed or ran late leaves the last answer standing, until it is too old
+                self._marker_view, self._marker_view_at = view, asked
+        except Exception:  # noqa: BLE001 - see _marker_news
+            pass
+
+    def _take_marker_away(self, ack: int, boot: str | None) -> None:
+        """Voice is stopping and nothing will be left to clear the marker, so say so once. A poll like the others, so
+        it drops no key presses."""
+        if self._marker_shown:
+            self._bridge_call({"cmd": "poll", "ack": ack, "boot": boot, "marker": None}, timeout=MARKER_STOP_SECONDS)
+            self._marker_shown = False
 
     def _pointer(self, event: dict) -> None:
         """The mouse stands in for gaze. An odd event is skipped: this runs inside the poll loop."""
@@ -1152,7 +1275,7 @@ class VoiceService:
         return {k: v for k, v in reply.items() if k != "ok"}
 
     def _calibration_drawing(self) -> bool:
-        """Whether a Calibrate or Test has the viewport: what it draws there isn't voice's to cover or clear."""
+        """Whether gaze's Test may be drawing on the viewport: what it draws there isn't voice's to cover or clear."""
         return self.overlay is not None and self.overlay.holder == "gaze"
 
     def _hide_gaze(self) -> None:
@@ -1235,18 +1358,18 @@ class VoiceService:
             return None
         return gaze["targets"][0]["candidates"][0]["name"] in selected
 
-    def _viewport_changed(self, gaze) -> bool:
-        """Whether Blender's viewport is a different size now from the one the camera was calibrated on.
+    def _placed(self, gaze, look: GazeTrack) -> tuple[GazeTrack, tuple[float, float]] | None:
+        """This command's gaze and its patch as shares of Blender's viewport; None when Blender can't be placed.
 
-        Asked again for each command, because the person can resize the viewport at any time. False when there is
-        nothing to compare (the mouse), or when Blender can't say: ground() copes with that the way it always has.
+        Asked again for each command, because the person can move Blender at any time. The mouse needs none of this.
         """
-        saved = getattr(gaze, "view", None)
-        if saved is None:
-            return False
-        reply = self._bridge_call({"cmd": "gaze_view"})
-        live = viewport_size(reply) if reply and reply.get("ok") else None
-        return live is not None and live != saved
+        screen = getattr(gaze, "screen", None)
+        if screen is None:
+            return look, gaze.radius
+        view = viewport_area(self._bridge_call({"cmd": "gaze_view"}), self.factories.window_frame)
+        if view is None or not screen.holds(view):
+            return None
+        return track_on_viewport(look, screen, view), reach_on_viewport(gaze.radius, screen, view)
 
     def _crop_result(self, deadline: float, run: _Run, cancelled: Callable[[], bool]) -> str | None:
         """The picture Blender made, as base64, once it is ready. None on any error, or at the deadline or a stop."""
@@ -1265,30 +1388,47 @@ class VoiceService:
 
     def _picture_of(
         self, target: Target, radius: tuple[float, float], pictures, deadline: float, run: _Run,
-        cancelled: Callable[[], bool],
+        cancelled: Callable[[], bool], on_sent: Callable[[str], None] | None = None,
     ) -> str | None:
-        """One sentence about what is inside the ring around where the person looked, or None.
+        """One sentence about what is inside the bubble around where the person looked, or None.
 
-        Blender crops its viewport to the ring, from memory, and hands the picture over once. It goes straight to the
-        describer and is not kept anywhere here: not in the record, the target, or the bridge client.
+        Blender crops its viewport to the bubble's area, from memory, and hands the picture over once. It goes straight
+        to the describer. It is not put in the record, the target or the bridge client. `on_sent` is told the picture
+        (base64) just before the describer gets it, which is how the control center comes to hold a copy in memory for
+        the dashboard (see _look_closer).
         """
         ru, rv = float(radius[0]), float(radius[1])
         u, v = target.fixation.u, target.fixation.v
         if not all(math.isfinite(x) and x > 0 for x in (ru, rv)) or not all(math.isfinite(x) for x in (u, v)):
             return None
-        ring = [min(1.0, ru), min(1.0, rv)]
+        reach = [min(1.0, ru), min(1.0, rv)]
         started = self._bridge_call({"cmd": "gaze_crop", "u": min(1.0, max(0.0, u)), "v": min(1.0, max(0.0, v)),
-                                     "radius": ring, "size": PICTURE_SIZE})
+                                     "radius": reach, "size": PICTURE_SIZE})
         if not (started and started.get("ok") and started.get("pending")):
             return None  # an add-on from before pictures says "unknown command", which is no picture and no error
         png = self._crop_result(deadline, run, cancelled)
         left = deadline - time.monotonic()
         if png is None or left <= 0 or cancelled():
             return None
+        if on_sent is not None:
+            on_sent(png)
         return clean_description(pictures.describe(png, target.word, target.candidates[0].name, timeout=left,
                                                    cancelled=cancelled))
 
-    def _look_closer(self, record: dict, grounding: Grounding, run: _Run) -> None:
+    def _keep_picture(self, command_id: str, number: int, png_base64: str) -> bool:
+        """Hold a picture that is being sent, in memory only, so the dashboard can show it. False if it isn't a PNG, or
+        if its command is no longer on the list of recent commands (twenty newer ones arrived while it was being made):
+        nothing would ever show it, and nothing would drop it."""
+        try:
+            png = base64.b64decode(png_base64, validate=True)
+        except ValueError:  # not base64 at all
+            return False
+        with self._lock:  # one step with _new_record, which drops a command's pictures as it leaves the list
+            if not any(record["id"] == command_id for record in self.recent):
+                return False
+            return self._sent_pictures.keep(command_id, number, png)
+
+    def _look_closer(self, record: dict, grounding: Grounding, run: _Run, sent: list[int]) -> None:
         """For each settled target that is a big piece of mesh with no name, put a sentence from a picture in `picture`.
 
         All of it, the crops and the describers, shares one PICTURE_SECONDS. Nothing here can stop a command: pictures
@@ -1296,9 +1436,13 @@ class VoiceService:
         slow or says "unclear", all leave `picture` None and the command goes on with the text it has. A stop, or voice
         turning off, ends the wait at once and kills the describer. Whether pictures may be used is only read, from
         what the picture part last found out (see Factories.pictures), so nothing about it can hold the command up.
+
+        Each picture that goes to a describer is also held in memory, in this service, under the command and the number
+        of its target, so the dashboard can show what the AI was shown (see picture()). Its number is added to `sent`.
+        The record gets that number and nothing of the image.
         """
         pictures = self._pictures
-        wanted = [t for t in grounding.targets if needs_picture(t)]
+        wanted = [(number, t) for number, t in enumerate(grounding.targets) if needs_picture(t)]
         if pictures is None or not wanted:
             return
 
@@ -1316,10 +1460,15 @@ class VoiceService:
         self._stage("refining", record)  # the command is still being understood
         self._status(LOOKING_CLOSER, "working")
         try:
-            for target in wanted:
+            for number, target in wanted:
                 if cancelled() or time.monotonic() >= deadline:
                     break
-                target.picture = self._picture_of(target, grounding.radius, pictures, deadline, run, cancelled)
+
+                def on_sent(png: str, number: int = number) -> None:
+                    if self._keep_picture(record["id"], number, png):
+                        sent.append(number)
+
+                target.picture = self._picture_of(target, grounding.radius, pictures, deadline, run, cancelled, on_sent)
         except Exception:  # noqa: BLE001 - whatever went wrong, the person's command is not the place to say so
             print(NO_PICTURE, file=sys.stderr)
         finally:
@@ -1331,34 +1480,39 @@ class VoiceService:
         The answer goes in record["gaze"]. In "on" mode it also joins the focus the brains read, and guesses that aren't
         clear (see is_clear) are put to the person first (see _ask_which). Nothing here can stop a command: if gaze is
         lost or breaks, or nobody says which one, the command runs on the selection. The one exception is that last case
-        with nothing selected. There is nothing to run it on, so the command fails and this returns False. A camera that
-        was calibrated on a differently sized viewport is treated like lost gaze, and the status line says to calibrate
-        again.
+        with nothing selected. There is nothing to run it on, so the command fails and this returns False. If Blender
+        can't be found on the screen gaze was calibrated on, that is treated like lost gaze, and the status line says so.
+        When gaze found nothing because nearly all the readings landed off the screen (a calibration that reads wrong),
+        the status line says to calibrate again. The counts for each pointing word go in record["gaze"]["windows"].
         """
         gaze = self._gaze  # there is none when gaze is off, can't start, or has no camera part yet
         if gaze is None:
             return True
-        if self._viewport_changed(gaze):  # for every command: the person can resize the viewport at any moment
-            record["gaze"] = {"status": "none", "targets": [], "radius": [], "matched_selection": None, "asked": False,
-                              "viewport_changed": True}
-            record["_gaze_note"] = VIEW_CHANGED
-            return True
         words, clip_start = record["words"], record["_t0"] - PREROLL  # the clip _transcribe cut starts here
         if not pointing_words(words, clip_start):
             return True
-        asked = settled = False
+        placed = self._placed(gaze, record["_look"] or GazeTrack())
+        if placed is None:
+            record["gaze"] = {"status": "none", "targets": [], "radius": [], "matched_selection": None, "asked": False,
+                              "not_on_screen": True}
+            record["_gaze_note"] = NOT_ON_SCREEN
+            return True
+        look, radius = placed
+        asked = settled = off_screen = False
+        sent: list[int] = []  # which targets had a picture sent: the record says so, and holds nothing of the image
         try:
-            grounding = ground(words, clip_start, record["_look"] or GazeTrack(), gaze.radius, self._pick, self._piece)
+            grounding = ground(words, clip_start, look, radius, self._pick, self._piece)
+            off_screen = not grounding.targets and mostly_off_screen(grounding.windows)
             if self.gaze_mode == "on" and grounding.status == "clarify":
                 asked, settled = True, self._settle(record, grounding, run)
             if self.gaze_mode == "on" and grounding.status == "resolved":  # watching only never takes a picture
-                self._look_closer(record, grounding, run)
+                self._look_closer(record, grounding, run, sent)
             found = grounding.to_dict()
         except Exception as exc:  # noqa: BLE001 - a dead socket or odd data from the host must not stop voice
             print(f"GazeVoice: gaze failed: {exc!r}", file=sys.stderr)
             found = {"status": "none", "targets": [], "radius": [], "error": repr(exc)}
         matched = self._matches_selection(found, record["focus"])
-        record["gaze"] = {**found, "matched_selection": matched, "asked": asked}
+        record["gaze"] = {**found, "matched_selection": matched, "asked": asked, "pictures_sent": sent}
         if matched is not None:
             with self._lock:
                 self._gaze_checked += 1
@@ -1366,7 +1520,7 @@ class VoiceService:
         if self.gaze_mode != "on":
             return True
         if not found["targets"]:
-            record["_gaze_note"] = GAZE_LOST
+            record["_gaze_note"] = GAZE_OFF_SCREEN if off_screen else GAZE_LOST
             return True
         if record["_stop"] or run.stop.is_set():  # "stop" was said while asking; _edit ends the command
             return True

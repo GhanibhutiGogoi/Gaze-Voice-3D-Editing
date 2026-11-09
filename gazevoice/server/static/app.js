@@ -90,6 +90,10 @@ const S = {
   forms: new Map(), // provider id -> unsaved key-form fields (the key is never sent back by the server)
   editing: new Set(), // provider ids whose saved key is being changed
   models: new Map(), // provider id -> {models, error} from GET /api/providers/<id>/models
+  thumbs: new Map(), // picture address -> its small picture element, loaded once and moved into each new draw of the list
+  oldThumbs: new Map(), // the ones the draw before this one used, while a draw is under way
+  gonePictures: new Set(), // addresses the control center no longer has a picture for
+  pictureView: null, // the full-size dialog, once it has been made: {dialog, img, caption, item}
 };
 
 const VOICE_WORDS = {
@@ -287,7 +291,7 @@ function resultLine(job) {
   }
   if (r.project) return `Project: ${r.project.split("/").pop()}`;
   if (r.launched) return "Launched";
-  if (r.calibrated) return typeof r.median === "number" ? `Typically off by ${Math.round(r.median * 100)}% of the viewport` : "Calibrated";
+  if (r.calibrated) return typeof r.median === "number" ? `Typically off by ${Math.round(r.median * 100)}% of the screen` : "Calibrated";
   if (r.tested) return typeof r.followed === "number" ? `The ring found you ${Math.round(r.followed * 100)}% of the time` : "Tested";
   if (r.installed) return "Installed";
   if (r.passed === true && r.claude) return `Pictures are cleaned up with Claude Code ${r.claude}`;
@@ -690,6 +694,10 @@ async function removeProvider(cid) {
 }
 
 function pressKey(comp, action) {
+  if (action.href) {
+    location.href = action.href;
+    return;
+  }
   if (action.confirm) {
     S.armed = { cid: comp.id, aid: action.id, until: Date.now() + ARM_MS };
     clearTimeout(pressKey.timer);
@@ -849,15 +857,18 @@ function renderVoice() {
     }
 
     const recent = v.recent || [];
-    box.append(recent.length
-      ? h("ol", { class: "cmd-list", "aria-label": "Recent commands" }, recent.slice(0, 12).map(commandRow))
-      : h("p", {
-        class: "cmd-empty",
-        text: on
-          ? `Nothing yet. Hold ${key} in ${hostName} and say something like “make this twice as tall”.`
-          : "Commands you speak show up here: what was heard, what was understood, and what changed.",
-      }));
+    box.append(commandList(recent, on
+      ? `Nothing yet. Hold ${key} in ${hostName} and say something like “make this twice as tall”.`
+      : "Commands you speak show up here: what was heard, what was understood, and what changed."));
   });
+}
+
+// The recent commands, or `emptyText` when there are none. Either way the small pictures of commands that are no longer
+// listed are let go, so an emptied list (a restarted dashboard, a rebuilt voice) leaves none behind.
+function commandList(recent, emptyText) {
+  return renderingPictures(() => recent.length
+    ? h("ol", { class: "cmd-list", "aria-label": "Recent commands" }, recent.map(commandRow))
+    : h("p", { class: "cmd-empty", text: emptyText }));
 }
 
 // With gaze on or watching, your selection is the right answer to "this", so how often gaze picked the same
@@ -901,6 +912,126 @@ function gazeLine(r) {
   return `${r.focus && r.focus.gaze ? "Gaze picked" : "Gaze would have picked"} ${said.join(" · ")}`;
 }
 
+// The pictures that went to the AI for this command, one for each pointing word it was sent for. `said` is what the AI
+// made of it (null when it couldn't tell). The picture itself is in the control center's memory, which keeps the last
+// 20 and nothing once it stops, so it may be gone. The record only says that one was sent, never what was in it.
+function sentPictures(r) {
+  const gaze = r.gaze;
+  if (!gaze || !Array.isArray(gaze.targets) || !Array.isArray(gaze.pictures_sent)) return [];
+  const items = [];
+  for (const number of gaze.pictures_sent) {
+    const target = Number.isInteger(number) && number >= 0 ? gaze.targets[number] : null;
+    if (!target) continue;
+    items.push({
+      number,
+      command: r.id,
+      word: target.word,
+      said: target.picture || null,
+      url: `/api/voice/pictures/${encodeURIComponent(r.id)}/${number}`,
+    });
+  }
+  return items;
+}
+
+function pictureLine(item, gone) {
+  const said = item.said ? `The AI said: “${item.said}”.` : "The AI couldn't say what was in it.";
+  const lost = gone ? " The picture isn't kept any more: only the last 20 are, and none after the dashboard stops." : "";
+  return `Picture sent for “${item.word}”. ${said}${lost}`;
+}
+
+// The list is drawn from scratch each time, but a small picture that has loaded is moved into the new draw, so that it
+// isn't fetched again (the control center tells the browser to keep none). Whatever the draw doesn't use is let go.
+function renderingPictures(draw) {
+  S.oldThumbs = S.thumbs;
+  S.thumbs = new Map();
+  try {
+    return draw();
+  } finally {
+    S.oldThumbs = new Map();
+  }
+}
+
+function pictureThumb(item) {
+  let img = S.thumbs.get(item.url) || S.oldThumbs.get(item.url);
+  if (!img) {
+    img = h("img", {
+      src: item.url,
+      alt: `The picture sent for “${item.word}”, with the gaze bubble on it`,
+      onerror: () => pictureGone(item),
+    });
+  }
+  S.thumbs.set(item.url, img);
+  const key = `picture-${item.url}`;
+  return h("button", {
+    class: "cmd-thumb",
+    type: "button",
+    "data-focus-key": key,
+    "aria-label": `Show the picture sent for “${item.word}” full size`,
+    title: "Show full size",
+    onclick: () => showPicture(item, key),
+  }, img);
+}
+
+// How a command's row is found again after the list has been drawn anew (see preservingFocus).
+function commandKey(id) {
+  return `command-${id}`;
+}
+
+function pictureGone(item) {
+  S.gonePictures.add(item.url);
+  S.thumbs.delete(item.url);
+  renderVoice();
+}
+
+function pictureRows(r) {
+  return sentPictures(r).map((item) => {
+    const gone = S.gonePictures.has(item.url);
+    const line = h("p", { class: "cmd-heard", text: pictureLine(item, gone) });
+    return h("div", { class: "cmd-picture" }, gone ? null : pictureThumb(item), line);
+  });
+}
+
+// One dialog for them all. showModal() gives it Escape, keeps the keyboard inside it, and darkens the page behind.
+function pictureView() {
+  if (S.pictureView) return S.pictureView;
+  const img = h("img", { class: "picture-view-img", alt: "" });
+  const caption = h("p", { class: "picture-view-caption", id: "picture-view-caption" });
+  const dialog = h("dialog", {
+    class: "picture-view",
+    "aria-label": "Picture sent to the AI",
+    "aria-describedby": "picture-view-caption",
+  }, img, caption, h("button", { class: "key", type: "button" }, "Close"));
+  const view = { dialog, img, caption, item: null };
+  dialog.addEventListener("click", () => dialog.close()); // the picture, the words, the button or the dark around it
+  // The focus goes back to the small picture. If that is gone from the page (the picture turned out not to be kept), it
+  // goes to the command's row instead, so it never falls to the top of the page.
+  dialog.addEventListener("close", () => {
+    const find = (key) => key && document.querySelector(`[data-focus-key="${CSS.escape(key)}"]`);
+    const again = find(dialog.dataset.opener) || (view.item && find(commandKey(view.item.command)));
+    if (again) again.focus({ preventScroll: true });
+  });
+  img.addEventListener("load", () => { img.hidden = false; }); // until then the last picture mustn't show in its place
+  img.addEventListener("error", () => {
+    img.hidden = true;
+    caption.textContent = pictureLine(view.item, true);
+    pictureGone(view.item);
+  });
+  document.body.append(dialog);
+  S.pictureView = view;
+  return view;
+}
+
+function showPicture(item, openerKey) {
+  const view = pictureView();
+  view.item = item;
+  view.img.hidden = true;
+  view.img.alt = `The picture sent for “${item.word}”, with the gaze bubble on it`;
+  view.img.src = item.url;
+  view.caption.textContent = pictureLine(item, false);
+  view.dialog.dataset.opener = openerKey || "";
+  view.dialog.showModal();
+}
+
 function commandRow(r) {
   const led = { done: "live", failed: "fault", stopped: "off" }[r.stage] || "busy";
   let understood = (r.kind === "ignore" ? `Not a ${voice().host === "unity" ? "Unity" : "Blender"} command` : KIND_WORDS[r.kind])
@@ -930,12 +1061,13 @@ function commandRow(r) {
     r.fallback && "used what was heard",
   ].filter(Boolean).join(" · ");
   const editedBy = r.model ? [r.provider, modelLabel(r.model), effortLabel(r.effort)].filter(Boolean).join(" · ") : "";
-  return h("li", { class: "cmd", "data-stage": r.stage },
+  return h("li", { class: "cmd", "data-stage": r.stage, "data-focus-key": commandKey(r.id), tabindex: "-1" },
     h("span", { class: "led", "data-led": led, "aria-hidden": "true" }),
     h("div", { class: "cmd-main" },
       h("p", { class: "cmd-understood", text: understood }),
       heard ? h("p", { class: "cmd-heard", text: heard }) : null,
       gazeLine(r) ? h("p", { class: "cmd-heard", text: gazeLine(r) }) : null,
+      pictureRows(r),
       r.prompt && r.prompt !== r.refined
         ? h("details", { class: "cmd-prompt" }, h("summary", { text: "Prompt sent to the editor" }), h("p", { text: r.prompt }))
         : null,
@@ -1041,7 +1173,8 @@ function upsertCommand(record) {
   const recent = (v.recent || []).filter((r) => r.id !== record.id);
   recent.unshift(record);
   recent.sort((a, b) => b.created - a.created);
-  S.voice = { ...v, recent: recent.slice(0, 20) };
+  // The service says how many it keeps (recent_limit), and the page keeps as many. Not told yet: nothing is cut.
+  S.voice = { ...v, recent: v.recent_limit ? recent.slice(0, v.recent_limit) : recent };
 }
 
 // ---------- routing (settings) ----------
@@ -1073,7 +1206,7 @@ function gazeRows(settings) {
     h("p", { class: "route-note", text: "Gaze tells the editor what you were looking at when you say this, that or there. Watch only records it and compares it with your selection, but changes nothing. Mouse uses the pointer over Blender's 3D viewport while you hold the key. Camera uses the Gaze unit in the rack: it has to be installed and calibrated, and until then voice uses your selection. The camera is only on while voice is on, or while you calibrate or test it, and no picture from the camera is kept." }),
     routeRow("Pictures · each unnamed target uses a little of your plan", "gaze_pictures", settings.gaze_pictures === true,
       [[false, "Off"], [true, "On"]]),
-    h("p", { class: "route-note", text: "When gaze is On and you look at a big part of a model that has nothing to name it, a picture of just that spot in Blender's viewport (never your camera) goes to a short-lived Claude Code process, which says in a few words what it shows. Only those words reach the editor. Pictures stay off until you turn them on here and press Check pictures get cleaned up on the Gaze unit; a new Claude Code version needs the check again. GazeVoice never saves a picture. Claude Code gets it for one reply, and the check looks for any copy left behind. Anthropic keeps what's sent under your account's terms." }),
+    h("p", { class: "route-note", text: "When gaze is On and you look at a big part of a model that has nothing to name it, a picture of just that spot in Blender's viewport (never your camera) goes to a short-lived Claude Code process, which says in a few words what it shows. Only those words reach the editor. Pictures stay off until you turn them on here and press Check pictures get cleaned up on the Gaze unit; a new Claude Code version needs the check again. GazeVoice never saves a picture. Claude Code gets it for one reply, and the check looks for any copy left behind. Anthropic keeps what's sent under your account's terms. The dashboard keeps the last 20 pictures in memory so you can see what the AI was shown, and drops them when it stops." }),
   ];
 }
 
