@@ -7,24 +7,41 @@
 - Shows GazeVoice's status at the bottom-left of every 3D viewport and in the
   sidebar's "GazeVoice" tab.
 - Lets the app add one undo step per voice command, and undo or redo by voice.
+- Answers what is under a point in the largest 3D viewport and what part of the model
+  that is, draws the app's gaze dot, ring and numbered marks there, and while the key is
+  held reports the mouse as a stand-in for gaze. None of that edits the scene.
+- Shows a see-through, gliding bubble in that viewport wherever the app says the person is looking, while voice
+  runs with camera gaze. It is drawn on top of the viewport and edits nothing.
+- Can hand the app a picture of the part of the viewport around a target that has no name,
+  with the same bubble drawn on it. It is taken from the GPU's memory, held in memory until the app
+  reads it once, and never written to a file.
 
 Listens on 127.0.0.1 only. A bpy timer polls a non-blocking socket, so all
-scene access happens on Blender's main thread. Later, gaze plugs in here.
+scene access happens on Blender's main thread.
 """
 
 from __future__ import annotations
 
+import math
+import os
 import socket
 import time
 
 import blf
 import bpy
+import gpu
+from bpy_extras import view3d_utils
+from gpu_extras.batch import batch_for_shader
+from mathutils import Matrix, Vector
+from mathutils.bvhtree import BVHTree
 
 from . import protocol
 
 HOST = "127.0.0.1"
 POLL_SECONDS = 0.1
 MAX_HOLD_SECONDS = 60.0
+# Seconds between mouse reports while the key is held. A little over 1/MAX_POINTER_RATE, so none is dropped.
+POINTER_TICK = 0.06
 FRESH_STATUS_SECONDS = 6.0  # a status set this recently shows even while voice is off (the Test key's)
 DEFAULT_KEY = "⌥ Space"
 VOICE_OFF = "Voice is off. Turn it on in the GazeVoice dashboard."
@@ -40,6 +57,30 @@ STATE_COLORS = {
     "error": (1.0, 0.40, 0.35, 1.0),
 }
 STATE_ICONS = {"idle": "INFO", "listening": "REC", "working": "TIME", "done": "CHECKMARK", "error": "ERROR"}
+GAZE_COLOR = (0.40, 0.72, 1.0, 0.95)  # the dot and the ring
+MARK_COLOR = (1.0, 0.80, 0.25, 1.0)  # a numbered mark's disc
+MARK_TEXT_COLOR = (0.08, 0.08, 0.08, 1.0)
+DOT_RADIUS = 7  # pixels
+MARK_RADIUS = 12
+RING_WIDTH = 2.5
+CIRCLE_STEPS = 48
+CROP_TICK = 0.05  # seconds between repaint requests while a crop waits for the viewport to draw
+# The live gaze marker: a see-through bubble that glides after the eyes, like the ones in eye-tracking videos. All of
+# its look is here and in _draw_marker.
+MARKER_SIZE = 90  # points across: the same on any display
+MARKER_COLOR = tuple(c / 255 for c in protocol.BUBBLE_COLOR)  # aqua, the same as the bubble on a picture
+# A deep teal just outside the rim: it shows on a light part of the scene, and on a dark one it all but disappears,
+# where the aqua shows instead.
+MARKER_EDGE_COLOR = (0.0, 0.30, 0.26)
+# How the bubble looks from its middle out to its edge, as (share of the radius, colour, opacity), blended smoothly
+# from one to the next: faint all over, a faint rim near the edge, and fading to nothing at the edge itself, so it is
+# soft. Nowhere strong enough to hide the model under it.
+MARKER_PROFILE = ((0.0, MARKER_COLOR, 0.05), (0.60, MARKER_COLOR, 0.07), (0.82, MARKER_COLOR, 0.24),
+                  (0.89, MARKER_COLOR, 0.28), (0.95, MARKER_EDGE_COLOR, 0.16), (1.0, MARKER_EDGE_COLOR, 0.0))
+MARKER_STEPS = 96  # points round its outline: it is big enough that fewer would show corners
+MARKER_STRETCH_POINTS = 90.0  # moving this many points a step (its own width) stretches it to twice as long
+MARKER_MAX_STRETCH = 0.45  # and it never gets more than this much longer
+MARKER_TRAIL = 0.4  # how far back along its way a stretched bubble reaches, as a share of the stretch
 
 _server: socket.socket | None = None
 _clients: dict[socket.socket, bytearray] = {}
@@ -47,7 +88,13 @@ _events = protocol.EventQueue()
 _status = {"text": "", "state": "idle", "last": "", "at": 0.0}
 _changed = {"since_mark": True}
 _shown = {"status": False, "live": False}  # what the viewport and sidebar last showed
+_gaze = {"dot": None, "ring": None, "marks": [], "marker": None}  # what the app asked to have drawn
+_marker_glide = protocol.MarkerGlide()  # where the marker is drawn now, on its way to _gaze["marker"]
+_marker_repaints = protocol.Repaints()  # when it may ask the viewport to repaint
 _draw_handle = None
+_marker_fault = {"said": False}  # whether a failure to draw the marker has been printed yet
+_crop = protocol.CropSlot()  # the picture asked for with gaze_crop, until the app reads it
+_crop_job = {"handle": None, "wanted": None}  # its one-off draw handler, and (u, v, radius, size)
 _addon_keymaps: list = []
 
 
@@ -111,6 +158,144 @@ def _run_op(op, **kwargs) -> bool:
     return "FINISHED" in result
 
 
+def _target():
+    """(window, area, main region) of the 3D viewport gaze looks at, or None.
+
+    It is the largest VIEW_3D area in the first window, and the first of equals, so it is the same one every time.
+    """
+    windows = bpy.context.window_manager.windows
+    best = None
+    for area in windows[0].screen.areas if windows else ():
+        region = next((r for r in area.regions if r.type == "WINDOW"), None) if area.type == "VIEW_3D" else None
+        if region is None or region.width <= 0 or region.height <= 0:
+            continue
+        if best is None or area.width * area.height > best[1].width * best[1].height:
+            best = (windows[0], area, region)
+    return best
+
+
+def _pixels_per_point(window) -> int:
+    """How many pixels make one point of the window's own size: 2 on a Retina screen."""
+    across = max(area.x + area.width for area in window.screen.areas)  # in pixels; window.width is in points
+    return max(1, round(across / window.width))
+
+
+def _mirrored_points(obj, local: Vector) -> list[Vector]:
+    """`local` (a point in obj's space) and where it lands reflected across the planes of obj's Mirror modifiers,
+    in every combination: a mirrored copy of the mesh is where the evaluated surface is, not the original's."""
+    points = [local]
+    for modifier in obj.modifiers:
+        if modifier.type != "MIRROR" or not modifier.show_viewport:
+            continue
+        # the planes pass through the origin of the mirror object, else of obj itself
+        into = Matrix.Identity(4)
+        if modifier.mirror_object is not None:
+            into = modifier.mirror_object.matrix_world.inverted() @ obj.matrix_world
+        back = into.inverted()
+        for axis in range(3):
+            if not modifier.use_axis[axis]:
+                continue
+            for point in list(points):
+                flipped = into @ point
+                flipped[axis] = -flipped[axis]
+                points.append(back @ flipped)
+    return points
+
+
+def _end_crop() -> None:
+    """Remove the pending crop's draw handler, if there is one."""
+    handle, _crop_job["handle"] = _crop_job["handle"], None
+    if handle is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(handle, "WINDOW")
+
+
+def _crop_tick() -> float | None:
+    """A timer, alive while a crop is pending or its picture is unread: ask the target viewport to repaint (its draw
+    handler runs only then) until the crop is made or given up on, remove the handler, then keep looking at the slot,
+    which drops a picture nobody reads after CROP_KEEP_SECONDS."""
+    state = _crop.state
+    if state == "pending":
+        target = _target()
+        if target is not None:
+            target[1].tag_redraw()
+        return CROP_TICK
+    _end_crop()
+    return POLL_SECONDS if state == "ready" else None  # None unregisters the timer
+
+
+def _marker_tick() -> float | None:
+    """A timer, alive only while the gaze marker is showing, fading or waiting for its last repaint: it moves the marker
+    one step towards where the app says the eyes are, and asks the gaze viewport (only that one, and only its main
+    region) to repaint when what is drawn has changed. A repaint draws the whole 3D view again, so `_marker_repaints`
+    lets only one wait at a time, and no sooner after one than that one took to draw."""
+    if not _events.live():  # the app is gone: it isn't there to say the eyes have moved on
+        _gaze["marker"] = None
+        _marker_glide.reset()
+        changed = True
+    else:
+        changed = _marker_glide.step(_gaze["marker"])
+    target = _target()
+    if target is not None:
+        if changed:
+            _marker_repaints.want()
+        if _marker_repaints.ask(time.monotonic()):
+            target[2].tag_redraw()
+    if _gaze["marker"] is not None or _marker_glide.showing or (target is not None and _marker_repaints.pending):
+        return protocol.MARKER_TICK
+    return None  # unregisters the timer
+
+
+def _crop_png(context, u: float, v: float, radius: list[float], size: int) -> bytes:
+    """Draw the viewport into an offscreen buffer, cut out the box around the target, scale it so its long side is
+    `size`, draw the gaze bubble on it and encode it as PNG. All in memory; call it from a draw handler. The live
+    marker is not in it: drawing the viewport offscreen leaves out what add-ons draw on top."""
+    import numpy as np  # Blender bundles it; imported here so that a missing one fails this crop, not the add-on
+
+    region, region_3d = context.region, context.region_data
+    wanted = protocol.crop_box(u, v, radius, region.width, region.height)
+    # Draw no bigger than the picture needs: a box wider than `size` is drawn smaller, a small one at full size.
+    scale = min(1.0, size / max(wanted[2] - wanted[0], wanted[3] - wanted[1]))
+    width, height = max(1, round(region.width * scale)), max(1, round(region.height * scale))
+    offscreen = gpu.types.GPUOffScreen(width, height)
+    try:
+        offscreen.draw_view3d(
+            context.scene, context.view_layer, context.space_data, region,
+            region_3d.view_matrix, region_3d.window_matrix,
+            do_color_management=True,  # without it the picture comes out far too dark
+            draw_background=True,
+        )
+        with offscreen.bind():
+            buffer = gpu.state.active_framebuffer_get().read_color(0, 0, width, height, 4, 0, "UBYTE")
+        shot = np.frombuffer(bytes(buffer), dtype=np.uint8).reshape(height, width, 4)  # never buffer.to_list(): 300 ms
+    finally:
+        offscreen.free()
+    box = protocol.crop_box(u, v, radius, width, height)
+    left, top, right, bottom = box
+    out_width, out_height = protocol.crop_size(box, size)
+    # The GPU hands back the bottom row first, with alpha; the picture wants the top row first, without.
+    piece = shot[height - bottom : height - top, left:right, :3][::-1]
+    rows = (np.arange(out_height) * 2 + 1) * (bottom - top) // (2 * out_height)  # nearest neighbour
+    columns = (np.arange(out_width) * 2 + 1) * (right - left) // (2 * out_width)
+    pixels = bytearray(piece[rows][:, columns].tobytes())
+    bubble = protocol.bubble_in_crop(u, v, radius, width, height, box, (out_width, out_height))
+    protocol.draw_bubble(pixels, out_width, out_height, *bubble)
+    return protocol.encode_png(out_width, out_height, bytes(pixels))
+
+
+def _grab_crop() -> None:
+    """The pending crop's one-off POST_PIXEL draw handler: it runs inside a viewport repaint, the only place the
+    viewport can be drawn into a buffer. It never raises; a failure becomes the crop's error."""
+    if _crop.state != "pending" or _crop_job["wanted"] is None:
+        return
+    target, area = _target(), bpy.context.area
+    if target is None or area is None or target[1].as_pointer() != area.as_pointer():
+        return  # another 3D viewport repainted; wait for the target's
+    try:
+        _crop.finish(_crop_png(bpy.context, *_crop_job["wanted"]))
+    except Exception as exc:  # noqa: BLE001 - a draw handler must not raise
+        _crop.fail(f"couldn't capture the viewport ({exc})")
+
+
 class BpyScene:
     """protocol.SceneAccess backed by the live Blender session."""
 
@@ -170,6 +355,121 @@ class BpyScene:
 
     def mark_unchanged(self) -> None:
         _changed["since_mark"] = False
+
+    def gaze_view(self) -> tuple[int, int] | None:
+        target = _target()
+        return (target[2].width, target[2].height) if target else None
+
+    def gaze_place(self) -> dict | None:
+        target = _target()
+        if target is None:
+            return None
+        window, _area, region = target
+        return {"x": region.x, "y": region.y, "scale": _pixels_per_point(window),
+                "window_width": window.width, "window_height": window.height, "pid": os.getpid()}
+
+    def gaze_pick(self, points: list[tuple[float, float]]) -> list[dict | None] | None:
+        target = _target()
+        if target is None:
+            return None
+        _window, area, region = target
+        region_3d = area.spaces.active.region_3d
+        scene = bpy.context.scene
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        hits = []
+        for u, v in points:
+            coord = (u * region.width, (1.0 - v) * region.height)
+            origin = view3d_utils.region_2d_to_origin_3d(region, region_3d, coord)
+            direction = view3d_utils.region_2d_to_vector_3d(region, region_3d, coord)
+            hit, location, _normal, _face, obj, _matrix = scene.ray_cast(depsgraph, origin, direction)
+            if not hit or obj is None:
+                hits.append(None)
+                continue
+            original = obj.original
+            hits.append({
+                "uid": original.session_uid,
+                "name": original.name,
+                "faces": len(original.data.polygons) if original.type == "MESH" else 0,
+                "point": [round(c, 6) for c in location],
+            })
+        return hits
+
+    def gaze_piece(self, uid: int, point: tuple[float, float, float]) -> dict | None:
+        obj = next((o for o in bpy.data.objects if o.session_uid == uid), None)
+        if obj is None or obj.type != "MESH":
+            return None
+        if obj.mode == "EDIT":
+            obj.update_from_editmode()  # until this, obj.data doesn't hold what was done since Edit Mode began
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        world = Vector(point)
+        mesh = obj.data
+        material_count = sum(1 for slot in obj.material_slots if slot.material)
+
+        # The original face, which the modifiers renumber: nearest point on the cage.
+        faces = [tuple(polygon.vertices) for polygon in mesh.polygons]
+        face = None
+        if faces:
+            cage = BVHTree.FromPolygons([vertex.co.copy() for vertex in mesh.vertices], faces)
+            nearest = None
+            for candidate in _mirrored_points(obj, obj.matrix_world.inverted() @ world):
+                found = cage.find_nearest(candidate)
+                if found[2] is not None and (nearest is None or found[3] < nearest[3]):
+                    nearest = found
+            face = nearest[2] if nearest else None
+
+        # The face you see: nearest point on the evaluated mesh, so a mirrored wing reads Wing.R. In Edit Mode with
+        # no modifier showing, that mesh has no polygons and can't be searched, and what you see is the original.
+        evaluated = obj.evaluated_get(depsgraph)
+        seen_mesh = evaluated.data
+        if obj.mode == "EDIT" and not seen_mesh.polygons:
+            seen_mesh, seen = mesh, -1 if face is None else face
+        else:
+            _found, _location, _normal, seen = evaluated.closest_point_on_mesh(
+                evaluated.matrix_world.inverted() @ world, depsgraph=depsgraph)
+        weights: dict[str, float] = {}
+        material = None
+        if 0 <= seen < len(seen_mesh.polygons):
+            polygon = seen_mesh.polygons[seen]
+            for index in polygon.vertices:
+                for element in seen_mesh.vertices[index].groups:
+                    name = evaluated.vertex_groups[element.group].name
+                    weights[name] = weights.get(name, 0.0) + element.weight
+            if polygon.material_index < len(obj.material_slots):
+                slot_material = obj.material_slots[polygon.material_index].material
+                material = slot_material.name if slot_material else None
+        part = protocol.face_part(weights, material, material_count)
+
+        piece_faces = None
+        if face is not None and len(faces) <= protocol.MAX_PIECE_FACES:
+            piece_faces = protocol.linked_face_count(faces, face)
+        return {"face": face, "part": part, "piece_faces": piece_faces, "object_faces": len(faces)}
+
+    def gaze_show(self, dot: list | None, ring: list | None, marks: list[dict]) -> None:
+        _gaze.update(dot=dot, ring=ring, marks=marks)
+        _redraw()
+
+    def gaze_marker(self, at: list | None) -> None:
+        _gaze["marker"] = at
+        if (at is not None or _marker_glide.showing) and not bpy.app.timers.is_registered(_marker_tick):
+            bpy.app.timers.register(_marker_tick, first_interval=0.0, persistent=True)
+
+    def gaze_crop(self, u: float, v: float, radius: list[float], size: int) -> str | None:
+        if _target() is None:
+            return "no 3D viewport"
+        if not _crop.begin():
+            return "a picture is already being taken"
+        _end_crop()  # the last crop's handler, if its timer hasn't removed it yet
+        _crop_job["wanted"] = (u, v, radius, size)
+        _crop_job["handle"] = bpy.types.SpaceView3D.draw_handler_add(_grab_crop, (), "WINDOW", "POST_PIXEL")
+        if not bpy.app.timers.is_registered(_crop_tick):
+            bpy.app.timers.register(_crop_tick, first_interval=0.0, persistent=True)
+        return None
+
+    def gaze_crop_result(self) -> dict:
+        result = _crop.read()
+        if "pending" not in result:
+            _end_crop()  # done, failed or timed out: nothing is waiting for a draw any more
+        return result
 
 
 # --- socket server ----------------------------------------------------------------
@@ -267,6 +567,17 @@ def _voice_ready(operator) -> bool:
     return True
 
 
+def _pointer_uv(context, event) -> tuple[float, float] | None:
+    """Where the mouse is across the gaze viewport, 0 to 1 from the top left; None when it is anywhere else."""
+    target = _target()
+    if target is None or context.window != target[0]:
+        return None
+    region = target[2]
+    u = (event.mouse_x - region.x) / region.width
+    v = 1.0 - (event.mouse_y - region.y) / region.height
+    return (u, v) if 0.0 <= u <= 1.0 and 0.0 <= v <= 1.0 else None
+
+
 class GAZEVOICE_OT_push_to_talk(bpy.types.Operator):
     """Hold to talk to GazeVoice; release to send. Esc cancels"""
 
@@ -279,22 +590,45 @@ class GAZEVOICE_OT_push_to_talk(bpy.types.Operator):
         self._key = event.type
         self._started = time.time()
         _queue("ptt", state="down")
-        context.window_manager.modal_handler_add(self)
+        self._report_pointer(context, event)  # where the mouse is as the key goes down
+        manager = context.window_manager
+        # A mouse resting on the part you mean sends no move events, so a timer reports it while the key is held.
+        self._timer = manager.event_timer_add(POINTER_TICK, window=context.window)
+        manager.modal_handler_add(self)
         return {"RUNNING_MODAL"}
+
+    @staticmethod
+    def _report_pointer(context, event):
+        position = _pointer_uv(context, event)
+        if position is not None:
+            _events.add_pointer(*position)  # the mouse stands in for gaze while the key is held
+
+    def _stop_timer(self, context):
+        timer, self._timer = getattr(self, "_timer", None), None
+        if timer is not None:
+            context.window_manager.event_timer_remove(timer)
 
     def modal(self, context, event):
         if event.type == self._key and event.value == "RELEASE":
+            self._stop_timer(context)
             _queue("ptt", state="up")
             return {"FINISHED"}
         if (event.type == "ESC" and event.value == "PRESS") or event.type == "WINDOW_DEACTIVATE":
+            self._stop_timer(context)
             _queue("ptt", state="cancel")  # Esc, or Blender lost focus (the release would never come)
             return {"CANCELLED"}
         if time.time() - self._started > MAX_HOLD_SECONDS:
+            self._stop_timer(context)
             _queue("ptt", state="cancel")  # a key stuck down mustn't send a minute of room audio
             return {"CANCELLED"}
         if event.type == self._key:
             return {"RUNNING_MODAL"}  # swallow key repeats (Space would play the animation)
+        if event.type in ("MOUSEMOVE", "TIMER"):
+            self._report_pointer(context, event)
         return {"PASS_THROUGH"}
+
+    def cancel(self, context):
+        self._stop_timer(context)  # Blender ended the hold some other way, say by loading a file
 
 
 class GAZEVOICE_OT_talk_toggle(bpy.types.Operator):
@@ -336,7 +670,131 @@ class GAZEVOICE_PT_panel(bpy.types.Panel):
         layout.label(text=f"Or hold {BpyScene().key_label()} anywhere")
 
 
+def _draw_shape(kind: str, points: list[tuple[float, float]], color: tuple, width: float = 0.0) -> None:
+    if width:
+        shader = gpu.shader.from_builtin("POLYLINE_UNIFORM_COLOR")
+        shader.uniform_float("viewportSize", gpu.state.viewport_get()[2:])
+        shader.uniform_float("lineWidth", width)
+    else:
+        shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+    shader.uniform_float("color", color)
+    batch_for_shader(shader, kind, {"pos": points}).draw(shader)
+
+
+def _ellipse(x: float, y: float, rx: float, ry: float) -> list[tuple[float, float]]:
+    angles = (2.0 * math.pi * i / CIRCLE_STEPS for i in range(CIRCLE_STEPS))
+    return [(x + rx * math.cos(a), y + ry * math.sin(a)) for a in angles]
+
+
+def _disc(x: float, y: float, radius: float) -> list[tuple[float, float]]:
+    """A filled circle as a triangle fan."""
+    rim = _ellipse(x, y, radius, radius)
+    return [(x, y)] + rim + [rim[0]]
+
+
+def _oval(x: float, y: float, along: float, across: float, cos_t: float, sin_t: float) -> list[tuple[float, float]]:
+    """MARKER_STEPS points round an oval: half-length `along` in the direction (cos_t, sin_t), half-width `across`."""
+    rim = []
+    for i in range(MARKER_STEPS):
+        angle = 2.0 * math.pi * i / MARKER_STEPS
+        ex, ey = along * math.cos(angle), across * math.sin(angle)
+        rim.append((x + ex * cos_t - ey * sin_t, y + ex * sin_t + ey * cos_t))
+    return rim
+
+
+def _draw_marker() -> None:
+    """The live gaze marker: a see-through bubble, faint all over with a faint rim, soft at its edge and with no core,
+    so the model shows through every part of it. While it travels it stretches along its way, its rim trailing a
+    little behind, and when it stops it relaxes into a round drop. This is the one place that decides what it looks
+    like. POST_PIXEL only, and in the gaze viewport only, like the dot."""
+    glide = _marker_glide
+    if not (glide.showing or _marker_repaints.waiting):  # the common case, on every repaint: nothing to do
+        return
+    target, area = _target(), bpy.context.area
+    if target is None or area is None or target[1].as_pointer() != area.as_pointer():
+        return
+    _marker_repaints.drawn(time.monotonic())
+    if not glide.showing or not _events.live():
+        return
+    region = bpy.context.region
+    width, height = region.width, region.height
+    scale = _pixels_per_point(target[0])
+    x, y = glide.x * width, (1.0 - glide.y) * height  # pixels from the region's bottom left
+    moved_x, moved_y = glide.vx * width, -glide.vy * height  # its way over the last steps, up being positive
+    speed = math.hypot(moved_x, moved_y)
+    stretch = min(MARKER_MAX_STRETCH, speed / (MARKER_STRETCH_POINTS * scale))
+    cos_t, sin_t = (moved_x / speed, moved_y / speed) if speed > 0 else (1.0, 0.0)
+    radius = MARKER_SIZE / 2 * scale
+    rings = []  # one oval for each step of MARKER_PROFILE, with its colour
+    for share, rgb, opacity in MARKER_PROFILE:
+        r = radius * share
+        along, across = r * (1.0 + stretch), r / math.sqrt(1.0 + stretch)
+        back = (along - r) * MARKER_TRAIL * share  # the further out, the further it trails, so the rim lags behind
+        rings.append((_oval(x - cos_t * back, y - sin_t * back, along, across, cos_t, sin_t),
+                      (*rgb, opacity * glide.alpha)))
+    points, colors = [], []
+    for (inner, inner_color), (outer, outer_color) in zip(rings, rings[1:]):  # the band between each two ovals
+        for i in range(MARKER_STEPS):
+            j = (i + 1) % MARKER_STEPS
+            points += (inner[i], outer[i], outer[j], inner[i], outer[j], inner[j])
+            colors += (inner_color, outer_color, outer_color, inner_color, outer_color, inner_color)
+    gpu.state.blend_set("ALPHA")
+    shader = gpu.shader.from_builtin("SMOOTH_COLOR")  # blends each band's colours smoothly from its inside out
+    batch_for_shader(shader, "TRIS", {"pos": points, "color": colors}).draw(shader)
+    gpu.state.blend_set("NONE")
+
+
+def _draw_gaze() -> None:
+    """The dot, ring and numbered marks, in the gaze viewport only and only while the app is there to clear them."""
+    if not (_gaze["dot"] or _gaze["ring"] or _gaze["marks"]) or not _events.live():
+        return
+    target, area = _target(), bpy.context.area
+    if target is None or area is None or target[1].as_pointer() != area.as_pointer():
+        return
+    width, height = bpy.context.region.width, bpy.context.region.height
+
+    def at(u: float, v: float) -> tuple[float, float]:
+        return u * width, (1.0 - v) * height  # pixels from the region's bottom left
+
+    gpu.state.blend_set("ALPHA")
+    if _gaze["ring"]:
+        u, v, ru, rv = _gaze["ring"]
+        _draw_shape("LINE_LOOP", _ellipse(*at(u, v), ru * width, rv * height), GAZE_COLOR, RING_WIDTH)
+    if _gaze["dot"]:
+        x, y = at(*_gaze["dot"])
+        _draw_shape("TRI_FAN", _disc(x, y, DOT_RADIUS), GAZE_COLOR)
+    font = 0
+    blf.size(font, 14)
+    for mark in _gaze["marks"]:
+        x, y = at(mark["u"], mark["v"])
+        _draw_shape("TRI_FAN", _disc(x, y, MARK_RADIUS), MARK_COLOR)
+        number = str(mark["n"])
+        text_width, text_height = blf.dimensions(font, number)
+        blf.color(font, *MARK_TEXT_COLOR)
+        blf.position(font, x - text_width / 2, y - text_height / 2, 0)
+        blf.draw(font, number)
+        if mark["name"]:
+            blf.enable(font, blf.SHADOW)
+            blf.shadow(font, 3, 0.0, 0.0, 0.0, 0.8)
+            blf.color(font, *MARK_COLOR)
+            blf.position(font, x + MARK_RADIUS + 6, y - text_height / 2, 0)
+            blf.draw(font, mark["name"])
+            blf.disable(font, blf.SHADOW)
+    gpu.state.blend_set("NONE")
+
+
 def _draw_status() -> None:
+    try:
+        _draw_marker()
+    except Exception as exc:  # noqa: BLE001 - the marker is a nicety: it mustn't stop the dot, ring, numbers and status line
+        try:
+            gpu.state.blend_set("NONE")  # it may have stopped half way through, with blending on
+        except Exception:  # noqa: BLE001
+            pass
+        if not _marker_fault["said"]:  # this runs on every redraw: say it once
+            _marker_fault["said"] = True
+            print(f"GazeVoice Bridge: the marker failed to draw ({exc!r}). The rest still draws.")
+    _draw_gaze()
     if not _status_visible():
         return
     text = _status["text"]
@@ -388,6 +846,15 @@ def register() -> None:
 def unregister() -> None:
     global _draw_handle
     _stop_server()
+    if bpy.app.timers.is_registered(_crop_tick):
+        bpy.app.timers.unregister(_crop_tick)
+    _end_crop()
+    _crop.drop()  # a picture nobody read goes with the add-on
+    _crop_job["wanted"] = None
+    if bpy.app.timers.is_registered(_marker_tick):
+        bpy.app.timers.unregister(_marker_tick)
+    _gaze.update(dot=None, ring=None, marks=[], marker=None)
+    _marker_glide.reset()
     _unregister_keymap()
     if _on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph_update)

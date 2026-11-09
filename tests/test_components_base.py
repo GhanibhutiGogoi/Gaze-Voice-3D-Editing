@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 
-from gazevoice.components.base import ActionSpec, Component, Context, Health
+from gazevoice.components.base import ActionSpec, CameraClaim, Component, Context, Health
 from gazevoice.events import EventBus
 from gazevoice.jobs import Job, JobError
 from gazevoice.paths import AppPaths
@@ -43,7 +43,7 @@ class ComponentBaseTest(unittest.TestCase):
                 "health": "ready",
                 "summary": "All good",
                 "details": [["Version", "5.2.2"]],
-                "actions": [{"id": "install", "label": "Install", "confirm": None, "uses_plan": False}],
+                "actions": [{"id": "install", "label": "Install", "confirm": None, "uses_plan": False, "href": None}],
             },
         )
 
@@ -65,3 +65,31 @@ class ComponentBaseTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CameraClaimTest(unittest.TestCase):
+    def test_one_user_at_a_time(self):
+        camera = CameraClaim()
+        self.assertIsNone(camera.holder)
+        self.assertIsNone(camera.take("voice"))  # None means it is yours
+        self.assertEqual(camera.holder, "voice")
+        self.assertEqual(camera.take("gaze"), "voice")  # and who has it, when it isn't
+        self.assertEqual(camera.take("voice"), "voice")  # taking it twice is not holding it twice
+        camera.release("voice")
+        self.assertIsNone(camera.holder)
+        self.assertIsNone(camera.take("gaze"))
+
+    def test_only_the_holder_can_give_it_back(self):
+        camera = CameraClaim()
+        camera.take("voice")
+        camera.release("gaze")  # a refused user cleaning up must not take voice's camera away
+        self.assertEqual(camera.holder, "voice")
+        camera.release("voice")
+        camera.release("voice")  # twice is fine
+        self.assertIsNone(camera.holder)
+
+    def test_a_context_has_one_by_default_and_each_context_its_own(self):
+        a, b = make_ctx(), make_ctx()
+        a.camera.take("voice")
+        self.assertEqual(a.camera.holder, "voice")
+        self.assertIsNone(b.camera.holder)

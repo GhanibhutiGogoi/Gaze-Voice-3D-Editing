@@ -1,4 +1,7 @@
 import json
+import os
+import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -11,6 +14,15 @@ from gazevoice.voice.brains import BrainError, ClaudeSession, CodexSession, clau
 FIXTURES = Path(__file__).parent / "fixtures"
 FAKE_CLAUDE = [sys.executable, str(FIXTURES / "fake_claude.py")]
 FAKE_CODEX = [sys.executable, str(FIXTURES / "fake_codex.py")]
+
+
+def wait_for_exit(session, seconds=3.0):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if not session.alive:
+            return True
+        time.sleep(0.02)
+    return not session.alive
 
 
 class ArgvTest(unittest.TestCase):
@@ -61,6 +73,137 @@ class ClaudeSessionTest(unittest.TestCase):
             self.assertEqual(s.turns, 2)
         finally:
             s.close()
+
+    def test_send_takes_content_blocks_as_well_as_text(self):
+        record = Path(self.tmp.name) / "stdin.json"
+        blocks = [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}},
+                  {"type": "text", "text": "What is in the ring?"}]
+        s = self.session(env={"FAKE_CLAUDE_STDIN_OUT": str(record), "FAKE_CLAUDE_PICTURE": "a wing tip"})
+        s.start()
+        try:
+            picture = s.send(blocks)
+            text = s.send("hello")  # strings go as they always did
+        finally:
+            s.close()
+        self.assertEqual((picture.text, picture.is_error), ("a wing tip", False))
+        self.assertEqual(text.text, "echo: hello")
+        sent = json.loads(record.read_text())
+        self.assertEqual((sent["types"], sent["media_type"], sent["length"], sent["text"]),
+                         (["image", "text"], "image/png", len("iVBORw0KGgo="), "What is in the ring?"))
+
+    def test_nothing_that_was_sent_is_kept_by_the_session(self):
+        data = "iVBORw0KGgo" + "A" * 5000
+        blocks = [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}},
+                  {"type": "text", "text": "What is in the ring?"}]
+        s = self.session()
+        s.start()
+        try:
+            s.send(blocks)
+            kept = repr({k: v for k, v in vars(s).items() if k not in ("proc", "_threads")})
+            kept += repr(list(s._stderr)) + repr(s.init) + repr(list(s._events.queue))
+        finally:
+            s.close()
+        self.assertNotIn("iVBOR", kept)
+
+    def test_kill_ends_a_process_that_is_busy_and_is_safe_to_repeat(self):
+        s = self.session()
+        s.kill()  # not started yet: nothing to do
+        s.start()
+        outcome = []
+
+        def busy():
+            try:
+                outcome.append(s.send("slow", timeout=10))
+            except BrainError as exc:
+                outcome.append(exc)
+
+        thread = threading.Thread(target=busy, daemon=True)
+        thread.start()
+        time.sleep(0.3)
+        began = time.monotonic()
+        s.kill()
+        s.kill()
+        self.assertTrue(wait_for_exit(s))
+        thread.join(3)
+        self.assertLess(time.monotonic() - began, 2.0)
+        self.assertIsInstance(outcome[0], BrainError)  # the turn that was running learns the process is gone
+        s.close()
+
+    def test_release_returns_at_once_and_the_process_leaves_by_itself(self):
+        left = Path(self.tmp.name) / "left"
+        s = self.session(env={"FAKE_CLAUDE_EXIT_DELAY": "0.6", "FAKE_CLAUDE_EXIT_OUT": str(left)})
+        s.start()
+        s.send("hello")
+        began = time.monotonic()
+        leaving = s.release()
+        self.assertLess(time.monotonic() - began, 0.3)  # does not wait for the tidying up
+        self.assertTrue(s.alive)
+        leaving.join(5)
+        self.assertFalse(leaving.is_alive())
+        self.assertEqual((s.alive, s.proc.returncode, left.read_text()), (False, 0, "left"))  # left, wasn't killed
+
+    def test_release_asks_a_process_that_will_not_leave_to_stop_and_then_kills_it(self):
+        asked = Path(self.tmp.name) / "asked"
+        s = self.session(env={"FAKE_CLAUDE_EXIT_DELAY": "60", "FAKE_CLAUDE_IGNORE_TERM": str(asked)})
+        s.start()
+        s.send("hello")
+        began = time.monotonic()
+        leaving = s.release(wait=0.3, term_wait=0.3)
+        leaving.join(5)
+        self.assertLess(time.monotonic() - began, 3.0)
+        self.assertEqual((s.alive, s.proc.returncode), (False, -signal.SIGKILL))  # it ignored the first request
+        self.assertEqual(asked.read_text(), "term")
+
+    def test_release_stops_with_the_gentler_signal_when_that_is_enough(self):
+        s = self.session(env={"FAKE_CLAUDE_NEVER_READS": "1"})  # ends when asked to
+        s.start()
+        leaving = s.release(wait=0.3, term_wait=5.0)
+        began = time.monotonic()
+        leaving.join(5)
+        self.assertLess(time.monotonic() - began, 2.0)  # not the five seconds it would have been given
+        self.assertEqual(s.proc.returncode, -signal.SIGTERM)
+
+    def test_a_describer_that_will_not_leave_does_not_outlive_the_app(self):
+        # The process has a session of its own, so only the thread that asks and then kills can end it. If that were
+        # a daemon thread, the parent here would exit at once and the process would be left sleeping.
+        asked = Path(self.tmp.name) / "asked"
+        parent = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(Path(__file__).resolve().parents[1])!r})\n"
+            "from gazevoice.voice.brains import ClaudeSession\n"
+            f"s = ClaudeSession({[*FAKE_CLAUDE]!r}, cwd={self.tmp.name!r}, env={{'FAKE_CLAUDE_EXIT_DELAY': '60', "
+            f"'FAKE_CLAUDE_IGNORE_TERM': {str(asked)!r}}})\n"
+            "s.start()\n"
+            "s.send('hello')\n"
+            "print(s.proc.pid, flush=True)\n"
+            "s.release(wait=0.3, term_wait=0.3)\n"
+            "# and the program ends here, without waiting for it\n"
+        )
+        began = time.monotonic()
+        done = subprocess.run([sys.executable, "-c", parent], capture_output=True, text=True, timeout=30)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        pid = int(done.stdout.split()[0])
+        self.assertLess(time.monotonic() - began, 10.0)
+        with self.assertRaises(ProcessLookupError):  # the parent has ended and the process is not there
+            os.kill(pid, 0)
+        self.assertEqual(asked.read_text(), "term")  # it was asked first, ignored that, and was killed
+
+    def test_the_exit_thread_is_not_a_daemon_but_the_readers_are(self):
+        s = self.session()
+        s.start()
+        s.send("hello")
+        leaving = s.release()
+        self.assertFalse(leaving.daemon)
+        leaving.join(5)
+        self.assertEqual(s.proc.returncode, 0)
+
+    def test_close_still_waits_three_seconds_then_kills_for_the_long_lived_sessions(self):
+        s = self.session(env={"FAKE_CLAUDE_NEVER_READS": "1"})
+        s.start()
+        began = time.monotonic()
+        s.close()
+        self.assertTrue(2.5 < time.monotonic() - began < 5.0)
+        self.assertEqual(s.proc.returncode, -signal.SIGKILL)
 
     def test_tools_are_reported_live_and_in_the_result(self):
         seen = []

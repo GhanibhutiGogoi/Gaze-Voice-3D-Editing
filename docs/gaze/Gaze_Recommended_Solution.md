@@ -1,7 +1,7 @@
 # Recommended Gaze Solution for GazeVoice
 
 **Date:** 2026-11-06
-**Status:** Proposed solution for team review
+**Status:** Built for Blender. Unity is not built. Real calibrations have been run, and the latest (2026-11-09) was typically off by about 23% of the screen. One spoken session ran on 2026-11-08, but gaze found nothing in it because of a head-position bug that has since been fixed. The closer seat, the eyelids and the head-turn correction haven't been tried on a real run yet.
 **Scope:** Gaze grounding for Unity and Blender. This proposal does not replace current Unity Voice work and does not select a final gaze model.
 
 ## 1. Goals and Design Decisions

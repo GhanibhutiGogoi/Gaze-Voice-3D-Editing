@@ -171,7 +171,10 @@ class ClaudeSession:
                         _end_process(self.proc)
                     raise BrainError("The brain took too long to answer.") from None
 
-    def send(self, text: str, on_tool: Callable[[str], None] | None = None, timeout: float = 180.0) -> TurnResult:
+    def send(
+        self, text: str | Sequence[dict], on_tool: Callable[[str], None] | None = None, timeout: float = 180.0
+    ) -> TurnResult:
+        """One user turn. `text` is a string, or a list of content blocks (say, an image block and a text block)."""
         with self._lock:
             if not self.alive:
                 raise BrainError(f"The brain isn't running: {self._tail()}")
@@ -251,6 +254,15 @@ class ClaudeSession:
         if proc is not None and self._in_turn and self.turns == turn:
             _end_process(proc)
 
+    def kill(self) -> None:
+        """End the process now, whatever it is doing, and everything it started. Safe from any thread, and twice."""
+        proc = self.proc
+        if proc is not None and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
     def close(self) -> None:
         proc = self.proc
         if proc is None:
@@ -268,6 +280,50 @@ class ClaudeSession:
             except (ProcessLookupError, PermissionError):
                 proc.kill()
             proc.wait(timeout=3)
+        self._drop_streams()
+
+    def release(self, wait: float = 10.0, term_wait: float = 2.0) -> threading.Thread:
+        """Let go of a session that has done its job: close its input and return at once.
+
+        Claude Code tidies up as it exits (it rewrites a config file it shares with every other session), and has taken
+        several seconds to do it, so it is given `wait` seconds to leave by itself. A thread waits for that and, if
+        the process is still there, asks it to stop (SIGTERM to its whole group), and kills it `term_wait` seconds
+        later. Returns that thread: join it to wait until the process is gone and its pipes are closed.
+
+        The thread is not a daemon: the process has a session of its own, so nothing else would end it if the app quit
+        before it left. Quitting waits for it (at most `wait` + `term_wait` + 3 seconds, and nearly always under one).
+        """
+        proc = self.proc
+        try:
+            if proc is not None and proc.stdin:
+                proc.stdin.close()
+        except OSError:
+            pass
+        thread = threading.Thread(target=self._leave, args=(wait, term_wait), name="brain-exit")
+        thread.start()
+        return thread
+
+    def _leave(self, wait: float, term_wait: float) -> None:
+        proc = self.proc
+        if proc is None:
+            return
+        for sig, patience in ((None, wait), (signal.SIGTERM, term_wait), (signal.SIGKILL, 3.0)):
+            if sig is not None:
+                try:
+                    os.killpg(proc.pid, sig)
+                except (ProcessLookupError, PermissionError):
+                    proc.kill()
+            try:
+                proc.wait(timeout=patience)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        self._drop_streams()
+
+    def _drop_streams(self) -> None:
+        proc = self.proc
+        if proc is None:
+            return
         for thread in self._threads:
             thread.join(timeout=1)
         for stream in (proc.stdout, proc.stderr):

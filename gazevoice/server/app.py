@@ -23,6 +23,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from .. import __version__
 from ..components.base import Component, ComponentState, Context, Health
 from ..components.brains import resolve_sources, sources_pending
+from ..components.gaze import camera_gaze_installed
 from ..events import EventBus
 from ..jobs import Job, JobAlreadyRunning, JobError, JobManager
 from ..probes import ProbeTimedOut
@@ -60,9 +61,11 @@ STATIC_TYPES = {
 _STATIC_NAME = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*")
 _ACTION_PATH = re.compile(r"/api/components/([a-z0-9_]+)/actions/([a-z0-9_]+)")
 _PROVIDER_PATH = re.compile(r"/api/providers/([a-z0-9_]+)(/remove|/models)?")
+# A command's id (date, time, number) and which of its pointing words the picture was for: plain digits, no leading zero.
+_PICTURE_PATH = re.compile(r"/api/voice/pictures/([0-9]{8}-[0-9]{6}-[0-9]{1,9})/(0|[1-9][0-9]{0,2})")
 MODEL_LIST_SECONDS = 600
 _MAX_BODY = 64 * 1024
-_CSP = "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'"
+_CSP = "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'"
 
 
 class ControlCenter:
@@ -154,8 +157,11 @@ class ControlCenter:
     # --- voice ---------------------------------------------------------------------------
     def _voice_config_now(self, sources: dict[str, str | None]) -> tuple:
         s = self.ctx.settings
+        # Only voice that would use the camera cares: a Calibrate beside any other voice needs no restart.
+        wants_camera = s.voice_host == "blender" and s.gaze_mode != "off" and s.gaze_source == "camera"
         return (s.voice_host, s.unity_mcp_command, s.unity_mcp_args,
-                sources["refiner"], sources["editor"], s.stt_engine, s.mic_device,
+                sources["refiner"], sources["editor"], s.stt_engine, s.mic_device, s.gaze_mode, s.gaze_source,
+                s.gaze_pictures, s.camera_device, wants_camera and camera_gaze_installed(self.ctx.paths),
                 s.editor_model, s.editor_effort, s.editor_api_model, s.editor_api_thinking,
                 s.refiner_model, s.refiner_effort, s.refiner_api_model, s.refiner_api_thinking,
                 json.dumps(s.providers, sort_keys=True))
@@ -223,13 +229,18 @@ class ControlCenter:
             raise VoiceError("Turn voice on first.")
         return getattr(self.voice, method)(*args)
 
+    def voice_picture(self, command_id: str, number: int) -> bytes | None:
+        """A picture voice sent to the describer, from its memory; None if voice was never built or the picture is gone."""
+        voice = self.voice
+        return None if voice is None else voice.picture(command_id, number)
+
     def shutdown(self) -> None:
         """Stop everything this process started (ffmpeg, the speech worker, brain sessions)."""
         if self.voice is not None:
             self.voice.stop()
         self._pool.shutdown(wait=False, cancel_futures=True)
 
-    def run_action(self, component_id: str, action: str) -> Job:
+    def run_action(self, component_id: str, action: str, params: dict | None = None) -> Job:
         component = self.components.get(component_id)
         if component is None:
             raise KeyError(component_id)
@@ -240,6 +251,7 @@ class ControlCenter:
             raise ValueError(f"{component.name} can't do “{action}” right now. Refresh and try again.")
 
         def work(job: Job) -> dict | None:
+            job.params = params or {}
             try:
                 return component.run_action(action, job)
             finally:
@@ -256,6 +268,20 @@ class ControlCenter:
             elif WORKFLOW_ID in running:
                 raise JobAlreadyRunning(WORKFLOW_ID, running[WORKFLOW_ID])
             return self.jobs.start(component_id, action, work)
+
+    def gaze_page(self, body: dict) -> None:
+        """What the calibration page says: that a dot is up, that it is still there during the head guide, that the
+        person pressed Start anyway, or that it has gone. KeyError if there is no gaze unit."""
+        page = self.components["gaze"].page
+        job = body.get("job")
+        if body.get("left"):
+            page.left(job)
+        elif body.get("skip"):
+            page.skip(job)
+        elif body.get("alive"):
+            page.alive(job)
+        else:
+            page.shown(job, body.get("number"))
 
     def settings_dict(self) -> dict:
         return self.ctx.settings.to_dict()
@@ -477,6 +503,8 @@ class _Handler(BaseHTTPRequestHandler):
         path = url.path
         if path == "/":
             return self._static("index.html")
+        if path == "/calibrate":
+            return self._static("calibrate.html")
         if path.startswith("/static/"):
             return self._static(path[len("/static/"):])
         if path == "/api/state":
@@ -497,9 +525,25 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json(200, self.center.provider_models(match.group(1)))
             except KeyError:
                 return self._error(404, "Unknown provider")
+        picture = _PICTURE_PATH.fullmatch(path)  # the path as sent: nothing is decoded, so there is no way round the pattern
+        if picture:
+            return self._picture(picture.group(1), int(picture.group(2)))
         if path == "/api/voice":
             return self._json(200, self.center.voice_snapshot())
         return self._error(404, "Not found")
+
+    def _picture(self, command_id: str, number: int) -> None:
+        """A picture that went to the describer. It comes from memory, is never cached, and can't be embedded elsewhere.
+
+        The answer for a picture that isn't there carries the same embedding rule, so that another site can't tell a
+        picture that exists from one that doesn't by whether the browser blocked it.
+        """
+        same_site_only = {"Cross-Origin-Resource-Policy": "same-origin"}
+        png = self.center.voice_picture(command_id, number)
+        if png is None:
+            body = json.dumps({"error": "That picture isn't kept any more"}).encode()
+            return self._send(404, body, "application/json; charset=utf-8", same_site_only)
+        self._send(200, png, "image/png", same_site_only)
 
     def _voice_post(self, path: str, body: dict) -> None:
         center = self.center
@@ -561,11 +605,20 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._error(404, "Unknown provider")
             except ValueError as exc:
                 return self._error(400, str(exc))
+        if path == "/api/gaze/page":
+            body = self._parse_json(raw)
+            if body is None:
+                return self._error(400, "Send a JSON object")
+            try:
+                self.center.gaze_page(body)
+            except KeyError:
+                return self._error(404, "Not found")
+            return self._json(202, {"ok": True})
         match = _ACTION_PATH.fullmatch(path)
         if not match:
             return self._error(404, "Not found")
         try:
-            job = self.center.run_action(*match.groups())
+            job = self.center.run_action(*match.groups(), self._parse_json(raw))
         except KeyError:
             return self._error(404, "Unknown component")
         except ValueError as exc:

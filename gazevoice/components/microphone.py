@@ -31,24 +31,35 @@ PERMISSION_HELP = (
     "(Terminal or your editor), then try again."
 )
 _DEVICE = re.compile(r"\]\s*\[(\d+)\]\s+(.+?)\s*$")
+_DEVICES_HEADER = re.compile(r"AVFoundation (audio|video) devices")
+_BUILT_IN_CAMERA = re.compile(r"(?=.*(MacBook|FaceTime))(?=.*(Camera|HD))", re.IGNORECASE)
+_NOT_A_FACE_CAMERA = re.compile(r"desk view|capture screen", re.IGNORECASE)
 
 
-def parse_avfoundation_devices(listing: str) -> list[tuple[str, str]]:
-    """Audio inputs as (index, name), from `ffmpeg -f avfoundation -list_devices true` output."""
+def _devices_listed_under(listing: str, kind: str) -> list[tuple[str, str]]:
+    """The (index, name) lines under "AVFoundation <kind> devices:" in ffmpeg's listing."""
     devices: list[tuple[str, str]] = []
-    in_audio = False
+    listing_kind = None
     for line in listing.splitlines():
-        if "AVFoundation audio devices" in line:
-            in_audio = True
+        header = _DEVICES_HEADER.search(line)
+        if header:
+            listing_kind = header.group(1)
             continue
-        if "AVFoundation video devices" in line:
-            in_audio = False
-            continue
-        if in_audio:
+        if listing_kind == kind:
             match = _DEVICE.search(line)
             if match:
                 devices.append((match.group(1), match.group(2)))
     return devices
+
+
+def parse_avfoundation_devices(listing: str) -> list[tuple[str, str]]:
+    """Audio inputs as (index, name), from `ffmpeg -f avfoundation -list_devices true` output."""
+    return _devices_listed_under(listing, "audio")
+
+
+def parse_video_devices(listing: str) -> list[tuple[str, str]]:
+    """Cameras and screens as (index, name), from the same listing. The numbers are the ones `-i` takes."""
+    return _devices_listed_under(listing, "video")
 
 
 def pick_device(devices: list[tuple[str, str]], setting: str) -> tuple[str, str, bool] | None:
@@ -67,6 +78,24 @@ def pick_device(devices: list[tuple[str, str]], setting: str) -> tuple[str, str,
         if not _NOT_A_MIC.search(name):
             return index, name, True
     return (devices[0][0], devices[0][1], True) if devices else None
+
+
+def face_cameras(devices: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """The video devices that could watch a face: not a Desk View camera, and not a screen being captured."""
+    return [(index, name) for index, name in devices if not _NOT_A_FACE_CAMERA.search(name)]
+
+
+def pick_camera(devices: list[tuple[str, str]], setting: str) -> tuple[str, str] | None:
+    """(index, name) of the camera to watch the face with; "" means auto. None if there is no such camera.
+
+    A setting is the camera's name, because plugging things in renumbers the cameras. If that camera is gone
+    the answer is None, never another camera. Auto takes only the Mac's own camera (MacBook or FaceTime):
+    a phone is often listed first, and nobody expects their phone's camera to be switched on.
+    """
+    usable = face_cameras(devices)
+    if setting:
+        return next(((index, name) for index, name in usable if name == setting), None)
+    return next(((index, name) for index, name in usable if _BUILT_IN_CAMERA.search(name)), None)
 
 
 def wav_level_dbfs(path: Path) -> float:
@@ -103,14 +132,21 @@ class Microphone(Component):
             return None
         return data if isinstance(data.get("level_dbfs"), (int, float)) else None
 
-    def devices(self, fresh: bool = False) -> list[tuple[str, str]]:
+    def _listing(self, fresh: bool) -> str:
         if not fresh:
             listing = self.probe(LIST_DEVICES, timeout=10, ttl=DEVICE_CACHE_SECONDS)
         else:
             listing = self.runner.run(LIST_DEVICES, timeout=10)
             if listing.returncode == TIMED_OUT:
-                raise JobError("macOS didn't list the microphones in time. Try again in a moment.")
-        return parse_avfoundation_devices(listing.stderr + listing.stdout)
+                raise JobError("macOS didn't list the microphones and cameras in time. Try again in a moment.")
+        return listing.stderr + listing.stdout
+
+    def devices(self, fresh: bool = False) -> list[tuple[str, str]]:
+        return parse_avfoundation_devices(self._listing(fresh))
+
+    def cameras(self, fresh: bool = False) -> list[tuple[str, str]]:
+        """Every video device from the same listing as the microphones, so asking costs no second probe."""
+        return parse_video_devices(self._listing(fresh))
 
     def check(self) -> ComponentState:
         if not self.runner.which("ffmpeg"):

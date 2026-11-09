@@ -7,7 +7,7 @@ import socket
 import threading
 
 BRIDGE_PORT = 9877  # matches blender_addon/gazevoice_bridge/protocol.py
-BRIDGE_VERSION = "0.2.0"
+BRIDGE_VERSION = "0.3.3"
 
 
 def port_open(host: str, port: int, timeout: float = 0.5) -> bool:

@@ -676,6 +676,7 @@ main {
   box-shadow: var(--inset-window);
 }
 .cmd .led { margin-top: 5px; }
+.cmd:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
 .cmd-main { display: grid; gap: 2px; min-width: 0; }
 .cmd-understood { font-size: var(--fs-ui); font-weight: 600; overflow-wrap: anywhere; }
 .cmd-heard { font: var(--fs-data)/1.5 var(--font-mono); color: var(--readout-key); overflow-wrap: anywhere; }
@@ -695,6 +696,39 @@ main {
   white-space: nowrap;
 }
 .cmd-model { color: var(--readout-ink); }
+/* A picture that was sent to the AI: a small one beside what the AI said about it. It opens full size. */
+.cmd-picture { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 10px; align-items: center; margin: 4px 0; }
+.cmd-picture > :only-child { grid-column: 1 / -1; }
+.cmd-thumb {
+  display: block;
+  width: 88px;
+  height: 66px;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--bevel);
+  border-radius: var(--r-plate);
+  background: var(--seam);
+  cursor: zoom-in;
+}
+.cmd-thumb:hover { border-color: var(--readout-key); }
+.cmd-thumb:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.cmd-thumb img { display: block; width: 100%; height: 100%; object-fit: contain; }
+.picture-view {
+  max-width: min(92vw, 1100px);
+  max-height: 92vh;
+  padding: 12px;
+  border: 1px solid var(--bevel);
+  border-radius: var(--r-plate);
+  background: var(--readout);
+  color: var(--readout-ink);
+  box-shadow: var(--shadow-plate);
+  cursor: zoom-out;
+}
+.picture-view[open] { display: grid; gap: 10px; justify-items: start; }
+.picture-view::backdrop { background: rgb(0 0 0 / 0.72); }
+.picture-view-img { display: block; max-width: 100%; max-height: calc(92vh - 120px); object-fit: contain; background: var(--seam); }
+.picture-view-img[hidden] { display: none; }
+.picture-view-caption { font: var(--fs-data)/1.5 var(--font-mono); color: var(--readout-key); overflow-wrap: anywhere; }
 .cmd-empty {
   padding: 12px 14px;
   border: 1px dashed color-mix(in srgb, var(--ink-3) 45%, transparent);

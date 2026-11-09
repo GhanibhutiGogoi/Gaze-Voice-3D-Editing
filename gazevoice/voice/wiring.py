@@ -14,7 +14,9 @@ from .api_brain import ApiSession, host_mcp
 from .audio import MicError, MicStream, mic_argv
 from .brains import BrainError, ClaudeSession, CodexSession, claude_session_argv
 from .commands import EDITOR_PROMPT, REFINER_PROMPT, UNITY_EDITOR_PROMPT, UNITY_REFINER_PROMPT
-from .service import EDITOR_WARMUP, REFINER_WARMUP, Factories, VoiceService
+from .gaze_tracker import GazeError, GazeTracker
+from .picture import Describer, clear_leftover_images
+from .service import EDITOR_WARMUP, REFINER_WARMUP, Factories, PointerTracker, VoiceService
 from .stt import SpeechService
 
 # unit id, the healths that are good enough, what to call it
@@ -90,7 +92,8 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
     from ..components.providers import config_for
 
     from ..components.brains import write_mcp_config
-    from ..components.microphone import Microphone, pick_device
+    from ..components.gaze import WORKER as GAZE_WORKER, Gaze, camera_gaze_installed, load_calibration
+    from ..components.microphone import Microphone, pick_camera, pick_device
     from ..components.speech import ENGINES, WORKER, Speech
 
     paths, settings = ctx.paths, ctx.settings
@@ -166,6 +169,32 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
                           warmup=REFINER_WARMUP, timeout=90)
         return provider("refiner", source)
 
+    def camera_gaze() -> GazeTracker:
+        # Picked at each start from a fresh listing: the camera's number moves when a phone or a webcam is plugged in,
+        # and one plugged in just now has to count.
+        picked = pick_camera(microphone.cameras(fresh=True), settings.camera_device)
+        if picked is None:
+            raise GazeError("That camera isn't connected. Pick another one in Routing.")
+        calibration = load_calibration(paths.gaze_calibration)
+        if calibration is None:
+            raise GazeError("The saved gaze calibration is out of date. Calibrate gaze again.")
+        return GazeTracker(Gaze(ctx).python, GAZE_WORKER, picked[0], calibration, model_file=paths.gaze_model_file)
+
+    # Gaze is for Blender. The mouse needs no setup. The camera needs gaze installed and calibrated; without those
+    # there is no gaze part, and voice uses the selection. A missing camera is found at each start, not here: this
+    # service is used again the next time voice starts, and by then the camera may be plugged in.
+    gaze_mode = settings.gaze_mode if host == "blender" else "off"
+    gaze = None
+    if gaze_mode != "off":
+        if settings.gaze_source == "mouse":
+            gaze = PointerTracker
+        elif camera_gaze_installed(paths):
+            gaze = camera_gaze
+
+    def pictures() -> Describer | None:
+        clear_leftover_images(paths)  # whatever a crash left goes at every start, with pictures on or not
+        return Describer(paths, ctx.runner) if settings.gaze_pictures and gaze_mode == "on" else None
+
     factories = Factories(
         bridge=bridge_factory,
         mic=mic,
@@ -173,5 +202,9 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
         stt=lambda: SpeechService(speech.python, WORKER, engine.key, engine.model, env={"HF_HUB_OFFLINE": "1"}),
         refiner=refiner,
         editor=editor,
+        gaze=gaze,
+        pictures=pictures if host == "blender" else None,
     )
-    return VoiceService(paths.logs, bus, factories, engine=engine.key, brain=sources["editor"], host=host)
+    return VoiceService(paths.logs, bus, factories, engine=engine.key, brain=sources["editor"], host=host,
+                        gaze_mode=gaze_mode, gaze_source=settings.gaze_source,
+                        camera=ctx.camera if gaze is camera_gaze else None, overlay=ctx.camera)
