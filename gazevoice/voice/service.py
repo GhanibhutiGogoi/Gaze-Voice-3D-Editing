@@ -50,7 +50,18 @@ from ..events import EventBus
 from ..mac_windows import window_frame
 from .audio import SILENCE_HELP, MicError, is_digital_silence, write_wav
 from .brains import BrainError
-from .commands import choice_number, editor_message, meta_command, parse_refined, refiner_message, vocabulary_prompt
+from .commands import (
+    STOP_TRAINING,
+    TRAINING_RUNNING,
+    choice_number,
+    editor_message,
+    in_play_mode,
+    meta_command,
+    parse_refined,
+    refiner_message,
+    stops_training,
+    vocabulary_prompt,
+)
 from .gaze import (
     AFTER_WORD,
     BEFORE_WORD,
@@ -155,6 +166,9 @@ class Factories:
     # .describe(png_base64, word, object_name, timeout=…, cancelled=…) gives one clean sentence, or None.
     # It is called every time voice starts, so it is also where leftovers from a crash are swept. None means neither.
     pictures: Callable[[], Any] | None = None
+    # Asked for each command: one more line for the editing AI (or None), such as that a training run has Unity in Play
+    # mode. It is the host's wiring that knows; the service only passes the line on.
+    editor_notice: Callable[[], str | None] | None = None
 
 
 class PointerTracker:
@@ -800,6 +814,8 @@ class VoiceService:
             "timings": {},
             "_gaze_note": "",  # shown beside the status when gaze didn't help
             "_look": None,  # the gaze for this clip while the command waits its turn; never saved (see _keep_look)
+            "_notice": None,  # the host's extra line, asked for once when the command starts, for both brains
+            "_command": None,  # the command as the host understood it, when it needs neither gaze nor the refiner
             "_t0": 0.0,
             "_t1": 0.0,
             "_stop": False,
@@ -848,6 +864,7 @@ class VoiceService:
     def _finish(self, record: dict, stage: str) -> None:
         record["stage"] = stage
         record["_look"] = None
+        record["_notice"] = None
         record["timings"]["total"] = round(self.clock() - record["created"], 2)
         self._save(record)
         self._update(record)
@@ -855,6 +872,17 @@ class VoiceService:
     def _done(self, record: dict, line: str, state: str = "done") -> None:
         self._status(line, state, revert=True)
         self._finish(record, "done")
+
+    def _editor_notice(self) -> str | None:
+        """The host's extra line for the editing AI. If it can't be had, the command goes without it."""
+        notice = self.factories.editor_notice
+        if notice is None:
+            return None
+        try:
+            return notice()
+        except Exception as exc:  # noqa: BLE001 - a line that can't be had must not cost the command
+            print(f"GazeVoice: couldn't add the host's note to the command: {exc!r}", file=sys.stderr)
+            return None
 
     def _fail(self, record: dict, message: str) -> None:
         record["error"] = message
@@ -1168,12 +1196,20 @@ class VoiceService:
 
     def _meta(self, kind: str, record: dict, run: _Run) -> None:
         record["kind"] = record["refined"] = kind
+        if kind in ("undo", "redo") and in_play_mode(self._editor_notice()):
+            # Undo in Play mode can scramble the undo history once Play ends, so nothing is undone or redone.
+            record["reply"] = TRAINING_RUNNING
+            self._fail(record, TRAINING_RUNNING)
+            return
         if kind == "stop":
             queued = self._drain(run.edit_q, keep_marker=True)
             running = self._interrupt_current(skip=record)
             for waiting in queued:
                 self._stopped(waiting, "Stopped before it started.", run)
             stopped = running is not None or bool(queued)
+            if not stopped and stops_training(record["heard"], self._editor_notice()):
+                self._send_on(record, run, STOP_TRAINING)  # nothing to cancel, and a run is going: "stop it" means that
+                return
             record["reply"] = "Stopped." if stopped else "Nothing was running."
             self._done(record, "■ Stopped" if stopped else record["reply"])
             return
@@ -1185,6 +1221,14 @@ class VoiceService:
             self._fail(record, f"{self.host_label} is busy. Finish what you're doing, then say {kind} again.")
         else:
             self._fail(record, f"{self.host_label} couldn't {kind}.")
+
+    def _send_on(self, record: dict, run: _Run, command: str) -> None:
+        """Queue this utterance as `command`, which goes to the editing AI as it is."""
+        record["kind"] = "command"
+        record["_command"] = command
+        record["stage"] = "queued"
+        self._update(record)
+        run.edit_q.put(record)
 
     def _edit_loop(self, run: _Run) -> None:
         while True:
@@ -1545,7 +1589,8 @@ class VoiceService:
         refiner = None
         try:
             refiner = self._session("_refiner", self.factories.refiner, run)
-            turn = refiner.send(refiner_message(record["heard"], record["focus"], record["names"], previous),
+            turn = refiner.send(refiner_message(record["heard"], record["focus"], record["names"], previous,
+                                                record["_notice"]),
                                 timeout=REFINE_SECONDS)
             reply = "" if turn.is_error else turn.text
             if turn.interrupted:
@@ -1565,7 +1610,11 @@ class VoiceService:
         if record["kind"] in ("undo", "redo"):
             self._meta(record["kind"], record, run)
             return
-        if record["source"] == "voice":
+        record["_notice"] = self._editor_notice()
+        if record["_command"]:  # the host already knows what was meant: nothing to ground or to word again
+            record["refined"] = record["prompt"] = record["_command"]
+            record["kind"] = "command"
+        elif record["source"] == "voice":
             if not self._ground(record, run):  # it asked which one, got no answer, and had no selection to fall back on
                 return
             if record["_stop"] or run.stop.is_set():  # "stop" was said while Blender was being asked
@@ -1606,7 +1655,8 @@ class VoiceService:
         try:
             editor = self._session("_editor", self.factories.editor, run)
             record["effort"] = getattr(editor, "effort", None)
-            turn = editor.send(editor_message(record["prompt"] or record["refined"], record["heard"], record["focus"]),
+            turn = editor.send(editor_message(record["prompt"] or record["refined"], record["heard"], record["focus"],
+                                              record["_notice"]),
                                on_tool=on_tool, timeout=EDIT_SECONDS)
             init = getattr(editor, "init", None) or {}
             record["model"], record["provider"] = init.get("model"), init.get("provider")

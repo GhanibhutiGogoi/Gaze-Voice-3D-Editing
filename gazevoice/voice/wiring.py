@@ -7,13 +7,20 @@ from typing import Mapping
 from ..blender_socket import BridgeClient
 from ..components.base import ComponentState, Context, Health
 from ..components.brains import BRAIN_ORDER, brain_pending
+from ..components.mlagents import LIVE_STATES as TRAINING_LIVE
 from ..events import EventBus
 from ..providers import ChatClient, KeyStore
 from ..settings import Settings
 from .api_brain import ApiSession, host_mcp
 from .audio import MicError, MicStream, mic_argv
 from .brains import BrainError, ClaudeSession, CodexSession, claude_session_argv
-from .commands import EDITOR_PROMPT, REFINER_PROMPT, UNITY_EDITOR_PROMPT, UNITY_REFINER_PROMPT
+from .commands import (
+    EDITOR_PROMPT,
+    PLAY_MODE_SAYING,
+    REFINER_PROMPT,
+    UNITY_EDITOR_PROMPT,
+    UNITY_REFINER_PROMPT,
+)
 from .gaze_tracker import GazeError, GazeTracker
 from .picture import Describer, clear_leftover_images
 from .service import EDITOR_WARMUP, REFINER_WARMUP, Factories, PointerTracker, VoiceService
@@ -87,8 +94,12 @@ def voice_readiness(
     return missing
 
 
-def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: KeyStore | None = None) -> VoiceService:
-    """A VoiceService wired to the selected editor host, mic, speech engine and brains."""
+def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: KeyStore | None = None,
+                control_url: str | None = None) -> VoiceService:
+    """A VoiceService wired to the selected editor host, mic, speech engine and brains.
+
+    `control_url` is where the dashboard is. Unity's built-in MCP server uses it to reach ML-Agents training.
+    """
     from ..components.providers import config_for
 
     from ..components.brains import write_mcp_config
@@ -119,7 +130,7 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
     else:
         from ..unity_mcp import server_command
 
-        server_cmd = server_command(settings)
+        server_cmd = server_command(settings, control_url)
         bridge_factory = lambda: BridgeClient(port=9878)
     mcp_config = write_mcp_config(paths, server_cmd, mcp_server)
     editor_prompt = EDITOR_PROMPT if host == "blender" else UNITY_EDITOR_PROMPT
@@ -195,6 +206,20 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
         clear_leftover_images(paths)  # whatever a crash left goes at every start, with pictures on or not
         return Describer(paths, ctx.runner) if settings.gaze_pictures and gaze_mode == "on" else None
 
+    def training_notice() -> str | None:
+        """While a training run is going, the editing AI is told so with every command.
+
+        A run that is waiting for Play leaves Unity in Edit mode, where scene edits survive. Once it is running,
+        Unity is in Play mode for it, and the scene must be left alone.
+        """
+        training = ctx.training
+        run = training.status() if training is not None else None
+        if run is None or run["state"] not in TRAINING_LIVE:
+            return None
+        if run["state"] == "waiting":
+            return f"Training: {run['run_id']} is waiting for Unity to press Play."
+        return f"Training: {run['run_id']} is running, so {PLAY_MODE_SAYING} for it."
+
     factories = Factories(
         bridge=bridge_factory,
         mic=mic,
@@ -204,6 +229,7 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
         editor=editor,
         gaze=gaze,
         pictures=pictures if host == "blender" else None,
+        editor_notice=training_notice if host == "unity" else None,
     )
     return VoiceService(paths.logs, bus, factories, engine=engine.key, brain=sources["editor"], host=host,
                         gaze_mode=gaze_mode, gaze_source=settings.gaze_source,

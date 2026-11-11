@@ -8,7 +8,7 @@ GazeVoice lets you edit Blender or Unity scenes by talking, and in Blender by lo
 **Status:** three stages are built:
 
 - **The control center:** a local dashboard that installs each piece, connects them and checks that the whole workflow is ready.
-- **The voice loop:** hold to talk in Blender or Unity, say what you want, and release to edit. The chain runs hold-to-talk → speech-to-text → cleanup → editor → one undo step.
+- **The voice loop:** hold to talk in Blender or Unity, say what you want, and release to edit. The chain runs hold-to-talk → speech-to-text → cleanup → editor → one undo step. In Unity you can also train ML-Agents agents by voice.
 - **Gaze in Blender:** look at what you mean and say "this" or "there". It's built, and the latest real calibration (2026-11-09) was typically off by about 23% of the screen, so expect it to be rough. Unity doesn't have it.
 
 See [the design](docs/superpowers/specs/2026-10-18-gazevoice-design.md), [the control center plan](docs/superpowers/plans/2026-10-18-control-center.md), [the voice loop plan](docs/superpowers/plans/2026-10-19-voice-loop.md), [the gaze plan](docs/superpowers/plans/2026-11-06-gaze-blender.md) and [the gaze proposal](docs/gaze/Gaze_Recommended_Solution.md).
@@ -35,7 +35,8 @@ Every unit shows its real state on this Mac. Nothing installs, records audio, op
 7. **Claude Code / Codex:** detected automatically, using whatever login they already have. GazeVoice never asks for a key for these two. *Test* and *Connect to Blender* each spend a little of your plan.
 8. **DeepSeek, Qwen or a custom API** (optional): see [Use DeepSeek, Qwen or another API](#use-deepseek-qwen-or-another-api).
 9. **Gaze** (optional, Blender only): *Install gaze* sets up gaze tracking in its own Python environment and downloads about 340 MB. *Calibrate* opens its own page in your browser and *Test* asks first, and the camera turns on only when you start one. See [Use gaze](#use-gaze).
-10. **Check everything** runs every test from left to right and lights up the signal path. It doesn't include the Gaze unit.
+10. **ML-Agents** (optional, Unity only): *Install* sets up ML-Agents' Python side in its own environment and downloads about 1.2 GB. See [Train agents with ML-Agents](#train-agents-with-ml-agents).
+11. **Check everything** runs every test from left to right and lights up the signal path. It doesn't include the Gaze unit.
 
 ## Talk to Blender
 
@@ -147,6 +148,31 @@ On an M4 MacBook Air, measured outside Blender:
 | Editor reply for a lookup | a few seconds |
 
 Real edits take longer with bigger models.
+
+## Train agents with ML-Agents
+
+Unity's [ML-Agents](https://github.com/Unity-Technologies/ml-agents) teaches a game character by trial and error. GazeVoice can run that training for you, so you start, check and stop it by voice. It's for Unity only.
+
+1. **Install it once.** Press *Install* on the ML-Agents unit. It asks first, then sets up its own Python 3.10 environment and downloads ML-Agents and PyTorch: about 1.2 GB to download, about 600 MB on disk, about 5 minutes. It needs `uv`. Only that button installs it. If you ask the editor to train without it, nothing is installed: the editor tells you to press *Install*.
+2. **Pick your Unity project** on the Unity project unit. Training runs on that project.
+3. **Start voice and talk.** Say things like:
+   - "Make a cube agent that learns to reach the target" (the editor adds Unity's `com.unity.ml-agents` package if the project lacks it, and writes the agent's script);
+   - "Train the agent";
+   - "How's training going?";
+   - "Stop training";
+   - "Use the trained model".
+
+**What happens.** "Train the agent" starts `mlagents-learn`, waits until it is listening for Unity (a few seconds, or up to half a minute the first time after installing, while PyTorch loads), and then puts Unity into Play mode, which is what training waits for. ML-Agents only looks for the trainer once, as Play starts, so if Unity was already in Play mode the editor stops Play first. If Play isn't pressed within 2 minutes, the run fails and says so. The ML-Agents unit shows the run's state, step and reward while it goes, and has a *Stop training* key. Stopping a run before Play was pressed saves nothing. Training stops by itself when it reaches its step limit, 200,000 unless you name another amount.
+
+**Where it runs.** Training runs on this Mac, between the Unity Editor and ML-Agents' own Python process. GazeVoice and mlagents-learn send nothing anywhere. Unity's own Editor analytics, if you turned them on in Unity, may report anonymised training settings. Stopping the dashboard normally (Ctrl+C or closing the Terminal) stops training too, and saves its model first. A crash or a force-quit leaves `mlagents-learn` running: stop it from Activity Monitor.
+
+**Good to know:**
+
+- **One run at a time.** Every run's folder is kept, so the editor gives each run a new name, such as `Mover-20261111-1530`.
+- **Don't edit the scene while it trains.** Unity is in Play mode for training, and Play mode throws scene changes away. The editor answers "Couldn't: training is running. Stop it first." Say "stop training" first.
+- **Using the model** copies it into the project, under `Assets/GazeVoice/MLAgents/<run>/`, and sets it as the agent's model, with an undo step.
+- **Only the built-in Unity MCP server has these tools.** If you set your own in Routing, it doesn't get them.
+- Training uses port 5004. If something else already has it, the run fails and says so.
 
 ## Use gaze
 
@@ -262,6 +288,8 @@ Good to know:
 | The last 20 pictures sent to the AI | Nowhere on disk. The dashboard holds them in memory, and they're gone when it stops |
 | Blender add-ons | Blender's `extensions/user_default/` (`mcp`, `gazevoice_bridge`) |
 | Gaze's Python environment | `…/GazeVoice/venvs/gaze/` |
+| ML-Agents' Python environment, and each training run's log | `…/GazeVoice/venvs/mlagents/`, `…/GazeVoice/logs/mlagents-<run>.log` |
+| Training runs, their settings and the models | In your Unity project: `MLAgents/results/<run>/`, `MLAgents/configs/<run>.yaml`, and `Assets/GazeVoice/MLAgents/<run>/` once you use a model |
 | Gaze's face model, your calibration and the last calibration's readings (both numbers only), and the picture check | `…/GazeVoice/state/` (`face_landmarker.task`, `gaze-calibration.json`, `gaze-last-run.json`, `gaze-picture-check.json`) |
 | API keys for DeepSeek, Qwen and custom providers | macOS Keychain, service "GazeVoice" |
 

@@ -2,7 +2,7 @@
 
 <!-- impeccable:product-schema 1 -->
 
-Written 2026-10-18 from the planning conversation with the user. Items marked *(inferred)* weren't stated outright. Updated 2026-11-07 to cover gaze in Blender.
+Written 2026-10-18 from the planning conversation with the user. Items marked *(inferred)* weren't stated outright. Updated 2026-11-07 to cover gaze in Blender, and 2026-11-11 to cover ML-Agents training in Unity.
 
 ## Platform
 
@@ -43,6 +43,7 @@ LLM 3D editing today works from the prompt alone. GazeVoice also passes focus co
   - Speech-to-text: Parakeet or Whisper, via MLX
   - Microphone, via ffmpeg
   - Gaze (optional, Blender only): the Mac's camera via ffmpeg, and MediaPipe's face model in its own Python environment
+  - ML-Agents (optional, Unity only): its Python side in its own environment (about 1.2 GB to download, about 600 MB on disk, about 5 minutes), installed only by its unit's Install button. It trains Unity agents on this Mac when asked by voice, and stops, saving the model, when the dashboard is stopped normally. The tools are on GazeVoice's built-in Unity MCP server only.
 - **Consent:**
   - Installs, downloads, mic recordings, camera use and model calls only happen when the user clicks.
   - Actions marked "uses your plan" spend Claude or Codex usage.

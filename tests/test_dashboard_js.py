@@ -400,6 +400,35 @@ class GazeLineTest(unittest.TestCase):
 
 
 @unittest.skipUnless(NODE, "node isn't installed")
+class ShelfTest(unittest.TestCase):
+    """Which units the dashboard puts on which shelf, read from the real NAMES and GROUPS in app.js."""
+
+    @classmethod
+    def setUpClass(cls):
+        source = APP_JS.read_text()
+        blocks = []
+        for name, close in (("NAMES", r"\}"), ("GROUPS", r"\]")):
+            match = re.search(rf"^const {name} = [\[{{].*?^{close};\n", source, re.DOTALL | re.MULTILINE)
+            assert match, f"{name} is not where this test expects it"
+            blocks.append(match.group(0))
+        program = "\n".join(blocks) + "\nconsole.log(JSON.stringify({ NAMES, GROUPS }));\n"
+        done = subprocess.run([NODE, "-e", program], capture_output=True, text=True, timeout=30)
+        assert done.returncode == 0, done.stderr
+        cls.names, cls.groups = (lambda data: (data["NAMES"], data["GROUPS"]))(json.loads(done.stdout))
+
+    def test_ml_agents_is_on_the_unity_shelf_after_the_bridge(self):
+        unity = next(group for group in self.groups if group["label"] == "Unity")
+        self.assertEqual(unity["ids"], ["unity", "unity_project", "unity_mcp", "unity_bridge", "mlagents"])
+
+    def test_it_is_on_no_other_shelf(self):
+        shelves = [group["label"] for group in self.groups if "mlagents" in group["ids"]]
+        self.assertEqual(shelves, ["Unity"])
+
+    def test_it_is_called_ml_agents(self):
+        self.assertEqual(self.names["mlagents"], "ML-Agents")
+
+
+@unittest.skipUnless(NODE, "node isn't installed")
 class ResultLineTest(unittest.TestCase):
     def test_a_passed_picture_check_says_which_claude_code_it_was_for(self):
         self.assertEqual(result_line({"passed": True, "claude": "2.1.303", "seconds": 7.4}),
@@ -416,6 +445,15 @@ class ResultLineTest(unittest.TestCase):
     def test_a_pass_without_a_version_is_not_taken_for_a_picture_check(self):
         self.assertEqual(result_line({"passed": True}), "Done")
         self.assertEqual(result_line({"passed": False, "claude": "2.1.303"}), "Done")
+
+    def test_stopping_a_training_run_reads_as_what_training_says_not_as_a_project(self):
+        status = {"state": "stopped", "run_id": "run1", "project": "/Users/me/Unity/Game", "behaviors": {},
+                  "message": "Training run1 stopped. Its model was saved and is ready to use.", "models": ["Mover"]}
+        self.assertEqual(result_line(status), "Training run1 stopped. Its model was saved and is ready to use.")
+
+    def test_a_result_with_only_a_state_or_only_a_message_is_not_taken_for_a_training_status(self):
+        self.assertEqual(result_line({"state": "on"}), "Done")
+        self.assertEqual(result_line({"message": "hello"}), "Done")
 
     def test_the_other_results_read_as_they_did(self):
         self.assertEqual(result_line({"installed": True}), "Installed")
