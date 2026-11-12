@@ -147,6 +147,7 @@ class GazeSample:
     v: float
     confidence: float
     away: bool = False  # the tracker zeroed `confidence` because the reading was well off the screen, not for a blink
+    viewport_id: str | None = None
 
 
 class GazeTrack:
@@ -346,10 +347,18 @@ class Target:
 
 @dataclass
 class Miss:
-    """A pointing word said while the eyes had settled on empty space: every ray missed, so there's no 3D point."""
+    """A pointing word over empty space; a work-plane intersection may supply a placement point."""
 
     word: str
     at: float
+    point: list[float] | None = None
+    plane: str | None = None
+
+    def to_dict(self) -> dict:
+        result = {"word": self.word, "at": self.at}
+        if self.point is not None:
+            result.update(point=list(self.point), plane=self.plane)
+        return result
 
 
 @dataclass
@@ -390,7 +399,7 @@ class Grounding:
 
     def to_dict(self) -> dict:
         return {"status": self.status, "targets": [t.to_dict() for t in self.targets], "radius": list(self.radius),
-                "misses": [asdict(m) for m in self.misses], "windows": [asdict(w) for w in self.windows]}
+                "misses": [m.to_dict() for m in self.misses], "windows": [asdict(w) for w in self.windows]}
 
 
 def is_clear(target: Target) -> bool:
@@ -412,6 +421,7 @@ def ground(
     radius: tuple[float, float],
     pick: Callable[[list[list[float]]], Sequence[dict | None] | None],
     piece: Callable[[Candidate], dict | None],
+    place: Callable[[float, float], dict | None] | None = None,
 ) -> Grounding:
     """Work out what each pointing word in `words` refers to.
 
@@ -437,9 +447,26 @@ def ground(
         hits = pick(points)
         if not hits:
             continue
+        miss = Miss(word.text, word.start)
+        if word.text in ("here", "there") and hits[0] is None and place is not None:
+            try:
+                placement = place(*points[0])
+                point = placement.get("point") if isinstance(placement, dict) else None
+                plane = placement.get("plane") if isinstance(placement, dict) else None
+                if (isinstance(point, (list, tuple)) and len(point) == 3
+                        and all(_number(value) for value in point)
+                        and plane in ("z=0", "y=0")):
+                    miss.point, miss.plane = list(point), plane
+                    misses.append(miss)
+                    continue  # the centre is empty, even if the patch grazed a neighboring object
+            except (OSError, ValueError):
+                pass  # fall back to the original object/miss scoring
+        if word.text in ("here", "there") and hits[0] is None:
+            misses.append(miss)
+            continue  # an empty centre cannot become a neighboring object destination
         candidates = score_hits(points, list(hits))
         if not candidates:
-            misses.append(Miss(word.text, word.start))
+            misses.append(miss)
             continue
         try:
             looked_closer = piece(candidates[0])
@@ -447,5 +474,5 @@ def ground(
             looked_closer = None
         targets.append(Target(word.text, word.start, candidates, fixation, piece=looked_closer))
     if not targets:
-        return Grounding("none", [], radius, misses, windows)
+        return Grounding("resolved" if any(m.point is not None for m in misses) else "none", [], radius, misses, windows)
     return Grounding("resolved" if all(is_clear(t) for t in targets) else "clarify", targets, radius, misses, windows)

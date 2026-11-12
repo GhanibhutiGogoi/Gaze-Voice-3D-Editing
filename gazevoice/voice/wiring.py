@@ -180,10 +180,10 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
             raise GazeError("The saved gaze calibration is out of date. Calibrate gaze again.")
         return GazeTracker(Gaze(ctx).python, GAZE_WORKER, picked[0], calibration, model_file=paths.gaze_model_file)
 
-    # Gaze is for Blender. The mouse needs no setup. The camera needs gaze installed and calibrated; without those
+    # Both hosts share tracking and grounding. The mouse needs no setup. The camera needs installation and calibration; without those
     # there is no gaze part, and voice uses the selection. A missing camera is found at each start, not here: this
     # service is used again the next time voice starts, and by then the camera may be plugged in.
-    gaze_mode = settings.gaze_mode if host == "blender" else "off"
+    gaze_mode = settings.gaze_mode
     gaze = None
     if gaze_mode != "off":
         if settings.gaze_source == "mouse":

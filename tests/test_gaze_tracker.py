@@ -120,6 +120,11 @@ class CameraListTest(unittest.TestCase):
     def test_auto_takes_a_facetime_camera_too(self):
         self.assertEqual(pick_camera([("0", "FaceTime HD Camera")], ""), ("0", "FaceTime HD Camera"))
 
+    def test_auto_takes_a_chinese_macbook_camera_and_excludes_desk_view(self):
+        devices = [("0", "MacBook Air相机"), ("1", "MacBook Air桌上视角相机")]
+        self.assertEqual(pick_camera(devices, ""), ("0", "MacBook Air相机"))
+        self.assertIsNone(pick_camera(devices, "MacBook Air桌上视角相机"))
+
     def test_auto_never_falls_back_to_a_phone_or_any_other_camera(self):
         phone = [("0", "Nokia Unbreakable V Camera")]
         self.assertIsNone(pick_camera(phone, ""))

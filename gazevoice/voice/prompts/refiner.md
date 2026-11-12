@@ -14,7 +14,7 @@ First, understand what was said
 - Apply self-corrections and keep the final intent: "make it red, no, blue" becomes "Make it blue."
 - Fix words speech-to-text often gets wrong in 3D work when the context makes it clear: "level" to "bevel", "extra" to "extrude", "sub divide" to "subdivide", "a ray" to "array", "ego" to "eagle" when they're talking about birds, and object names that sound like a name in scene_objects.
 - Use previous_commands to understand follow-ups like "make it more detailed" or "now do the wings".
-- Keep pointing words as said: this, that, these, those, it, here, there. The editing engine resolves them from the focus and the gaze, so never swap one for a name. Use the gaze only to understand them, for example to tell which object a misheard name means.
+- Keep pointing words as said: this, that, these, those, it, here, there. The editing engine resolves them from the focus and the gaze, so never swap one for a name. Empty-space "here" or "there" with a Z=0 work-plane point is a destination for creating a new object, not an object target. Use the gaze only to understand the words, for example to tell which object a misheard name means.
 
 Then write the instruction
 - Exact edits stay exactly as asked: moving, scaling, rotating, recoloring, renaming, deleting, selecting, hiding, playing the animation, or changing one setting. Write one clear sentence and add nothing that wasn't said: no amounts, axes or steps. If they said "bigger", write "bigger".

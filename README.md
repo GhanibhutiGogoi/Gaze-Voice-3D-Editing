@@ -1,15 +1,15 @@
 # Gaze-Voice-3D-Editing
 
-GazeVoice lets you edit Blender or Unity scenes by talking, and in Blender by looking too, without an AI chat window.
+GazeVoice lets you edit Blender or Unity scenes by talking, using gaze or mouse focus to identify spoken targets.
 
 - **Voice:** your speech is transcribed on your Mac and cleaned up into one clear instruction. Claude Code, Codex or a configured API provider edits the selected host through MCP.
-- **Focus:** each command carries what you're focused on, so edits stay scoped to it. That's your selection, or in Blender, what you were looking at when you said "this" or "there" (see [Use gaze](#use-gaze)).
+- **Focus:** each command carries what you're focused on, so edits stay scoped to it. That's your selection, or what you were looking at when you said "this" or "there" (see [Use gaze](#use-gaze)).
 
 **Status:** three stages are built:
 
 - **The control center:** a local dashboard that installs each piece, connects them and checks that the whole workflow is ready.
 - **The voice loop:** hold to talk in Blender or Unity, say what you want, and release to edit. The chain runs hold-to-talk → speech-to-text → cleanup → editor → one undo step.
-- **Gaze in Blender:** look at what you mean and say "this" or "there". It's built, and the latest real calibration (2026-11-09) was typically off by about 23% of the screen, so expect it to be rough. Unity doesn't have it.
+- **Gaze in Blender:** look at what you mean and say "this" or "there". It's built, and the latest real calibration (2026-11-09) was typically off by about 23% of the screen, so expect it to be rough. Unity now supports mouse focus in SceneView and can use the same calibrated camera tracker; its real-camera accuracy still needs validation.
 
 See [the design](docs/superpowers/specs/2026-10-18-gazevoice-design.md), [the control center plan](docs/superpowers/plans/2026-10-18-control-center.md), [the voice loop plan](docs/superpowers/plans/2026-10-19-voice-loop.md), [the gaze plan](docs/superpowers/plans/2026-11-06-gaze-blender.md) and [the gaze proposal](docs/gaze/Gaze_Recommended_Solution.md).
 
@@ -29,7 +29,7 @@ Every unit shows its real state on this Mac. Nothing installs, records audio, op
 1. **Blender:** *Install Blender* (Homebrew), then *Launch*. Launch turns on online access, which the MCP add-on needs to start.
 2. **Blender MCP add-on:** *Install add-on* downloads Blender Lab's official add-on (v1.0.3). After installing, quit Blender and *Launch* it again.
 3. **Blender MCP server:** *Install server* downloads Blender Lab's server and installs its packages with `uv`. *Test* lists its tools and, if Blender is open, reads the scene.
-4. **GazeVoice Bridge:** *Install add-on* adds our small Blender add-on (v0.3.3). It gives Blender the hold-to-talk key and a GazeVoice tab in the sidebar, shares your selection, shows a status line in the viewport, and for gaze says what's under a point in the viewport, draws a ring and numbered labels, and shows a see-through bubble where you're looking (see [The marker](#the-marker)). If you installed an older version, the unit says *Update add-on*. Restart Blender after installing or updating.
+4. **GazeVoice Bridge:** *Install add-on* adds our small Blender add-on (v0.3.4). It gives Blender the hold-to-talk key and a GazeVoice tab in the sidebar, shares your selection, shows a status line in the viewport, and for gaze says what's under a point in the viewport, draws a ring and numbered labels, and shows a see-through bubble where you're looking (see [The marker](#the-marker)). If you installed an older version, the unit says *Update add-on*. Restart Blender after installing or updating.
 5. **Speech-to-text:** *Install* sets up Parakeet (or Whisper, chosen in Routing) in its own Python environment and downloads the model. *Test* transcribes a clip spoken by macOS.
 6. **Microphone:** *Test* records 3 seconds. If it hears silence, allow the app you started GazeVoice from in System Settings › Privacy & Security › Microphone.
 7. **Claude Code / Codex:** detected automatically, using whatever login they already have. GazeVoice never asks for a key for these two. *Test* and *Connect to Blender* each spend a little of your plan.
@@ -102,6 +102,22 @@ For animals, people and other organic shapes, the editor can build the model in 
 
 **Save often.** Like Blender's MCP server, this runs AI-written code inside Unity without guards. C# can reach your files and the network, and an endless loop hangs Unity, so "stop" can't end it.
 
+### Unity gaze
+
+1. Update the Unity Bridge package from the dashboard (version 0.3.1), then let Unity finish compiling.
+2. In Routing choose **Unity**, **Gaze: Watch only**, and **Gaze source: Mouse**. Start or restart voice.
+3. Move the pointer over the active **Scene** view. A transparent aqua indicator and object name show the focus. It does not select or change the object. Game view and Hierarchy are not gaze viewports.
+4. Keep the pointer over an object while holding the talk key and saying a pointing word, such as “make this twice as tall”. Watch only records the suggested object but edits your existing selection. Compare the command's gaze result with the intended target.
+5. Switch Gaze to **On** and restart voice to use the pointer target. When several objects are plausible, numbered labels appear: say a number with PTT, or press **1**, **2** or **3** while the Scene view is focused.
+6. With Gaze **On**, look at empty Scene space and say “Make a sofa here”. A forward ray intersecting Unity's Y=0 work plane supplies the new object's ground-contact position even with nothing selected. A nearly horizontal ray, a point behind the camera, or a missing viewport supplies no position. Existing-object edits still require a target or selection.
+7. Empty or unavailable gaze otherwise falls back to your selection. If no usable target or selection exists, the pointing edit is refused. Moving the view, changing the scene, or deleting a target invalidates old gaze: point again and repeat the command.
+
+Mouse focus needs neither a camera nor calibration. **Camera** uses the same local tracker and browser calibration as Blender. Start with Watch only; the webcam accuracy limitations below apply, and this Unity integration has not been validated with a real camera session. The camera indicator is a larger bubble. Eye-tracking headsets/Quest runtime input are not connected yet.
+
+Unity hits readable MeshFilter and SkinnedMeshRenderer surfaces without requiring colliders. Hidden, disabled and picking-disabled objects are excluded. Unsupported renderers (for example non-readable meshes or Terrain) conservatively block the ray rather than inventing a surface or selecting through them. Grounding is at GameObject level, with session-scoped IDs to distinguish duplicate names. Complex scenes may increase CPU picking cost. No model usage or camera access is needed to test the Mouse mode.
+
+See the [Unity gaze validation notes](docs/gaze/Unity_Gaze_Validation.md) for verified behavior, test limits and a manual regression checklist.
+
 **More ways to talk in Blender:**
 
 - *Talk* in the sidebar starts listening on the first click and sends on the second.
@@ -150,13 +166,13 @@ Real edits take longer with bigger models.
 
 ## Use gaze
 
-Gaze lets you look at what you mean, say "make this bigger", and skip the selecting. It's for Blender only for now. Unity, and voice without gaze, are meant to work as before.
+Gaze lets you look at what you mean, say "make this bigger", and skip the selecting. Blender supports object/part grounding and optional pictures. Unity supports SceneView object grounding, a visible focus indicator, numbered clarification and Watch only; optional pictures and mesh-part grounding remain Blender-only. See [Unity gaze](#unity-gaze).
 
 Gaze is new. The latest real calibration (2026-11-09) measured its typical miss at about 23% of the screen. The closer seat, the eyelids and the head-turn correction haven't been tried on a real run yet. Gaze also hasn't been seen picking the right thing in a real spoken session: in the one so far (2026-11-08, five commands) it found nothing, because of a head-position bug that has since been fixed. So what follows about how well it will do is what to expect, not a result.
 
 ### Set it up
 
-1. **Update the Bridge.** Press *Update add-on* on the Bridge unit (or *Install add-on*, if it isn't there yet), then restart Blender. Gaze and the marker need Bridge v0.3.3, which draws the marker as a see-through bubble and puts the same bubble on pictures. If you had v0.3.2 or earlier, the unit offers *Update add-on* again: press it and restart Blender. Until you do, voice won't start, and the Voice panel says the Bridge needs updating. Press *Update add-on* whenever the unit offers it.
+1. **Update the Bridge.** Press *Update add-on* on the Bridge unit (or *Install add-on*, if it isn't there yet), then restart Blender. Gaze and the marker need Bridge v0.3.4, which draws the marker as a see-through bubble and puts the same bubble on pictures. If you had v0.3.3 or earlier, the unit offers *Update add-on* again: press it and restart Blender. Until you do, voice won't start, and the Voice panel says the Bridge needs updating. Press *Update add-on* whenever the unit offers it.
 2. **Install gaze.** Press *Install gaze* on the Gaze unit. It asks first, then sets up its own Python environment and downloads about 340 MB (MediaPipe and its face model). It needs `uv`. Seeing the camera also needs ffmpeg, which the Microphone unit installs.
 3. **Calibrate.** Press *Calibrate* on the Gaze unit. It opens its own page in your browser, and Blender doesn't need to be open. If voice is on and using the camera, turn it off first. Press *Start*, then click the circle in the middle of the screen. That is when the camera turns on, and it stays on for about a minute.
    - **A calibration made before this update must be made again.** It was made without allowing for turning your head, so it is refused: the Gaze unit says "Your saved calibration is out of date. Calibrate gaze again.", and voice starts without gaze and says the same.
@@ -173,7 +189,7 @@ Gaze is new. The latest real calibration (2026-11-09) measured its typical miss 
    - It also says which of your readings it chose to learn from, whether turning your head is allowed for, and how far your head moved during the run. The calibration it saves learns from all 24 dots, after that figure is measured.
    - If it doesn't finish, the page says why, and how many camera frames had no face or had your eyes counted as shut.
 4. **Test** (optional). *Test* shows a ring in Blender that follows where you look for about ten seconds.
-5. **Start with Watch only.** In Routing, set **Gaze** to **Watch only**, then start voice. These rows show only when **3D host** is Blender.
+5. **Start with Watch only.** In Routing, set **Gaze** to **Watch only**, then start voice. These rows are available for both Blender and Unity.
 
 Routing has three gaze settings:
 
@@ -181,7 +197,7 @@ Routing has three gaze settings:
   - **Off** is the default. The camera stays off.
   - **Watch only** records what you were looking at when you said a pointing word and compares it with your selection. Edits land exactly as they do without gaze, and no pictures are taken. The Voice panel shows how often gaze picked what you had selected, and each command there shows what gaze would have picked. So does its `record.json` in the logs folder. Switch to On once it agrees with you often enough to trust.
   - **On** passes what you looked at to the cleanup step and the editor, along with your command.
-- **Gaze source:** **Camera** is the default. **Mouse** uses the pointer over Blender's 3D viewport while you hold the key. It needs no install or calibration, so it's a way to try gaze first.
+- **Gaze source:** **Camera** is the default. **Mouse** uses the pointer over Blender's 3D viewport or Unity's active SceneView while you hold the key. It needs no install or calibration, so it's a way to try gaze first.
 - **Camera:** Auto uses the Mac's own camera, never a phone's. Pick another camera here.
 
 Stop and start voice after you change any of them.
@@ -194,7 +210,7 @@ While voice is on with **Gaze** set to Watch only or On and **Gaze source** set 
 - **In the wrong place?** Then gaze needs calibrating. Press *Calibrate* again, on the screen you use Blender on, and sit where you'll work: gaze works from about the distance you calibrated at, so if you've moved further back, calibrate again from there. The page takes 25 to 45 cm, and about 30 cm is best. Beyond 45 cm the page says "Come closer"; you can press *Start anyway*, but gaze will be less exact from that far. It uses the same readings as "this" and "there", so a marker that's off means those will be off too.
 - **It only shows.** It's drawn on top of the viewport and changes nothing in your scene. It never picks anything by itself.
 - **Only for the camera.** With Gaze source on Mouse there's no marker, because the pointer already shows where you are.
-- **It needs Bridge v0.3.3.** Press *Update add-on* on the Bridge unit, then restart Blender. Until you do, voice won't start, and the Voice panel says the Bridge needs updating.
+- **It needs Bridge v0.3.4.** Press *Update add-on* on the Bridge unit, then restart Blender. Until you do, voice won't start, and the Voice panel says the Bridge needs updating.
 - **Big scenes.** Each time the marker moves, Blender has to draw the viewport again. In a slow scene, the marker waits after each redraw for as long as that redraw took before it asks for the next one. So it redraws at most about half the time.
 
 ### What to expect from gaze
@@ -204,6 +220,7 @@ While voice is on with **Gaze** set to Watch only or On and **Gaze source** set 
 - **Numbers when it isn't sure.** If two guesses are too close to call, or the best guess is weak, numbered labels appear on the likeliest ones in the viewport and the status line says "Which one? Say the number." A single object under your gaze is used without asking, unless it covers very little of where you looked. To answer, hold the talk key and say "two" within eight seconds. If you're still saying it when the time runs out, it still counts. Say nothing and the command uses your selection. With nothing selected, the command doesn't run and the status line says "Couldn't tell what you meant. Select it or say its name."
 - **Instanced objects.** Look at a collection instance and gaze may name the object inside it, not the instance. An edit may then change the source object, and every copy with it.
 - **Only pointing words.** "this", "that", "these", "those", "it", "them", "here" and "there" use gaze, and only in a command you speak while holding the talk key. Look at the thing as you say the word. Each pointing word takes its own look, so "move this over there" uses two. A command without a pointing word doesn't use gaze, and if it names something, the name wins.
+- **Creating in empty space.** A "here" or "there" fixation over empty space may give a work-plane coordinate for a new object's ground contact: Z=0 in Blender, Y=0 in Unity. The ray must intersect the plane in front of the camera. This is a placement destination, not an existing object; editing "this" still needs an object hit or selection.
 - **It falls back, and says so.** If gaze can't help (it couldn't start, lost track of your eyes, found nothing where you looked, or Blender isn't on the screen you calibrated on), the command runs on your selection and the status line says why, such as "Gaze lost, using your selection". If nearly all of what gaze read landed off the screen, it says "Gaze reads off the screen, using your selection. If you were looking at Blender, calibrate gaze again" instead, because that can mean the calibration reads wrong. Each command's `record.json` keeps, for every pointing word, how many readings fell in its window, how many were good enough to use, and how many were off the screen. If gaze couldn't start, the Voice panel says why for as long as voice is on. If one pointing word finds something and another finds empty space, the editor is told that word pointed at nothing. Gaze never stops voice and never edits anything itself. Each edit is still one undo step.
 - **Calibrated for one screen.** Move or resize Blender as you like. If you move it to another screen, calibrate on that one. Until you do, voice uses your selection. If you plug in a display that becomes the main display, calibrate again too, because positions are measured from the main display.
 

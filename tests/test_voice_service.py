@@ -1705,13 +1705,13 @@ class GazeVoiceTest(VoiceTestBase):
         self.build().start()
         self.assertEqual(self.service.state, "ready")
 
-    def test_unity_runs_exactly_as_before(self):
+    def test_an_old_unity_bridge_keeps_voice_working_and_explains_gaze_needs_an_update(self):
         self.build(host="unity", gaze_mode="on", gaze_source="mouse").start()
         self.gaze.look(0.5, 0.5)
         record = self.speak()
         self.assertEqual(record["stage"], "done", record["error"])
         self.assertEqual((self.gazes_made, self.gaze.starts), (0, 0))
-        self.assertFalse([c for c in self.bridge.calls if c.startswith("gaze_")])
+        self.assertIn("Update the Unity Bridge", self.service.snapshot()["gaze"]["problem"])
         self.assertIn("Focus: nothing selected", self.editor.sent[0])
 
     # --- where Blender is on the screen -------------------------------------------------------------

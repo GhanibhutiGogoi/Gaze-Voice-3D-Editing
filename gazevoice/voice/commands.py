@@ -90,9 +90,9 @@ def first_sentence(text: str, limit: int = 100) -> str:
 
 
 def has_gaze(focus: dict | None) -> bool:
-    """Whether the focus carries a gaze target (a gaze that found nothing doesn't count)."""
+    """Whether gaze found an object or a work-plane placement point."""
     gaze = (focus or {}).get("gaze")
-    return bool(gaze and gaze.get("targets"))
+    return bool(gaze and (gaze.get("targets") or any(m.get("point") for m in gaze.get("misses", []))))
 
 
 def refiner_message(heard: str, focus: dict | None, names: Sequence[str], previous: Sequence[str]) -> str:
@@ -161,10 +161,18 @@ def _describe_gaze(focus: dict) -> str:
     for number, target in enumerate(said):
         lead, indent = ("Focus (gaze): ", "  ") if number == 0 else ("  ", "    ")
         if "candidates" not in target:
-            lines.append(f'{lead}"{target["word"]}" at {target["at"]:.1f} s → nothing under the gaze')
+            point = target.get("point")
+            if point:
+                position = ", ".join(f"{x:.2f}" for x in point)
+                lines.append(f'{lead}"{target["word"]}" at {target["at"]:.1f} s → empty space; '
+                             f'placement point ({position}) on {target["plane"]} work plane (no object target)')
+            else:
+                lines.append(f'{lead}"{target["word"]}" at {target["at"]:.1f} s → nothing under the gaze')
             continue
         guesses = ", ".join(f"{c['name']} ({round(c['score'] * 100)}%)" for c in target["candidates"])
         lines.append(f'{lead}"{target["word"]}" at {target["at"]:.1f} s → {guesses}')
+        if gaze.get("host") == "unity":
+            lines.append(f"{indent}Unity target instance ID: {target['candidates'][0]['uid']}")
         detail = _gaze_detail(target)
         if detail:
             lines.append(f"{indent}{detail}")

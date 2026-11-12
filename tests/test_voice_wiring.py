@@ -248,7 +248,7 @@ class BuildVoiceTest(unittest.TestCase):
         self.assertFalse(tracker.alive)  # built, not started: the camera opens when voice starts
 
         self.assertIsNone(self.gaze_voice(gaze_mode="off", gaze_source="camera").factories.gaze)
-        self.assertIsNone(self.gaze_voice(host="unity", gaze_mode="on", gaze_source="camera").factories.gaze)
+        self.assertIsInstance(self.gaze_voice(host="unity", gaze_mode="on", gaze_source="camera").factories.gaze(), GazeTracker)
 
     def test_without_each_piece_gaze_is_not_built_and_voice_uses_the_selection(self):
         for name, missing in {"no venv": dict(venv=False), "no face model": dict(model=False),
@@ -344,7 +344,7 @@ class BuildVoiceTest(unittest.TestCase):
         for name, chosen in {"gaze off": dict(gaze_mode="off", gaze_source="camera"),
                              "the mouse": dict(gaze_mode="on", gaze_source="mouse"),
                              "watching the mouse": dict(gaze_mode="shadow", gaze_source="mouse"),
-                             "unity": dict(host="unity", gaze_mode="on", gaze_source="camera")}.items():
+                             "unity mouse": dict(host="unity", gaze_mode="on", gaze_source="mouse")}.items():
             with self.subTest(name):
                 self.assertIsNone(self.gaze_voice(**chosen).camera)
 
@@ -411,10 +411,10 @@ class BuildVoiceTest(unittest.TestCase):
         with self.assertRaisesRegex(GazeError, "[Cc]alibrate"):
             voice.factories.gaze()
 
-    def test_unity_never_gets_gaze(self):
+    def test_unity_mouse_gaze_needs_no_camera_or_install(self):
         voice = self.gaze_voice(host="unity", gaze_mode="on", gaze_source="mouse")
-        self.assertIsNone(voice.factories.gaze)
-        self.assertEqual(voice.gaze_mode, "off")
+        self.assertIsInstance(voice.factories.gaze(), PointerTracker)
+        self.assertEqual(voice.gaze_mode, "on")
 
     def test_unity_readiness_uses_unity_requirements_not_blender_units(self):
         settings = update_settings(self.t.ctx.settings, {"voice_host": "unity"})

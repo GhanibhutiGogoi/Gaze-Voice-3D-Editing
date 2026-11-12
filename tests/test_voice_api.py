@@ -264,14 +264,14 @@ class VoiceApiTest(unittest.TestCase):
     def test_a_calibrate_beside_mouse_voice_asks_for_no_restart(self):
         self.calibrating_beside_voice_asks_for_no_restart({"gaze_mode": "on", "gaze_source": "mouse"})
 
-    def test_a_calibration_means_nothing_to_unity_voice(self):
+    def test_a_new_calibration_changes_unity_camera_voice_config(self):
         self.start_server()
         self.center.update_settings({"voice_host": "unity", "gaze_mode": "on"})
         self.install_gaze_but_for_the_calibration()
         sources = {"refiner": "claude", "editor": "claude"}
         before = self.center._voice_config_now(sources)
         self.t.paths.gaze_calibration.write_text("{}")
-        self.assertEqual(self.center._voice_config_now(sources), before)
+        self.assertNotEqual(self.center._voice_config_now(sources), before)
 
     def test_changing_a_source_asks_for_a_restart(self):
         self.start_server()

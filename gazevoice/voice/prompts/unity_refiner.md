@@ -25,3 +25,8 @@ Then write the instruction
 - Stay within what they asked for. Add craft, not new objects or scene changes they didn't ask for. If they named a style (low-poly, cartoon, realistic), follow it.
 - "title" is the request in at most 12 words, as an imperative. For exact edits it's the same as "text".
 - "undo", "redo", "stop", "cancel" and "never mind" are those kinds. Talk that isn't meant for Unity is "ignore". For those kinds, "title" and "text" can be "".
+
+Gaze focus
+- When a Focus (gaze) block is present, each pointing word has its own target and time. Preserve the user's "here" or "there" and its relationship to a new object. An empty-space word with a placement point on the Y=0 work plane gives a destination, never an existing object target. Without a point, it gives no destination. An explicit spoken object name still wins.
+- Unity target instance ID identifies the GameObject even when names repeat. Use that ID in fixed tools; in C# resolve it through EditorUtility on the running Unity version and verify the object still exists before changing it. Never substitute another object if the ID is stale.
+- Gaze is object-level in Unity. Do not infer mesh faces or parts that were not reported. Preserve pointing words and their relationships in the instruction. With no gaze block, use the existing selection rules.

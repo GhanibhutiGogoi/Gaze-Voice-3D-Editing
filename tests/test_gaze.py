@@ -549,6 +549,38 @@ class GroundTest(unittest.TestCase):
         self.assertEqual(self.pieces, [])
         self.assertEqual(grounding.radius, DEFAULT_RADIUS)
 
+    def test_empty_here_can_hold_a_work_plane_point(self):
+        track = track_of(*steady(100.0, 0.4, 0.6))
+        calls = []
+        def place(u, v):
+            calls.append((u, v))
+            return {"point": [2.0, 0.0, 3.0], "plane": "y=0"}
+        result = ground(said(("here", 0.4, 0.6)), 100.0, track, DEFAULT_RADIUS,
+                        lambda points: [None] * len(points), self.piece, place)
+        self.assertEqual(result.status, "resolved")
+        self.assertEqual(result.to_dict()["misses"],
+                         [{"word": "here", "at": 100.4, "point": [2.0, 0.0, 3.0], "plane": "y=0"}])
+        self.assertEqual(calls, [(0.4, 0.6)])
+        self.assertEqual(result.targets, [])
+        self.assertEqual(ground(said(("this", 0.4, 0.6)), 100.0, track, DEFAULT_RADIUS,
+                                lambda points: [None] * len(points), self.piece, place).status, "none")
+        self.assertEqual(len(calls), 1)
+
+    def test_unavailable_work_plane_keeps_original_miss(self):
+        track = track_of(*steady(100.0, 0.4, 0.6))
+        result = ground(said(("here", 0.4, 0.6)), 100.0, track, DEFAULT_RADIUS,
+                        lambda points: [None] * len(points), self.piece, lambda u, v: None)
+        self.assertEqual(result.status, "none")
+        self.assertEqual(result.to_dict()["misses"], [{"word": "here", "at": 100.4}])
+
+    def test_empty_center_uses_plane_even_when_patch_touches_neighbor(self):
+        track = track_of(*steady(100.0, 0.4, 0.6))
+        result = ground(said(("here", 0.4, 0.6)), 100.0, track, DEFAULT_RADIUS,
+                        lambda points: [None] + [CHAIR] * (len(points) - 1), self.piece,
+                        lambda u, v: {"point": [2.0, 0.0, 3.0], "plane": "y=0"})
+        self.assertEqual(result.targets, [])
+        self.assertEqual(result.misses[0].point, [2.0, 0.0, 3.0])
+
     def test_a_failed_pick_means_no_gaze(self):
         track = track_of(*steady(100.0, 0.4, 0.6))
         words = said(("this", 0.4, 0.6))
