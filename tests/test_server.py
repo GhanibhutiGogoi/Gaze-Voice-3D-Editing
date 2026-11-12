@@ -1,19 +1,32 @@
+import dataclasses
 import http.client
+import io
 import json
+import os
+import shlex
 import socket
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from gazevoice.components.base import ActionSpec, Component, Health
+from gazevoice.components.mlagents import MLAgents
 from gazevoice.jobs import JobState
+from gazevoice.mlagents import TrainingError
 from gazevoice.probes import ProbeTimedOut
-from gazevoice.server.app import ControlCenter, make_server
+from gazevoice.server import app as server_app
+from gazevoice.server.app import STOP_WAIT_SECONDS, ControlCenter, make_server
 from gazevoice.voice.leftovers import make_noise_picture
 from gazevoice.voice.picture import SentPictures
 
-from .helpers import TempCtx
+from .helpers import TempCtx, fake_unity_project
+from .test_mlagents import FIXTURE, process_gone, wait_for
 
 
 class Okay(Component):
@@ -472,6 +485,612 @@ class SentPictureRouteTest(unittest.TestCase):
         self.assertFalse([source for source in directives["img-src"] if source.startswith(("http", "blob", "//"))])
         self.assertEqual(directives["default-src"], ["'self'"])
         self.assertEqual(directives["script-src"], ["'self'"])  # and nothing else about the page has loosened
+
+
+class FakeTraining:
+    """The training service as the control center sees it: something to subscribe to, ask and shut down."""
+
+    def __init__(self):
+        self.callbacks = []
+        self.message = "idle"
+        self.shutdowns = 0
+
+    def subscribe(self, callback):
+        self.callbacks.append(callback)
+
+    def status(self):
+        return {"state": "idle", "message": self.message}
+
+    def shutdown(self):
+        self.shutdowns += 1
+
+    def change(self, message):
+        self.message = message
+        for callback in list(self.callbacks):
+            callback()
+
+
+class Trainer(Component):
+    """A stand-in for the ML-Agents unit: its summary is whatever the training service says."""
+
+    id = "mlagents"
+    name = "ML-Agents"
+    role = "fake"
+
+    def __init__(self, ctx):
+        super().__init__(ctx)
+        self.checks = 0
+        self.started = threading.Event()
+        self.gate = None  # when set, the first check waits for it, after it has read the status
+
+    def check(self):
+        self.checks += 1
+        message = self.ctx.training.status()["message"]
+        if self.checks == 1 and self.gate is not None:
+            self.started.set()
+            self.gate.wait(5)
+        return self.state(Health.READY, message)
+
+
+class TrainingEventsTest(unittest.TestCase):
+    def setUp(self):
+        self.t = TempCtx()
+        self.training = self.t.ctx.training = FakeTraining()
+
+    def tearDown(self):
+        self.t.cleanup()
+
+    def center(self, *components):
+        center = ControlCenter(self.t.ctx, list(components), check_timeout=0.3, sse_ping=0.2)
+        self.addCleanup(center.shutdown)
+        return center
+
+    def updates(self, sub, until, timeout=5.0):
+        """The summaries of the ML-Agents `component.updated` events, up to and including the one that says `until`."""
+        seen = []
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            event = sub.get(timeout=0.2)
+            if event and event.kind == "component.updated" and event.data["id"] == "mlagents":
+                seen.append(event.data["summary"])
+                if event.data["summary"] == until:
+                    break
+        return seen
+
+    def test_the_control_center_listens_for_training_changes_once_when_there_is_an_ml_agents_unit(self):
+        self.center(Trainer(self.t.ctx), Okay(self.t.ctx))
+        self.assertEqual(len(self.training.callbacks), 1)
+
+    def test_it_does_not_listen_when_there_is_no_ml_agents_unit(self):
+        self.center(Okay(self.t.ctx))
+        self.assertEqual(self.training.callbacks, [])
+
+    def test_a_training_change_publishes_the_unit_again(self):
+        center = self.center(Trainer(self.t.ctx), Okay(self.t.ctx))
+        sub = center.bus.subscribe()
+        self.training.change("Waiting for Unity: press Play in the Editor to start training.")
+        self.assertEqual(self.updates(sub, "Waiting for Unity: press Play in the Editor to start training."),
+                         ["Waiting for Unity: press Play in the Editor to start training."])
+        self.assertEqual(center._last["mlagents"].summary, "Waiting for Unity: press Play in the Editor to start training.")
+        self.training.change("Training run1: step 10000, mean reward 0.500.")
+        self.assertEqual(self.updates(sub, "Training run1: step 10000, mean reward 0.500."),
+                         ["Training run1: step 10000, mean reward 0.500."])
+
+    def test_a_change_during_a_check_is_not_lost_and_not_published_out_of_order(self):
+        trainer = Trainer(self.t.ctx)
+        trainer.gate = threading.Event()
+        center = self.center(trainer)
+        sub = center.bus.subscribe()
+        self.training.change("one")
+        self.assertTrue(trainer.started.wait(5), "the first check should have started")
+        self.training.change("two")
+        self.training.change("three")
+        trainer.gate.set()
+        self.assertEqual(self.updates(sub, "three"), ["one", "three"])  # the newest last, and one more check, not two
+        self.assertIsNone(sub.get(timeout=0.3))
+        self.assertEqual(trainer.checks, 2)
+        self.assertEqual(center._last["mlagents"].summary, "three")
+
+    def test_a_failure_while_showing_one_change_does_not_stop_the_next_from_being_shown(self):
+        center = self.center(Trainer(self.t.ctx))
+        sub = center.bus.subscribe()
+        publish = center.bus.publish
+        failures = []
+
+        def publish_once_badly(kind, data):
+            if not failures:
+                failures.append(kind)
+                raise RuntimeError("the page's connection broke")
+            return publish(kind, data)
+
+        with mock.patch.object(center.bus, "publish", publish_once_badly), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as shown:
+            self.training.change("one")
+            wait_for(self, lambda: failures, what="the first update to fail")
+            wait_for(self, lambda: not center._training_checking, what="the failed update to be given up")
+            self.training.change("two")
+            self.assertEqual(self.updates(sub, "two"), ["two"])
+        self.assertIn("the page's connection broke", shown.getvalue())  # it is reported, not swallowed
+
+    def test_a_check_that_raises_once_does_not_stop_later_updates(self):
+        trainer = Trainer(self.t.ctx)
+        real_check = trainer.check
+        calls = []
+
+        def check_badly():
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("kaboom")
+            return real_check()
+
+        trainer.check = check_badly
+        center = self.center(trainer)
+        sub = center.bus.subscribe()
+        self.training.change("one")
+        self.assertEqual(self.updates(sub, "Check failed: kaboom"), ["Check failed: kaboom"])
+        self.training.change("two")
+        self.assertEqual(self.updates(sub, "two"), ["two"])
+
+    def test_a_late_change_after_the_control_center_closed_is_ignored(self):
+        center = self.center(Trainer(self.t.ctx))
+        center.shutdown()
+        self.training.change("late")  # raises if it tries to use the closed pool
+
+    def test_shutdown_shuts_the_training_service_down(self):
+        center = self.center(Okay(self.t.ctx))
+        center.shutdown()
+        self.assertEqual(self.training.shutdowns, 1)
+
+    def test_shutdown_still_shuts_training_down_when_voice_cant_stop(self):
+        center = self.center(Okay(self.t.ctx))
+
+        def broken():
+            raise RuntimeError("voice is stuck")
+
+        center.voice = SimpleNamespace(stop=broken)
+        with self.assertRaises(RuntimeError):
+            center.shutdown()
+        center.voice = None  # so the clean-up can close it again
+        self.assertEqual(self.training.shutdowns, 1)
+
+
+class StubTraining(FakeTraining):
+    """Training that records what the routes ask of it, and answers with what a test sets."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+        self.state = "idle"
+        self.error = None  # a TrainingError to raise from the next start, stop or import
+        self.stop_gate = None  # when set, stop() takes until the test sets it
+
+    def status(self):
+        return {"state": self.state, "run_id": "run1" if self.state != "idle" else None,
+                "project": "/p/Game" if self.state != "idle" else None, "behaviors": {},
+                "message": self.message, "log": None, "log_tail": [], "models": [], "exit_code": None}
+
+    def _maybe_fail(self):
+        if self.error is not None:
+            raise self.error
+
+    def start(self, mlagents_learn, project, run_id, config_yaml=None, resume=False, overwrite=False):
+        self.calls.append(("start", mlagents_learn, project, run_id, config_yaml, resume, overwrite))
+        self._maybe_fail()
+        self.state = "waiting"
+        return self.status()
+
+    def stop(self):
+        self.calls.append(("stop",))
+        self._maybe_fail()
+        if self.stop_gate is not None:  # the model is still being saved until a test lets go
+            self.state = "stopping"
+            self.stop_gate.wait(10)
+        self.state = "stopped"
+        return self.status()
+
+    def import_model(self, project, run_id, behavior=None):
+        self.calls.append(("import_model", project, run_id, behavior))
+        self._maybe_fail()
+        return {"asset_path": f"Assets/GazeVoice/MLAgents/{run_id}/Mover.onnx", "behavior": behavior or "Mover"}
+
+
+class Installable(Component):
+    """A stand-in for the ML-Agents unit: whether it is installed is whatever a test says."""
+
+    id = "mlagents"
+    name = "ML-Agents"
+    role = "fake"
+
+    def __init__(self, ctx, installed=True):
+        super().__init__(ctx)
+        self.is_installed = installed
+        self.mlagents_learn = Path("/fake/venvs/mlagents/bin/mlagents-learn")
+        self.installs = 0
+
+    def installed(self):
+        if isinstance(self.is_installed, Exception):
+            raise self.is_installed
+        return self.is_installed
+
+    def check(self):
+        return self.state(Health.READY if self.is_installed is True else Health.MISSING, "fake",
+                          actions=[ActionSpec("install", "Install")])
+
+    def action_install(self, job):
+        self.installs += 1
+
+
+class MLAgentsRoutesTest(unittest.TestCase):
+    """What the Unity AI's training tools reach: the dashboard's own routes, guarded like every other write."""
+
+    NOT_INSTALLED = "ML-Agents' Python side isn't installed. Press Install on the ML-Agents unit in the dashboard."
+    NO_PROJECT = "Pick your Unity project in the dashboard first."
+
+    def setUp(self):
+        self.t = TempCtx()
+        self.addCleanup(self.t.cleanup)
+        self.training = self.t.ctx.training = StubTraining()
+        self.unit = Installable(self.t.ctx)
+        self.t.ctx.settings = dataclasses.replace(self.t.ctx.settings, unity_project="/p/Game")
+        self.center = ControlCenter(self.t.ctx, [self.unit], check_timeout=0.3, sse_ping=0.2)
+        self.server = make_server(self.center, port=0)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, args=(0.02,), daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    request = ServerTest.request
+
+    def test_make_server_tells_the_control_center_where_it_is(self):
+        self.assertEqual(self.center.url, f"http://127.0.0.1:{self.port}")
+
+    def test_before_the_server_is_made_there_is_no_address(self):
+        other = ControlCenter(self.t.ctx, [self.unit])
+        self.addCleanup(other.shutdown)
+        self.assertIsNone(other.url)
+
+    def test_the_voice_factory_passes_the_address_to_build_voice(self):
+        with mock.patch("gazevoice.server.app.build_voice") as build:
+            self.center._voice_factory({"refiner": "claude", "editor": "claude"})
+        self.assertEqual(build.call_args.kwargs["control_url"], f"http://127.0.0.1:{self.port}")
+
+    def test_status_says_whether_it_is_installed_and_which_project(self):
+        status, body = self.request("GET", "/api/mlagents", write=False)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertTrue(body["installed"])
+        self.assertEqual(body["project"], "/p/Game")
+        self.assertEqual(body["state"], "idle")
+        self.assertEqual(body["message"], "idle")
+
+    def test_status_names_the_runs_project_while_a_run_exists(self):
+        self.training.state = "training"
+        self.assertEqual(self.request("GET", "/api/mlagents", write=False)[1]["project"], "/p/Game")
+        self.t.ctx.settings = dataclasses.replace(self.t.ctx.settings, unity_project="/p/Other")
+        body = self.request("GET", "/api/mlagents", write=False)[1]
+        self.assertEqual((body["state"], body["run_id"], body["project"]), ("training", "run1", "/p/Game"))
+
+    def test_status_with_no_project_set(self):
+        self.t.ctx.settings = dataclasses.replace(self.t.ctx.settings, unity_project="")
+        body = self.request("GET", "/api/mlagents", write=False)[1]
+        self.assertIsNone(body["project"])
+        self.assertEqual(body["runs"], [])
+
+    def save_models(self, project, run_id, *names, at):
+        folder = project / "MLAgents" / "results" / run_id
+        folder.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            (folder / f"{name}.onnx").write_bytes(b"model")
+            os.utime(folder / f"{name}.onnx", (at, at))
+
+    def test_status_lists_the_earlier_runs_that_have_a_model_newest_first(self):
+        project = fake_unity_project(self.t.root / "Game")
+        self.t.ctx.settings = dataclasses.replace(self.t.ctx.settings, unity_project=str(project))
+        (project / "MLAgents" / "results" / "no-model").mkdir(parents=True)
+        self.save_models(project, "Mover-1", "Mover", at=1_760_000_000.0)
+        self.save_models(project, "Mover-2", "Jumper", "Mover", at=1_760_001_000.0)
+        body = self.request("GET", "/api/mlagents", write=False)[1]
+        self.assertEqual(body["state"], "idle")  # as after a restart: no run, but the runs are there
+        self.assertIsNone(body["run_id"])
+        self.assertEqual([(run["run_id"], run["behaviors"]) for run in body["runs"]],
+                         [("Mover-2", ["Jumper", "Mover"]), ("Mover-1", ["Mover"])])
+        self.assertTrue(all(isinstance(run["modified"], str) for run in body["runs"]))
+
+    def test_status_lists_at_most_10_runs(self):
+        project = fake_unity_project(self.t.root / "Game")
+        self.t.ctx.settings = dataclasses.replace(self.t.ctx.settings, unity_project=str(project))
+        for number in range(12):
+            self.save_models(project, f"run{number:02d}", "A", at=1_760_000_000.0 + number)
+        runs = self.request("GET", "/api/mlagents", write=False)[1]["runs"]
+        self.assertEqual([run["run_id"] for run in runs], [f"run{n:02d}" for n in range(11, 1, -1)])
+
+    def test_status_has_no_runs_when_the_project_has_none_or_does_not_exist(self):
+        self.assertEqual(self.request("GET", "/api/mlagents", write=False)[1]["runs"], [])  # /p/Game isn't there
+        project = fake_unity_project(self.t.root / "Game")
+        self.t.ctx.settings = dataclasses.replace(self.t.ctx.settings, unity_project=str(project))
+        self.assertEqual(self.request("GET", "/api/mlagents", write=False)[1]["runs"], [])
+        self.assertFalse((project / "MLAgents").exists())  # asking creates nothing
+
+    def test_status_says_when_it_is_not_installed(self):
+        self.unit.is_installed = False
+        status, body = self.request("GET", "/api/mlagents", write=False)
+        self.assertEqual((status, body["ok"], body["installed"]), (200, True, False))
+
+    def test_status_that_cannot_tell_yet_says_to_try_again(self):
+        self.unit.is_installed = ProbeTimedOut(("python", "-c", "import mlagents"))
+        status, body = self.request("GET", "/api/mlagents", write=False)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"], "Still checking whether ML-Agents is installed. Try again in a moment.")
+
+    def test_status_with_a_foreign_host_is_refused(self):
+        self.assertEqual(self.request("GET", "/api/mlagents", headers={"Host": "evil.example"}, write=False)[0], 403)
+
+    def test_train_starts_a_run_in_the_chosen_project_and_passes_its_arguments_through(self):
+        status, body = self.request("POST", "/api/mlagents/train", {
+            "run_id": "Mover-1", "config_yaml": "behaviors: {}", "resume": False, "overwrite": True})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["state"], "waiting")
+        self.assertEqual(self.training.calls, [
+            ("start", self.unit.mlagents_learn, Path("/p/Game"), "Mover-1", "behaviors: {}", False, True)])
+
+    def test_train_needs_only_a_run_id(self):
+        self.assertEqual(self.request("POST", "/api/mlagents/train", {"run_id": "r1"})[0], 200)
+        self.assertEqual(self.training.calls, [("start", self.unit.mlagents_learn, Path("/p/Game"), "r1", None, False, False)])
+
+    def test_train_never_passes_a_wait_time_of_its_own(self):
+        self.request("POST", "/api/mlagents/train", {"run_id": "r1", "timeout_wait": 9999})
+        self.assertEqual(len(self.training.calls[0]), 7)
+
+    def test_train_when_not_installed_says_to_press_install_and_starts_nothing(self):
+        self.unit.is_installed = False
+        status, body = self.request("POST", "/api/mlagents/train", {"run_id": "r1"})
+        self.assertEqual((status, body["error"]), (409, self.NOT_INSTALLED))
+        self.assertEqual(self.training.calls, [])
+        self.assertEqual(self.unit.installs, 0)
+        self.assertEqual(self.center.jobs.recent(10), [])
+        self.assertEqual(self.center.jobs.running(), {})
+
+    def test_train_without_a_unit_is_the_same_as_not_installed(self):
+        self.center.components.pop("mlagents")
+        status, body = self.request("POST", "/api/mlagents/train", {"run_id": "r1"})
+        self.assertEqual((status, body["error"]), (409, self.NOT_INSTALLED))
+        self.assertEqual(self.training.calls, [])
+
+    def test_train_that_cannot_tell_if_it_is_installed_starts_nothing(self):
+        self.unit.is_installed = ProbeTimedOut(("python", "-c", "import mlagents"))
+        status, body = self.request("POST", "/api/mlagents/train", {"run_id": "r1"})
+        self.assertEqual((status, body["error"]),
+                         (409, "Still checking whether ML-Agents is installed. Try again in a moment."))
+        self.assertEqual(self.training.calls, [])
+        self.assertEqual(self.unit.installs, 0)
+
+    def test_train_with_no_project_says_to_pick_one(self):
+        self.t.ctx.settings = dataclasses.replace(self.t.ctx.settings, unity_project="")
+        status, body = self.request("POST", "/api/mlagents/train", {"run_id": "r1"})
+        self.assertEqual((status, body["error"]), (409, self.NO_PROJECT))
+        self.assertEqual(self.training.calls, [])
+
+    def test_train_asks_if_it_is_installed_before_it_asks_for_a_project(self):
+        self.unit.is_installed = False
+        self.t.ctx.settings = dataclasses.replace(self.t.ctx.settings, unity_project="")
+        self.assertEqual(self.request("POST", "/api/mlagents/train", {"run_id": "r1"})[1]["error"], self.NOT_INSTALLED)
+
+    def test_a_refusal_from_training_is_a_409_with_its_own_sentence(self):
+        self.training.error = TrainingError("A training run is already going. Stop it first.")
+        status, body = self.request("POST", "/api/mlagents/train", {"run_id": "r1"})
+        self.assertEqual((status, body["error"]), (409, "A training run is already going. Stop it first."))
+
+    def test_train_needs_a_run_id_and_sensible_arguments(self):
+        for bad in ({}, {"run_id": 7}, {"run_id": ""}, {"run_id": "r1", "config_yaml": 5},
+                    {"run_id": "r1", "resume": "yes"}, {"run_id": "r1", "overwrite": 1}):
+            with self.subTest(bad):
+                self.assertEqual(self.request("POST", "/api/mlagents/train", bad)[0], 400)
+        self.assertEqual(self.training.calls, [])
+
+    def test_stop_stops_and_answers_with_the_status(self):
+        self.training.state = "training"
+        status, body = self.request("POST", "/api/mlagents/stop", {})
+        self.assertEqual((status, body["state"]), (200, "stopped"))
+        self.assertEqual(self.training.calls, [("stop",)])
+
+    def test_stop_that_is_still_saving_answers_stopping_and_carries_on(self):
+        self.training.state = "training"
+        self.training.stop_gate = threading.Event()
+        self.addCleanup(self.training.stop_gate.set)
+        began = time.monotonic()
+        with mock.patch("gazevoice.server.app.STOP_WAIT_SECONDS", 0.3):
+            status, body = self.request("POST", "/api/mlagents/stop", {})
+        self.assertLess(time.monotonic() - began, 3.0)
+        self.assertEqual((status, body["state"]), (200, "stopping"))
+        self.assertEqual(self.training.calls, [("stop",)])
+        self.assertEqual(self.training.state, "stopping")  # the stop is still going
+        self.training.stop_gate.set()
+        wait_for(self, lambda: self.training.state == "stopped", what="the stop to finish after it was answered")
+        self.assertEqual(self.request("GET", "/api/mlagents", write=False)[1]["state"], "stopped")
+
+    def test_stop_that_finishes_in_time_answers_with_the_final_status(self):
+        self.training.state = "training"
+        self.training.stop_gate = threading.Event()
+        self.training.stop_gate.set()
+        status, body = self.request("POST", "/api/mlagents/stop", {})
+        self.assertEqual((status, body["state"]), (200, "stopped"))
+
+    def test_a_stop_that_training_refuses_is_a_409(self):
+        self.training.error = TrainingError("Couldn't stop it.")
+        status, body = self.request("POST", "/api/mlagents/stop", {})
+        self.assertEqual((status, body["error"]), (409, "Couldn't stop it."))
+
+    def just_too_late(self):
+        """The stop finishes a moment after the wait gave up: wait() says it timed out, and then the stop is over."""
+        class LateEvent(threading.Event):
+            def wait(self, timeout=None):
+                super().wait(5)
+                return False
+
+        class Late:
+            Event = LateEvent
+
+            def __getattr__(self, name):
+                return getattr(threading, name)
+
+        return mock.patch.object(server_app, "threading", Late())
+
+    def test_a_stop_that_is_refused_just_after_the_wait_ran_out_is_still_a_409_with_its_sentence(self):
+        self.training.error = TrainingError("Couldn't stop it.")
+        with self.just_too_late():
+            status, body = self.request("POST", "/api/mlagents/stop", {})
+        self.assertEqual((status, body), (409, {"error": "Couldn't stop it."}))
+
+    def test_a_stop_that_finishes_just_after_the_wait_ran_out_answers_with_its_final_status(self):
+        self.training.state = "training"
+        with self.just_too_late():
+            status, body = self.request("POST", "/api/mlagents/stop", {})
+        self.assertEqual((status, body["state"]), (200, "stopped"))
+
+    def test_the_dashboard_answers_stop_before_codexs_60_second_tool_limit_and_before_the_tool_gives_up(self):
+        from gazevoice.unity_mcp import DASHBOARD_SECONDS
+
+        self.assertEqual(STOP_WAIT_SECONDS, 40.0)
+        self.assertGreater(DASHBOARD_SECONDS["mlagents_stop"], STOP_WAIT_SECONDS)
+        self.assertLess(DASHBOARD_SECONDS["mlagents_stop"], 60.0)
+
+    def test_stop_with_no_body_works(self):
+        self.assertEqual(self.request("POST", "/api/mlagents/stop")[0], 200)
+
+    def test_import_copies_the_model_in(self):
+        status, body = self.request("POST", "/api/mlagents/import", {"run_id": "Mover-1", "behavior": "Mover"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"asset_path": "Assets/GazeVoice/MLAgents/Mover-1/Mover.onnx", "behavior": "Mover"})
+        self.assertEqual(self.training.calls, [("import_model", Path("/p/Game"), "Mover-1", "Mover")])
+
+    def test_import_without_a_behavior_lets_training_pick(self):
+        self.request("POST", "/api/mlagents/import", {"run_id": "Mover-1"})
+        self.assertEqual(self.training.calls, [("import_model", Path("/p/Game"), "Mover-1", None)])
+
+    def test_import_that_cannot_is_a_409_with_its_sentence(self):
+        self.training.error = TrainingError("Run Mover-1 hasn't saved a model yet.")
+        status, body = self.request("POST", "/api/mlagents/import", {"run_id": "Mover-1"})
+        self.assertEqual((status, body["error"]), (409, "Run Mover-1 hasn't saved a model yet."))
+
+    def test_import_with_no_project_says_to_pick_one(self):
+        self.t.ctx.settings = dataclasses.replace(self.t.ctx.settings, unity_project="")
+        status, body = self.request("POST", "/api/mlagents/import", {"run_id": "r1"})
+        self.assertEqual((status, body["error"]), (409, self.NO_PROJECT))
+
+    def test_import_needs_a_run_id(self):
+        for bad in ({}, {"run_id": 3}, {"run_id": "r1", "behavior": 4}):
+            with self.subTest(bad):
+                self.assertEqual(self.request("POST", "/api/mlagents/import", bad)[0], 400)
+
+    def test_every_post_without_the_header_is_refused(self):
+        for path in ("train", "stop", "import"):
+            with self.subTest(path):
+                status, _ = self.request("POST", f"/api/mlagents/{path}", {"run_id": "r1"}, write=False)
+                self.assertEqual(status, 403)
+        self.assertEqual(self.training.calls, [])
+
+    def test_a_post_from_another_site_is_refused(self):
+        status, _ = self.request("POST", "/api/mlagents/stop", {}, headers={"Origin": "http://evil.example"})
+        self.assertEqual(status, 403)
+        self.assertEqual(self.training.calls, [])
+
+    def test_a_post_with_a_foreign_host_is_refused(self):
+        status, _ = self.request("POST", "/api/mlagents/stop", {}, headers={"Host": "evil.example"})
+        self.assertEqual(status, 403)
+        self.assertEqual(self.training.calls, [])
+
+    def test_an_unknown_ml_agents_route_is_not_found(self):
+        self.assertEqual(self.request("POST", "/api/mlagents/install", {})[0], 404)
+        self.assertEqual(self.request("GET", "/api/mlagents/train", write=False)[0], 404)
+
+    def test_a_body_that_is_not_an_object_is_refused(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("POST", "/api/mlagents/train", body=b"[1]", headers={"X-GazeVoice": "1"})
+        response = conn.getresponse()
+        response.read()
+        conn.close()
+        self.assertEqual(response.status, 400)
+
+    def test_the_unity_ai_tools_work_against_the_real_routes(self):
+        from gazevoice.unity_mcp import call_dashboard
+
+        with mock.patch.dict(os.environ, {"GAZEVOICE_URL": self.center.url}):
+            status = call_dashboard("mlagents_status", {})
+            trained = call_dashboard("mlagents_train", {"run_id": "r1", "config_yaml": "behaviors: {}"})
+            imported = call_dashboard("mlagents_import_model", {"run_id": "r1", "behavior": "Mover"})
+            stopped = call_dashboard("mlagents_stop", {})
+            self.unit.is_installed = False
+            refused = call_dashboard("mlagents_train", {"run_id": "r2"})
+        self.assertEqual((status["ok"], status["installed"], status["state"]), (True, True, "idle"))
+        self.assertEqual((trained["ok"], trained["state"], trained["run_id"]), (True, "waiting", "run1"))
+        self.assertEqual(imported, {"ok": True, "asset_path": "Assets/GazeVoice/MLAgents/r1/Mover.onnx", "behavior": "Mover"})
+        self.assertEqual((stopped["ok"], stopped["state"]), (True, "stopped"))
+        self.assertEqual(refused, {"ok": False, "error": self.NOT_INSTALLED})
+
+    def test_no_route_ever_installs_anything(self):
+        self.unit.is_installed = False
+        for path, body in (("train", {"run_id": "r1"}), ("stop", {}), ("import", {"run_id": "r1"})):
+            self.request("POST", f"/api/mlagents/{path}", body)
+        self.request("GET", "/api/mlagents", write=False)
+        self.assertEqual(self.unit.installs, 0)
+        self.assertEqual(self.center.jobs.recent(10), [])
+
+
+class TrainingShutdownTest(unittest.TestCase):
+    """Closing the control center in the middle of a real run: the model is saved and nothing is left on port 5004."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._wrapper_dir = tempfile.TemporaryDirectory()
+        cls.wrapper = Path(cls._wrapper_dir.name) / "mlagents-learn"
+        cls.wrapper.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(FIXTURE))} \"$@\"\n")
+        cls.wrapper.chmod(0o755)
+        subprocess.run([str(cls.wrapper)], env={"FAKE_ML_SCRIPT": "crash"}, capture_output=True, check=False)  # vetting
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._wrapper_dir.cleanup()
+
+    def setUp(self):
+        self.t = TempCtx(which={"uv": "/Users/me/.local/bin/uv"})
+        self.addCleanup(self.t.cleanup)
+        self.unit = MLAgents(self.t.ctx)
+        self.unit.python.parent.mkdir(parents=True)
+        self.unit.python.write_text("")
+        self.unit.mlagents_learn.symlink_to(self.wrapper)
+        self.t.runner.add([str(self.unit.python), "-c", "import mlagents.trainers"])
+        self.project = fake_unity_project(self.t.root / "Game")
+        self.fake = self.t.root / "fake"
+        self.fake.mkdir()
+        self.center = ControlCenter(self.t.ctx, [self.unit], check_timeout=2.0, sse_ping=0.2)
+        self.addCleanup(self.center.shutdown)
+
+    def test_closing_the_control_center_mid_training_saves_the_model_and_leaves_no_helper(self):
+        sub = self.center.bus.subscribe()
+        env = {"FAKE_ML_SCRIPT": "wait_interrupt", "FAKE_ML_DIR": str(self.fake), "FAKE_ML_HELPER": "sigint"}
+        with mock.patch.dict(os.environ, env):
+            self.t.ctx.training.start(self.unit.mlagents_learn, self.project, "run1")
+        waiting = None
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and waiting is None:
+            event = sub.get(timeout=0.2)
+            if event and event.kind == "component.updated" and event.data["id"] == "mlagents" \
+                    and event.data["summary"].startswith("Waiting for Unity") \
+                    and any(a["id"] == "stop" for a in event.data["actions"]):
+                waiting = event
+        self.assertIsNotNone(waiting, "the unit should say it is waiting, and offer Stop")
+        wait_for(self, (self.fake / "ready").exists, what="the fake mlagents-learn to listen")
+        main, helper = int((self.fake / "main.pid").read_text()), int((self.fake / "helper.pid").read_text())
+
+        self.center.shutdown()
+
+        status = self.t.ctx.training.status()
+        self.assertEqual(status["state"], "stopped")
+        self.assertEqual(status["models"], ["Mover"])  # SIGINT was heard, so the model was saved
+        self.assertEqual(status["message"], "Training run1 stopped. Its model was saved and is ready to use.")
+        self.assertTrue(process_gone(main))
+        self.assertTrue(process_gone(helper))
+        self.assertTrue((self.fake / "helper.sigint").exists(), "the helper should have been sent SIGINT too")
 
 
 if __name__ == "__main__":

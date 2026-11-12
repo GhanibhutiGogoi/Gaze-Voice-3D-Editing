@@ -16,6 +16,11 @@ REFINER_PROMPT = PROMPTS / "refiner.md"
 UNITY_EDITOR_PROMPT = PROMPTS / "unity_editor.md"
 UNITY_REFINER_PROMPT = PROMPTS / "unity_refiner.md"
 KINDS = ("command", "undo", "redo", "stop", "ignore")
+# What the host's notice says while the editor must leave the scene alone, because Unity is in Play mode for training.
+PLAY_MODE_SAYING = "Unity is in Play mode"
+TRAINING_RUNNING = "Couldn't: training is running. Stop it first."
+TRAINING_LINE = "Training:"  # how the host's notice starts while a training run is going
+STOP_TRAINING = "Stop training"
 
 # Said before or after an instant command, these don't change it: "no, wait, stop it right now".
 _LEAD_IN = r"(?:no+|nope|oh|oops|wait|hold on|hang on|hey|okay|ok|uh+|um+|er+|ah+|so|please|just|blender)"
@@ -28,6 +33,9 @@ _META = {
         r"|wait|hold on|hang on)$"
     ),
 }
+# The ways of saying "stop" that can also mean the training run. "Never mind", "wait" and "hold on" can't.
+_STOPS_TRAINING = re.compile(
+    r"^(?:stop|stop (?:that|it|this|everything)|cancel|cancel (?:that|it|this)|abort|halt)$")
 _NUMBER_WORDS = {w: n for n, w in enumerate("one two three four five six seven eight nine ten".split(), 1)}
 _NUMBER_WORDS |= {"won": 1, "to": 2, "too": 2, "for": 4}  # what speech-to-text writes for a number said on its own
 _CHOICE = re.compile(rf"^(?:number\s+)?(\d{{1,2}}|{'|'.join(_NUMBER_WORDS)})$")
@@ -63,6 +71,11 @@ def meta_command(text: str) -> str | None:
     return None
 
 
+def stops_training(text: str, notice: str | None) -> bool:
+    """Whether a bare "stop it" means the training run: the host's notice has a Training line, and nothing else is said."""
+    return bool(notice) and notice.startswith(TRAINING_LINE) and bool(_STOPS_TRAINING.match(_normalize(text)))
+
+
 def choice_number(text: str) -> int | None:
     """The number when the whole utterance is just one ("two", "number two", "2", or "to" for "two"); None otherwise.
 
@@ -95,13 +108,22 @@ def has_gaze(focus: dict | None) -> bool:
     return bool(gaze and gaze.get("targets"))
 
 
-def refiner_message(heard: str, focus: dict | None, names: Sequence[str], previous: Sequence[str]) -> str:
+def in_play_mode(notice: str | None) -> bool:
+    """Whether the host's notice says Unity is in Play mode (a training run has it there)."""
+    return bool(notice) and PLAY_MODE_SAYING in notice
+
+
+def refiner_message(heard: str, focus: dict | None, names: Sequence[str], previous: Sequence[str],
+                    notice: str | None = None) -> str:
+    """What the refiner is told with each command. `notice` is the line the editor also gets, such as a training run."""
     message = {"heard": heard, "focus": focus or {}}
     if has_gaze(focus):  # the refiner reads the same words the editor will, beside the selection
         message["focus"] = {k: v for k, v in focus.items() if k != "gaze"}
         message["gaze"] = describe_focus(focus)
     message["scene_objects"] = list(names)[:150]
     message["previous_commands"] = list(previous)[-3:]
+    if notice:
+        message["notice"] = notice
     return json.dumps(message)
 
 
@@ -200,12 +222,15 @@ def describe_focus(focus: dict | None) -> str:
     return f"{lead} · mode {mode} · source: selection"
 
 
-def editor_message(command: str, heard: str, focus: dict | None) -> str:
+def editor_message(command: str, heard: str, focus: dict | None, notice: str | None = None) -> str:
+    """What the editing AI is told with each command. `notice` is one more line from the host, such as a training run."""
     lines = [f"Command: {command}"]
     if heard and heard.strip() != command.strip():
         lines.append(f'Heard: "{heard.strip()}"')
     description = describe_focus(focus)
     lines.append(description if has_gaze(focus) else f"Focus: {description}")
+    if notice:
+        lines.append(notice)
     return "\n".join(lines)
 
 

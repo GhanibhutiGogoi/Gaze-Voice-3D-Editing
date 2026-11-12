@@ -43,9 +43,17 @@ def main(argv: list[str] | None = None) -> int:
         threading.Timer(0.4, webbrowser.open, args=(url,)).start()
 
     def _terminate(signum, frame):
+        # Once is enough. A second hangup or terminate must not raise inside center.shutdown() and cut short the wait
+        # for a training run to save its model.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, _terminate)
+    # Closing the Terminal window: a training run must still be stopped and saved. Unless the program was started with
+    # `nohup`, which means SIGHUP is meant to be ignored.
+    if signal.getsignal(signal.SIGHUP) != signal.SIG_IGN:
+        signal.signal(signal.SIGHUP, _terminate)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

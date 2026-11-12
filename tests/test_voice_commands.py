@@ -126,6 +126,29 @@ class EditorMessageTest(unittest.TestCase):
         self.assertIn('Heard: "uh make this like twice as tall"', message)
         self.assertIn("Chair, Leg.001", message)
 
+    def test_a_notice_goes_on_the_line_after_the_focus(self):
+        focus = {"active": "Chair", "selected": ["Chair"], "mode": "OBJECT"}
+        notice = "Training: run1 is running, so Unity is in Play mode for it."
+        self.assertEqual(editor_message("Make it red.", "make it red", focus, notice),
+                         "Command: Make it red.\nHeard: \"make it red\"\n"
+                         "Focus: selected Chair (active: Chair) · mode OBJECT · source: selection\n" + notice)
+        self.assertEqual(editor_message("Make it red.", "make it red", focus, None),
+                         editor_message("Make it red.", "make it red", focus))
+        self.assertEqual(editor_message("Make it red.", "make it red", focus, ""),
+                         editor_message("Make it red.", "make it red", focus))
+
+    def test_the_refiner_gets_the_training_line_when_there_is_one(self):
+        notice = "Training: run1 is running, so Unity is in Play mode for it."
+        message = json.loads(refiner_message("how's it going", None, ["Mover"], [], notice))
+        self.assertEqual(message["notice"], notice)
+        self.assertEqual(message["heard"], "how's it going")
+
+    def test_the_refiner_gets_no_notice_when_there_is_none(self):
+        for notice in (None, ""):
+            with self.subTest(notice):
+                self.assertNotIn("notice", json.loads(refiner_message("make it red", None, [], [], notice)))
+        self.assertEqual(refiner_message("make it red", None, [], [], None), refiner_message("make it red", None, [], []))
+
     def test_focus_descriptions(self):
         self.assertIn("nothing selected", describe_focus({"active": None, "selected": [], "mode": "OBJECT"}))
         self.assertIn("unknown", describe_focus(None))
