@@ -173,13 +173,16 @@ class PromptTest(unittest.TestCase):
         self.assertLess(check, section.index("call mlagents_train with a new run id"))
         self.assertLess(check, section.index("`EditorApplication.isPlaying = true;`"))
 
-    def test_play_is_pressed_only_once_the_trainer_is_listening(self):
+    def test_play_is_pressed_only_when_asked_and_only_once_the_trainer_is_listening(self):
         section = UNITY_EDITOR_PROMPT.read_text().split("\nML-Agents\n", 1)[1]
+        asked = next(line for line in section.splitlines() if line.startswith("- If the command asks you to press Play"))
         for words in ('Press Play only when the state is "waiting" and `listening` is true: then enter Play mode at once',
                       "If `listening` is false, call mlagents_status, up to a few times, until `listening` is true, then enter Play mode",
                       "If it never becomes true, reply that ML-Agents is still starting, and that they can press Play "
-                      "themselves once the dashboard says it is waiting for Unity"):
-            self.assertIn(words, section)
+                      "themselves once the dashboard says it is waiting for Unity",
+                      "Training gives up if Play isn't pressed within 2 minutes.",
+                      "Reply that training started and is shown on the dashboard."):
+            self.assertIn(words, asked)
         self.assertNotIn("Then enter Play mode at once", section)
         self.assertLess(section.index("Press Play only when"), section.index("`EditorApplication.isPlaying = true;`"))
 
@@ -214,14 +217,88 @@ class PromptTest(unittest.TestCase):
                       prompt)
         self.assertIn("Couldn't: training is running. Stop it first.", prompt)
 
-    def test_a_run_that_lost_unity_is_pressed_through_again_in_the_prompts_own_words(self):
+    def test_a_run_that_lost_unity_leaves_play_mode_and_tells_the_user_unless_asked_to_press_play(self):
         from gazevoice.mlagents import LOST_CONNECTION
 
         section = UNITY_EDITOR_PROMPT.read_text().split("\nML-Agents\n", 1)[1]
         line = next(line for line in section.splitlines() if LOST_CONNECTION in line)
         self.assertTrue(line.startswith("- If mlagents_status says"))
-        self.assertLess(line.index("`EditorApplication.isPlaying = false;`"), line.index("`listening` is true"))
-        self.assertLess(line.index("`listening` is true"), line.index("`EditorApplication.isPlaying = true;`"))
+        off, on = "`EditorApplication.isPlaying = false;`", "`EditorApplication.isPlaying = true;`"
+        words = ('reply that Unity lost its connection: "press Play again once the dashboard says it is waiting for '
+                 'Unity".')
+        self.assertIn(words, line)
+        self.assertIn("Re-press Play only if the command asked you to press Play", line)
+        # out of Play mode first, then the reply, and only then (when asked) in again once the trainer listens
+        self.assertLess(line.index(off), line.index(words))
+        self.assertLess(line.index(words), line.index("Re-press Play only if"))
+        self.assertLess(line.index("Re-press Play only if"), line.index("`listening` is true"))
+        self.assertLess(line.index("`listening` is true"), line.index(on))
+        self.assertEqual(line.count(on), 1)  # setting isPlaying = true is no longer what it does by default
+        reply = "Unity lost its connection: press Play again once the dashboard says it is waiting for Unity."
+        self.assertLessEqual(len(reply.split()), 20)  # the reply this line asks for fits the cap
+
+    def test_training_runs_from_the_dashboard_and_the_user_is_never_sent_to_a_terminal(self):
+        """mlagents-learn lives in GazeVoice's own environment, not on the user's PATH, so their terminal can't run it."""
+        section = UNITY_EDITOR_PROMPT.read_text().split("\nML-Agents\n", 1)[1].split("\nLimits\n", 1)[0]
+        for words in ("Training runs from the dashboard, never from a terminal: mlagents-learn lives in GazeVoice's own "
+                      "environment, not on the user's PATH.",
+                      "So a request to set up, start or run the terminal side, the Python side, the trainer or "
+                      "mlagents-learn means: start a run with mlagents_train.",
+                      "Starting the trainer isn't installing anything.",
+                      "Never tell them to open a terminal or run a command."):
+            self.assertIn(words, section)
+        line = next(line for line in section.splitlines() if line.startswith("- Training runs from the dashboard"))
+        self.assertIn("Never tell them to open a terminal or run a command.", line)
+        self.assertLess(section.index(line), section.index("- To train (\"train it\")"))  # near the top
+        self.assertLess(section.index(line), section.index("call mlagents_train with a new run id"))
+        self.assertIn("Never install anything yourself.", section)  # still kept
+
+    def test_the_user_presses_play_by_default_and_the_editor_only_says_when_the_trainer_is_ready(self):
+        """"Set up the terminal" means: run the trainer, then tell them to start the scene. They press Play."""
+        prompt = UNITY_EDITOR_PROMPT.read_text()
+        section = prompt.split("\nML-Agents\n", 1)[1].split("\nLimits\n", 1)[0]
+        line = next(line for line in section.splitlines() if line.startswith("- After mlagents_train:"))
+        for words in ('at any point, if the state is "failed", reply with its message and don\'t press Play.',
+                      "Otherwise don't press Play yourself, unless the command asks you to press Play (see the next line)",
+                      'when `listening` is true, reply "The trainer is ready: press Play in Unity within 2 minutes to '
+                      'start training."',
+                      'when it isn\'t yet, reply "ML-Agents is starting: press Play once the dashboard says it is '
+                      'waiting for Unity."'):
+            self.assertIn(words, line)
+        self.assertNotIn("EditorApplication.isPlaying = true;", line)  # a plain "train it" never presses Play
+        self.assertNotIn("The trainer is listening: press Play in Unity within 2 minutes.", prompt)  # the old default
+        self.assertNotIn("If they say they'll press Play themselves", prompt)  # not a special case any more
+        asked = next(line for line in section.splitlines() if line.startswith("- If the command asks you to press Play"))
+        self.assertGreater(section.index(asked), section.index(line))
+        self.assertIn('as in "train it and press Play" or "start training and press Play"', asked)
+        self.assertNotIn("start it for me", prompt)  # the prompt writer now writes "start training and press Play"
+        # the first time Play is pressed in the section is in the line for "press Play too"
+        self.assertGreater(section.index("`EditorApplication.isPlaying = true;`"), section.index(asked))
+
+    def test_an_existing_trainer_config_in_the_project_is_read_and_passed_on(self):
+        section = UNITY_EDITOR_PROMPT.read_text().split("\nML-Agents\n", 1)[1].split("\nLimits\n", 1)[0]
+        line = next(line for line in section.splitlines() if line.startswith("- Then call mlagents_train"))
+        existing = ("If the project already has a trainer config for the behavior (a .yaml file under `Assets/` or in a "
+                    "top-level `config/` folder, such as one from ML-Agents' examples or one you saved earlier; never "
+                    "look in `Library/` and never scan the whole project, because execute_csharp runs on Unity's main "
+                    "thread), read it with execute_csharp (File.ReadAllText) and pass its text as config_yaml, after "
+                    "checking its behavior names match the Behavior Names in the scene. Otherwise write the "
+                    "config_yaml as below.")
+        self.assertIn(existing, line)
+        written = "Unless they asked otherwise, pass config_yaml with one entry per Behavior Name, in double quotes"
+        self.assertIn(written, line)
+        self.assertLess(line.index(existing), line.index(written))
+        self.assertLess(line.index("a new run id every time"), line.index(existing))
+
+    def test_even_ml_agents_replies_are_one_plain_short_sentence_but_a_failed_runs_message_is_given_whole(self):
+        section = UNITY_EDITOR_PROMPT.read_text().split("\nML-Agents\n", 1)[1].split("\nLimits\n", 1)[0]
+        line = next(line for line in section.splitlines() if line.startswith("- Even for ML-Agents"))
+        self.assertIn("Even for ML-Agents, reply with one plain sentence of at most 20 words, with no markdown.", line)
+        self.assertIn("The one exception to the 20-word limit is a failed run's message, which you give as it is.", line)
+        self.assertIn('if the state is "failed", reply with its message', section)  # the rule the exception is about
+        last = UNITY_EDITOR_PROMPT.read_text().splitlines()[-1]
+        self.assertTrue(last.startswith("Reply with one plain sentence of at most 20 words saying what changed"))
+        self.assertIn("(a failed training run's message is the one exception)", last)
 
     def test_a_failed_run_is_reported_and_play_is_not_pressed(self):
         section = UNITY_EDITOR_PROMPT.read_text().split("\nML-Agents\n", 1)[1]
@@ -266,11 +343,15 @@ class PromptTest(unittest.TestCase):
         self.assertIn("new run id", prompt)
         self.assertIn("date and time", prompt)
 
-    def test_play_mode_is_still_off_limits_except_to_train(self):
+    def test_play_mode_is_for_a_command_that_asks_for_it_and_training_does_not_count_as_asking(self):
         limits = UNITY_EDITOR_PROMPT.read_text().split("\nLimits\n", 1)[1]
         line = next(line for line in limits.splitlines() if "Play mode" in line)
         self.assertIn("Never enter Play mode", line)
-        self.assertIn("or to train ML-Agents", line)
+        self.assertIn("unless the command asks for exactly that.", line)
+        self.assertIn("Enter Play mode only when the command asks for it", line)
+        self.assertNotIn("or to train ML-Agents", line)  # it read as permission to press Play on "train it"
+        self.assertIn("A request to train ML-Agents still allows the `APP_UI_EDITOR_ONLY` scripting define, which is a "
+                      "Project Settings change.", line)
 
     def test_the_prompt_writer_knows_unity_words_and_keeps_its_reply_format(self):
         prompt = UNITY_REFINER_PROMPT.read_text()
@@ -299,6 +380,21 @@ class PromptTest(unittest.TestCase):
         line = next(line for line in prompt.splitlines() if line.startswith('- "undo", "redo", "stop", "cancel"'))
         self.assertIn("unless they are about training", line)
         self.assertLess(prompt.index("Stopping, cancelling or aborting training"), prompt.index(line))
+
+
+    def test_the_prompt_writer_turns_terminal_and_trainer_requests_into_start_training(self):
+        """The user says "set up the terminal part"; the dashboard runs the trainer, so it is the same as "train it"."""
+        prompt = UNITY_REFINER_PROMPT.read_text()
+        rule = next(line for line in prompt.splitlines() if line.startswith("- Training agents with ML-Agents"))
+        for words in ("Requests to train, or to set up, start or run the training terminal, the Python side, the "
+                      "trainer or mlagents-learn, are written as \"start training\" (kind \"command\").",
+                      "Add \"and press Play\" only if they asked for Play to be pressed: \"press Play\", \"start the "
+                      "scene\", \"play it\" and \"run it for me\", said about training, become \"start training and "
+                      "press Play\"."):
+            self.assertIn(words, rule)
+        self.assertNotIn('only if they asked for that, like "start training and press Play"', prompt)  # the old wording
+        self.assertNotIn("I'll press Play myself", prompt)  # pressing Play is theirs by default now
+        self.assertLess(prompt.index(rule), prompt.index('- "undo", "redo", "stop", "cancel"'))
 
 
 class MLAgentsDocsTest(unittest.TestCase):
@@ -335,6 +431,16 @@ class MLAgentsDocsTest(unittest.TestCase):
 
     def test_it_says_a_run_stopped_before_play_saves_nothing(self):
         self.assertIn("Stopping a run before Play was pressed saves nothing", self.section())
+
+    def test_train_the_agent_starts_the_trainer_and_the_user_presses_play(self):
+        section = self.section()
+        happens = section[section.index("**What happens.**"):section.index("**Watch it run.**")]
+        self.assertIn('"Train the agent" starts `mlagents-learn` and waits until it is listening for Unity', happens)
+        self.assertIn("The dashboard says when it is ready, and you press Play in Unity.", happens)
+        self.assertIn('Or say "train it and press Play" and the editor presses Play for you once it is ready.', happens)
+        self.assertNotIn("puts Unity into Play mode", section)  # it used to
+        self.assertNotIn("which is what training waits for", section)
+        self.assertIn("Once you press Play, Unity is in Play mode for training", section)
 
     def test_the_status_line_at_the_top_mentions_it(self):
         text = self.readme()

@@ -162,14 +162,16 @@ Unity's [ML-Agents](https://github.com/Unity-Technologies/ml-agents) teaches a g
    - "Stop training";
    - "Use the trained model".
 
-**What happens.** "Train the agent" starts `mlagents-learn`, waits until it is listening for Unity (a few seconds, or up to half a minute the first time after installing, while PyTorch loads), and then puts Unity into Play mode, which is what training waits for. ML-Agents only looks for the trainer once, as Play starts, so if Unity was already in Play mode the editor stops Play first. If Play isn't pressed within 2 minutes, the run fails and says so. The ML-Agents unit shows the run's state, step and reward while it goes, and has a *Stop training* key. Stopping a run before Play was pressed saves nothing. Training stops by itself when it reaches its step limit, 200,000 unless you name another amount.
+**What happens.** "Train the agent" starts `mlagents-learn` and waits until it is listening for Unity (a few seconds, or up to half a minute the first time after installing, while PyTorch loads). The dashboard says when it is ready, and you press Play in Unity. Or say "train it and press Play" and the editor presses Play for you once it is ready. ML-Agents only looks for the trainer once, as Play starts, so if Unity was already in Play mode the editor stops Play first. If Play isn't pressed within 2 minutes, the run fails and says so. The ML-Agents unit shows the run's state, step and reward while it goes, and has a *Stop training* key. Stopping a run before Play was pressed saves nothing. Training stops by itself when it reaches its step limit, 200,000 unless you name another amount.
+
+**Watch it run.** The dashboard shows a live *ML-Agents terminal* panel under Voice, with the trainer's output as it prints and a *Stop training* button. It only shows the output; you can't type into it.
 
 **Where it runs.** Training runs on this Mac, between the Unity Editor and ML-Agents' own Python process. GazeVoice and mlagents-learn send nothing anywhere. Unity's own Editor analytics, if you turned them on in Unity, may report anonymised training settings. Stopping the dashboard normally (Ctrl+C or closing the Terminal) stops training too, and saves its model first. A crash or a force-quit leaves `mlagents-learn` running: stop it from Activity Monitor.
 
 **Good to know:**
 
 - **One run at a time.** Every run's folder is kept, so the editor gives each run a new name, such as `Mover-20261111-1530`.
-- **Don't edit the scene while it trains.** Unity is in Play mode for training, and Play mode throws scene changes away. The editor answers "Couldn't: training is running. Stop it first." Say "stop training" first.
+- **Don't edit the scene while it trains.** Once you press Play, Unity is in Play mode for training, and Play mode throws scene changes away. The editor answers "Couldn't: training is running. Stop it first." Say "stop training" first.
 - **Using the model** copies it into the project, under `Assets/GazeVoice/MLAgents/<run>/`, and sets it as the agent's model, with an undo step.
 - **Only the built-in Unity MCP server has these tools.** If you set your own in Routing, it doesn't get them.
 - Training uses port 5004. If something else already has it, the run fails and says so.

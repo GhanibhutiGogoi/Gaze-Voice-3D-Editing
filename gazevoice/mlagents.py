@@ -34,6 +34,7 @@ RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 CONFIG_MAX_BYTES = 64 * 1024
 LOG_TAIL_LINES = 15
+TERMINAL_LINES = 1000  # how many of a run's last output lines are kept for the dashboard's terminal panel
 RUNS_LISTED = 10  # how many earlier runs recent_runs() lists
 _ACTIVE = ("waiting", "training", "stopping")
 _DRAIN_SECONDS = 2.0  # after the process exits: how long to let the last lines arrive before ending its helpers
@@ -191,6 +192,11 @@ class _Run:
 
     def __init__(self, run_id: str, project: Path, log_path: Path, proc: subprocess.Popen):
         self.run_id = run_id
+        # Tells this run from every other, even one that reuses its name (resume, overwrite). The clock and not a counter,
+        # because a counter would start from 1 again after the control center restarts. In microseconds, not nanoseconds:
+        # the dashboard reads it as a JavaScript number, which is exact only below 2**53 (about 9e15; microseconds are
+        # about 1.8e15, nanoseconds 1.8e18). start() keeps two runs from sharing one.
+        self.serial = time.time_ns() // 1000
         self.project = project
         self.log_path = log_path
         self.proc = proc
@@ -199,6 +205,8 @@ class _Run:
         self.behaviors: dict[str, dict] = {}
         self.last_behavior: str | None = None
         self.tail: collections.deque[str] = collections.deque(maxlen=LOG_TAIL_LINES)
+        self.output: collections.deque[tuple[int, str]] = collections.deque(maxlen=TERMINAL_LINES)  # (n, text) for every line
+        self.lines_read = 0  # the number of the last line read; the first is 1
         self.error_kind: str | None = None
         self.reached_training = False  # Unity connected, so a later time-out is not about the Play button
         self.listening = False  # it has printed that it is listening for Unity, so Play can be pressed
@@ -214,9 +222,10 @@ class _Run:
 class Training:
     def __init__(self, logs: Path):
         self._logs = Path(logs)
-        self._lock = threading.Lock()  # guards _run, its fields and _subscribers; callbacks run outside it
+        self._lock = threading.Lock()  # guards _run, its fields and the subscriber lists; callbacks run outside it
         self._run: _Run | None = None
         self._subscribers: list[Callable[[], None]] = []
+        self._output_subscribers: list[Callable[[str, int, int, str], None]] = []
         self._closed = False  # set by shutdown(): nothing starts after it
 
     def subscribe(self, callback: Callable[[], None]) -> None:
@@ -231,6 +240,24 @@ class Training:
             try:
                 callback()
             except Exception:  # noqa: BLE001 - one bad listener must not stop the run or the other listeners
+                traceback.print_exc(file=sys.stderr)
+
+    def subscribe_output(self, callback: Callable[[str, int, int, str], None]) -> None:
+        """`callback(run_id, serial, n, text)` runs for every line the trainer prints, in order, from the thread that reads it.
+
+        `serial` is the run's (see status()), and `n` counts from 1 in each run. The line can already be read back with
+        output(). The callback may call status() and output(); one that raises is reported and does not stop the reading.
+        """
+        with self._lock:
+            self._output_subscribers.append(callback)
+
+    def _emit_output(self, run_id: str, serial: int, n: int, text: str) -> None:
+        with self._lock:
+            callbacks = list(self._output_subscribers)
+        for callback in callbacks:
+            try:
+                callback(run_id, serial, n, text)
+            except Exception:  # noqa: BLE001 - one bad listener must not stop the reading or the other listeners
                 traceback.print_exc(file=sys.stderr)
 
     # -- start ----
@@ -300,7 +327,10 @@ class Training:
                 log_path.unlink(missing_ok=True)
                 raise TrainingError(f"Couldn't start ML-Agents: {exc.strerror or exc}.") from exc
 
+            previous = self._run
             run = self._run = _Run(run_id, project, log_path, proc)
+            if previous is not None and run.serial <= previous.serial:
+                run.serial = previous.serial + 1  # the same microsecond, or the clock stepped back: still a different run
             pump = threading.Thread(target=self._pump, args=(run, log), daemon=True, name=f"mlagents-out-{run_id}")
             watcher = threading.Thread(target=self._watch, args=(run, pump), daemon=True, name=f"mlagents-{run_id}")
             pump.start()
@@ -320,7 +350,7 @@ class Training:
         return self.status()
 
     def _pump(self, run: _Run, log) -> None:
-        """Copy every line to the log, keep the tail, and apply what the line means."""
+        """Copy every line to the log, keep it for the terminal panel and the tail, and apply what the line means."""
         try:
             for raw in run.proc.stdout:
                 line = raw.rstrip("\r\n")
@@ -336,10 +366,14 @@ class Training:
                         log = None  # a full disk mustn't block the pipe, or the run would freeze
                 event = parse_line(line)
                 with self._lock:
+                    run.lines_read += 1
+                    n = run.lines_read
+                    run.output.append((n, line))
                     if line.strip():
                         run.tail.append(line)
                     if event is not None:
                         self._apply(run, event)
+                self._emit_output(run.run_id, run.serial, n, line)
                 if event is not None:
                     self._notify()
         except (OSError, ValueError):
@@ -431,11 +465,27 @@ class Training:
 
     # -- reading it back ----
 
+    def output(self, after: int = 0) -> dict:
+        """What the trainer printed in the current (or last) run: {"run_id", "serial", "first", "lines": [{"n", "text"}, …]}.
+
+        `serial` is the run's, as status() gives it. `lines` holds the kept lines numbered above `after`; `first` is the
+        number of the oldest line still kept (0 when there are none), so a reader can tell when the cap has dropped lines
+        it never saw.
+        """
+        with self._lock:
+            run = self._run
+            if run is None:
+                return {"run_id": None, "serial": None, "first": 0, "lines": []}
+            kept = list(run.output)
+            run_id, serial = run.run_id, run.serial
+        return {"run_id": run_id, "serial": serial, "first": kept[0][0] if kept else 0,
+                "lines": [{"n": n, "text": text} for n, text in kept if n > after]}
+
     @staticmethod
     def _snapshot(run: _Run) -> dict:
         """Called with the lock held."""
         return {
-            "state": run.state, "run_id": run.run_id, "project": run.project, "log": run.log_path,
+            "state": run.state, "run_id": run.run_id, "serial": run.serial, "project": run.project, "log": run.log_path,
             "behaviors": {name: dict(values) for name, values in run.behaviors.items()},
             "last_behavior": run.last_behavior, "tail": list(run.tail), "error_kind": run.error_kind,
             "reached_training": run.reached_training, "exit_code": run.exit_code, "started": run.started,
@@ -448,13 +498,14 @@ class Training:
             snapshot = None if run is None else self._snapshot(run)
         if snapshot is None:
             return {
-                "state": "idle", "run_id": None, "project": None, "behaviors": {},
+                "state": "idle", "run_id": None, "serial": None, "project": None, "behaviors": {},
                 "message": "No training run has started yet.", "log": None, "log_tail": [], "models": [],
                 "exit_code": None, "listening": False,
             }
         models = _find_models(snapshot["project"], snapshot["run_id"])
         return {
-            "state": snapshot["state"], "run_id": snapshot["run_id"], "project": str(snapshot["project"]),
+            "state": snapshot["state"], "run_id": snapshot["run_id"], "serial": snapshot["serial"],
+            "project": str(snapshot["project"]),
             "behaviors": snapshot["behaviors"], "message": self._message(snapshot),
             "log": str(snapshot["log"]), "log_tail": snapshot["tail"], "models": models,
             "exit_code": snapshot["exit_code"], "listening": snapshot["listening"],

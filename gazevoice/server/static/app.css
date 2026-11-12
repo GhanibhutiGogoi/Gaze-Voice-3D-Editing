@@ -32,6 +32,10 @@
   --focus: #9ad8ff;
   --lens-light: #ffffff;
   --lens-dark: #000000;
+  /* Line colours for the ML-Agents terminal. Its screen is a dark readout in both themes, so these stay the same. */
+  --term-warn: #f0b43c;
+  --term-error: #ff8a80;
+  --term-progress: #8be6b8;
 
   /* Depth: plates sit on the desk, keys travel, readouts are inset glass. */
   --shadow-plate: 0 2px 4px rgb(0 0 0 / 0.3);
@@ -737,6 +741,48 @@ main {
   font-size: var(--fs-small);
 }
 
+/* ---------- ML-Agents terminal: the trainer's output, read only ---------- */
+
+.term-run { font: var(--fs-data) var(--font-mono); overflow-wrap: anywhere; }
+.term-readout {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  min-height: 48px;
+  padding: 8px 14px;
+  border-radius: var(--r-plate);
+  background: var(--readout);
+  color: var(--readout-ink);
+  box-shadow: var(--inset-window), 0 1px 0 var(--bevel);
+}
+.term-readout .led { width: 12px; height: 12px; }
+.term-status { font-size: var(--fs-ui); line-height: 1.35; overflow-wrap: anywhere; }
+.term-keys { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+.term-close { min-width: 32px; justify-content: center; padding: 5px 11px 8px; font-size: 18px; }
+.term-view { position: relative; }
+/* Following the newest line and Jump to latest move at once, never smoothly. */
+.term-screen {
+  max-height: 22rem;
+  min-height: 7.5rem;
+  overflow: auto;
+  padding: 10px 14px;
+  border-radius: var(--r-plate);
+  background: var(--readout);
+  color: var(--readout-ink);
+  font: var(--fs-small)/1.5 var(--font-mono);
+  box-shadow: var(--inset-window);
+  scroll-behavior: auto;
+}
+.term-screen:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.term-screen:empty::before { content: attr(data-empty); color: var(--readout-key); }
+.term-line { white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 4; }
+.term-line:empty::after { content: "\200b"; }
+.term-line[data-kind="warn"] { color: var(--term-warn); }
+.term-line[data-kind="error"] { color: var(--term-error); }
+.term-line[data-kind="progress"] { color: var(--term-progress); font-weight: 500; }
+.term-jump { position: absolute; right: 16px; bottom: 12px; }
+
 /* ---------- smaller windows ---------- */
 
 @media (max-width: 1180px) {
@@ -756,7 +802,7 @@ main {
   .plan-note { text-align: left; }
   .side { grid-template-columns: minmax(0, 1fr); }
   .transport-top, .transport-mid { grid-template-columns: minmax(0, 1fr); }
-  .voice-keys, .voice-aside { justify-content: flex-start; }
+  .voice-keys, .voice-aside, .term-keys { justify-content: flex-start; }
   .cmd { grid-template-columns: auto minmax(0, 1fr); }
   .cmd-meta { grid-column: 2; justify-items: start; text-align: left; white-space: normal; }
 }

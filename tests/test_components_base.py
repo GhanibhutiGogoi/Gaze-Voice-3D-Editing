@@ -47,6 +47,24 @@ class ComponentBaseTest(unittest.TestCase):
             },
         )
 
+    def test_a_component_that_reports_a_run_carries_it_in_its_dict_even_when_there_is_none(self):
+        class Runner(Dummy):
+            reports_run = True
+
+        run = {"run_id": "run1", "serial": 7, "state": "training", "listening": True}
+        idle = Runner(make_ctx()).state(Health.READY, "Idle")
+        self.assertIsNone(idle.run)
+        self.assertIsNone(idle.to_dict()["run"])  # the key is there, with nothing in it
+        going = Runner(make_ctx()).state(Health.READY, "Going", run=run)
+        self.assertEqual(going.run, run)
+        self.assertEqual(going.to_dict()["run"], run)
+
+    def test_other_components_have_no_run_in_their_dict(self):
+        state = Dummy(make_ctx()).check()
+        self.assertIsNone(state.run)
+        self.assertNotIn("run", state.to_dict())
+        self.assertNotIn("run", Dummy(make_ctx()).state(Health.CHECKING, "Still checking…").to_dict())
+
     def test_offers(self):
         state = Dummy(make_ctx()).check()
         self.assertTrue(state.offers("install"))

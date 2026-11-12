@@ -32,6 +32,7 @@ class MLAgents(Component):
     id = "mlagents"
     name = "ML-Agents"
     role = "Trains Unity agents on this Mac"
+    reports_run = True  # the dashboard's terminal panel follows the run through its state
 
     @property
     def venv(self) -> Path:
@@ -101,7 +102,10 @@ class MLAgents(Component):
             details.append(("Last run", f"{run['run_id']} · {run['state']}"))
         actions = [ActionSpec("stop", "Stop training")] if run["state"] in ("waiting", "training") else []
         summary = "Ready to train" if run["state"] == "idle" else run["message"]
-        return self.state(Health.READY, summary, details, actions)
+        # The run apart from the words above, so the page never has to read it back out of the "Last run" text.
+        current = None if run["state"] == "idle" else {
+            "run_id": run["run_id"], "serial": run["serial"], "state": run["state"], "listening": run["listening"]}
+        return self.state(Health.READY, summary, details, actions, run=current)
 
     def action_install(self, job: Job) -> dict:
         if not self.runner.which("uv"):
