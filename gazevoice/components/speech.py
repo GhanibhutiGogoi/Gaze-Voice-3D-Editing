@@ -74,6 +74,14 @@ class Speech(Component):
         if not self.runner.which("uv"):
             return self.state(Health.ERROR, "uv is needed to set up speech-to-text. Install uv (astral.sh/uv), then refresh.")
         details = [("Engine", engine.label), ("Model", engine.model)]
+        if not self.python.exists() and self.venv.exists():
+            return self.state(
+                Health.MISSING,
+                f"{engine.label}'s Python environment doesn't work any more, usually because the Python it was made "
+                "from was removed. Press Install to set it up again.",
+                details,
+                [self._install_action()],
+            )
         if not self.python.exists():
             return self.state(
                 Health.MISSING,
@@ -98,8 +106,14 @@ class Speech(Component):
             raise JobError("uv isn't installed. Install it from astral.sh/uv, then try again.")
         steps = []
         if not self.python.exists():
+            if self.venv.exists():  # a folder whose Python is gone (an uninstalled Anaconda, say); it holds only packages
+                # uv's --clear deletes whatever folder it is given, so only an environment or an empty folder is cleared.
+                if not ((self.venv / "pyvenv.cfg").is_file() or (self.venv.is_dir() and not any(self.venv.iterdir()))):
+                    raise JobError(f"{self.venv} isn't a Python environment, so it's left alone. "
+                                   "Move or delete that folder, then press Install again.")
+                job.log("The Python environment from before has no working Python, so it's being made again.")
             steps.append(("Creating a Python 3.12 environment…",
-                          ["uv", "venv", "--python", VENV_PYTHON, str(self.venv)], 3600))
+                          ["uv", "venv", "--clear", "--python", VENV_PYTHON, str(self.venv)], 3600))
         steps.append((f"Installing {engine.package}…",
                       ["uv", "pip", "install", "--python", str(self.python), engine.package], 3600))
         # The worker resumes a stalled download itself and prints progress; on a slow line a few GB takes hours.

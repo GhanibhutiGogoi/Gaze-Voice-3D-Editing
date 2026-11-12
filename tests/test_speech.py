@@ -96,7 +96,7 @@ class SpeechTest(unittest.TestCase):
     def test_install_sequence(self):
         model = ENGINES["parakeet"].model
         steps = [
-            ["uv", "venv", "--python", "3.12", str(self.venv)],
+            ["uv", "venv", "--clear", "--python", "3.12", str(self.venv)],
             ["uv", "pip", "install", "--python", str(self.py), "parakeet-mlx"],
             [str(self.py), str(WORKER), "--engine", "parakeet", "--model", model, "--download-only"],
         ]
@@ -107,6 +107,101 @@ class SpeechTest(unittest.TestCase):
         self.assertGreaterEqual(timeouts[tuple(steps[2])], 4 * 3600)  # a slow but moving download isn't cut off
         streamed = [c for c in self.t.runner.calls if c in {tuple(s) for s in steps}]
         self.assertEqual(streamed, [tuple(s) for s in steps])
+
+    def make_broken_venv(self):
+        """The folder is there, but its python links to a Python that was removed (an uninstalled Anaconda, say)."""
+        self.py.parent.mkdir(parents=True)
+        os.symlink(self.t.root / "removed" / "bin" / "python3", self.py)
+        (self.venv / "pyvenv.cfg").write_text("home = /opt/anaconda3/bin\n")  # a real environment has this file
+
+    def test_a_venv_whose_python_was_removed_says_so_and_offers_install(self):
+        self.make_broken_venv()
+        state = self.speech.check()
+        self.assertEqual(state.health, Health.MISSING)
+        self.assertEqual(state.summary, "Parakeet (NVIDIA)'s Python environment doesn't work any more, usually because "
+                                        "the Python it was made from was removed. Press Install to set it up again.")
+        self.assertTrue(state.offers("install"))
+        self.assertIsNotNone(next(a for a in state.actions if a.id == "install").confirm)
+
+    def test_install_makes_a_venv_with_no_working_python_again(self):
+        self.make_broken_venv()
+        model = ENGINES["parakeet"].model
+        steps = [
+            ["uv", "venv", "--clear", "--python", "3.12", str(self.venv)],
+            ["uv", "pip", "install", "--python", str(self.py), "parakeet-mlx"],
+            [str(self.py), str(WORKER), "--engine", "parakeet", "--model", model, "--download-only"],
+        ]
+        for argv in steps:
+            self.t.runner.add(argv, stdout="ok\n")
+        job = make_job("speech", "install")
+        self.speech.run_action("install", job)
+        self.assertEqual(self.t.runner.calls[0], tuple(steps[0]))
+        self.assertNotIn("--force", self.t.runner.calls[0])  # uv must still refuse a folder that isn't an environment
+        made_again = "The Python environment from before has no working Python, so it's being made again."
+        self.assertIn(made_again, job.lines)
+        self.assertLess(job.lines.index(made_again), job.lines.index("Creating a Python 3.12 environment…"))
+
+    def install_steps(self):
+        model = ENGINES["parakeet"].model
+        steps = [
+            ["uv", "venv", "--clear", "--python", "3.12", str(self.venv)],
+            ["uv", "pip", "install", "--python", str(self.py), "parakeet-mlx"],
+            [str(self.py), str(WORKER), "--engine", "parakeet", "--model", model, "--download-only"],
+        ]
+        for argv in steps:
+            self.t.runner.add(argv, stdout="ok\n")
+        return steps
+
+    def test_install_leaves_a_folder_that_is_not_a_python_environment_alone(self):
+        self.venv.mkdir(parents=True)
+        precious = self.venv / "notes.txt"
+        precious.write_text("not an environment")
+        self.install_steps()
+        with self.assertRaises(JobError) as caught:
+            self.speech.run_action("install", make_job("speech", "install"))
+        self.assertEqual(str(caught.exception), f"{self.venv} isn't a Python environment, so it's left alone. "
+                                                "Move or delete that folder, then press Install again.")
+        self.assertEqual(self.t.runner.calls, [])  # uv was never asked to clear anything
+        self.assertEqual(precious.read_text(), "not an environment")
+
+    def test_install_goes_ahead_over_an_empty_folder(self):
+        self.venv.mkdir(parents=True)
+        steps = self.install_steps()
+        self.speech.run_action("install", make_job("speech", "install"))
+        self.assertEqual(self.t.runner.calls[0], tuple(steps[0]))
+
+    def test_install_leaves_a_working_environment_alone(self):
+        self.make_venv()
+        (self.venv / "pyvenv.cfg").write_text("home = /opt/homebrew/opt/python@3.12/bin\n")  # so only the check can stop it
+        self.cache_model()
+        pip = ["uv", "pip", "install", "--python", str(self.py), "parakeet-mlx"]
+        self.t.runner.add(["uv", "venv", "--clear", "--python", "3.12", str(self.venv)])  # answers if wrongly asked
+        self.t.runner.add(pip, stdout="ok\n")
+        self.t.runner.add([str(self.py), str(WORKER), "--engine", "parakeet", "--model",
+                           ENGINES["parakeet"].model, "--download-only"], stdout="ok\n")
+        job = make_job("speech", "install")
+        self.speech.run_action("install", job)
+        self.assertEqual(self.t.runner.calls[0], tuple(pip))
+        self.assertEqual([call for call in self.t.runner.calls if call[1:2] == ("venv",)], [])  # never made again
+        self.assertEqual([line for line in job.lines if "being made again" in line], [])
+
+    def test_with_no_venv_folder_it_is_not_installed_and_install_says_nothing_about_making_it_again(self):
+        state = self.speech.check()
+        self.assertEqual(state.health, Health.MISSING)
+        self.assertEqual(state.summary, "Not installed. Parakeet (NVIDIA) runs locally on Apple silicon, so your voice "
+                                        "never leaves this Mac.")
+        steps = [
+            ["uv", "venv", "--clear", "--python", "3.12", str(self.venv)],
+            ["uv", "pip", "install", "--python", str(self.py), "parakeet-mlx"],
+            [str(self.py), str(WORKER), "--engine", "parakeet", "--model", ENGINES["parakeet"].model, "--download-only"],
+        ]
+        for argv in steps:
+            self.t.runner.add(argv, stdout="ok\n")
+        job = make_job("speech", "install")
+        self.speech.run_action("install", job)
+        self.assertEqual(self.t.runner.calls[0], tuple(steps[0]))
+        self.assertEqual([line for line in job.lines if "being made again" in line], [])
+        self.assertEqual(job.lines[0], "Creating a Python 3.12 environment…")
 
     def test_test_action_transcribes_generated_speech(self):
         self.make_venv()

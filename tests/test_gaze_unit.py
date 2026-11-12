@@ -1,6 +1,7 @@
 import hashlib
 import json
 import math
+import os
 import statistics
 import sys
 import threading
@@ -348,6 +349,26 @@ class GazeUnitTest(GazeCase):
         install = next(a for a in state.actions if a.id == "install")
         self.assertIn("340 MB", install.confirm)
 
+    def make_broken_venv(self):
+        """The folder is there, but its python links to a Python that was removed (an uninstalled Anaconda, say)."""
+        self.py.parent.mkdir(parents=True)
+        os.symlink(self.t.root / "removed" / "bin" / "python3", self.py)
+        (self.venv / "pyvenv.cfg").write_text("home = /opt/anaconda3/bin\n")  # a real environment has this file
+
+    def test_an_environment_whose_python_was_removed_says_so_and_offers_install(self):
+        self.make_broken_venv()
+        state = self.gaze.check()
+        self.assertEqual(state.health, Health.MISSING)
+        self.assertEqual(state.summary, "Gaze tracking's Python environment doesn't work any more, usually because the "
+                                        "Python it was made from was removed. Press Install to set it up again.")
+        self.assertIn("340 MB", next(a for a in state.actions if a.id == "install").confirm)
+
+    def test_with_no_environment_folder_it_is_not_installed_as_before(self):
+        state = self.gaze.check()
+        self.assertEqual(state.health, Health.MISSING)
+        self.assertEqual(state.summary, "Not installed. Gaze tracking runs on this Mac with your camera. "
+                                        "No picture of you is ever saved or sent.")
+
     def test_mediapipe_that_wont_import_is_not_installed(self):
         self.install(importable=False)
         state = self.gaze.check()
@@ -570,7 +591,7 @@ class GazeUnitTest(GazeCase):
 
     def steps(self):
         return [
-            ["uv", "venv", "--python", "3.12", str(self.venv)],
+            ["uv", "venv", "--clear", "--python", "3.12", str(self.venv)],
             ["uv", "pip", "install", "--python", str(self.py), "mediapipe==1.2.2"],
         ]
 
@@ -587,6 +608,51 @@ class GazeUnitTest(GazeCase):
         self.assertEqual(urls, [MODEL_URL])
         self.assertEqual(self.t.paths.gaze_model_file.read_bytes(), data)
         self.assertEqual([p.name for p in self.t.paths.gaze_model_file.parent.iterdir()], [self.t.paths.gaze_model_file.name])
+
+    def test_install_makes_an_environment_with_no_working_python_again(self):
+        self.gaze.opener = self.opener(self.fake_model())
+        self.make_broken_venv()
+        for argv in self.steps():
+            self.t.runner.add(argv, stdout="ok\n")
+        job = make_job("gaze", "install")
+        self.gaze.run_action("install", job)
+        self.assertEqual(self.t.runner.calls[0], tuple(self.steps()[0]))
+        self.assertNotIn("--force", self.t.runner.calls[0])  # uv must still refuse a folder that isn't an environment
+        made_again = "The Python environment from before has no working Python, so it's being made again."
+        self.assertIn(made_again, job.lines)
+        self.assertLess(job.lines.index(made_again), job.lines.index("Creating a Python 3.12 environment…"))
+
+    def test_install_leaves_a_folder_that_is_not_a_python_environment_alone(self):
+        self.venv.mkdir(parents=True)
+        precious = self.venv / "notes.txt"
+        precious.write_text("not an environment")
+        self.gaze.opener = self.opener(self.fake_model())
+        for argv in self.steps():
+            self.t.runner.add(argv, stdout="ok\n")
+        with self.assertRaises(JobError) as caught:
+            self.gaze.run_action("install", make_job("gaze", "install"))
+        self.assertEqual(str(caught.exception), f"{self.venv} isn't a Python environment, so it's left alone. "
+                                                "Move or delete that folder, then press Install again.")
+        self.assertEqual(self.t.runner.calls, [])  # uv was never asked to clear anything
+        self.assertEqual(precious.read_text(), "not an environment")
+
+    def test_install_goes_ahead_over_an_empty_folder(self):
+        self.venv.mkdir(parents=True)
+        self.gaze.opener = self.opener(self.fake_model())
+        for argv in self.steps():
+            self.t.runner.add(argv, stdout="ok\n")
+        self.gaze.run_action("install", make_job("gaze", "install"))
+        self.assertEqual(self.t.runner.calls[0], tuple(self.steps()[0]))
+
+    def test_install_with_no_environment_folder_says_nothing_about_making_it_again(self):
+        self.gaze.opener = self.opener(self.fake_model())
+        for argv in self.steps():
+            self.t.runner.add(argv, stdout="ok\n")
+        job = make_job("gaze", "install")
+        self.gaze.run_action("install", job)
+        self.assertEqual(self.t.runner.calls[0], tuple(self.steps()[0]))
+        self.assertEqual([line for line in job.lines if "being made again" in line], [])
+        self.assertEqual(job.lines[0], "Creating a Python 3.12 environment…")
 
     def test_install_leaves_alone_what_is_already_there(self):
         data = self.fake_model()
