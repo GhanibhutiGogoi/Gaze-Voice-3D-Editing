@@ -71,6 +71,12 @@ _MAX_BODY = 64 * 1024
 _CSP = "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'"
 
 
+def _after(query: str) -> int:
+    """The `after` of a query string: a whole number of up to 12 digits, or 0 when it is missing or is anything else."""
+    value = parse_qs(query).get("after", [""])[0]
+    return int(value) if value.isascii() and value.isdigit() and len(value) <= 12 else 0
+
+
 class ControlCenter:
     """Everything the HTTP layer needs: components, jobs, settings, events."""
 
@@ -108,6 +114,7 @@ class ControlCenter:
         self._training_again = False  # and training changed again meanwhile
         if "mlagents" in self.components and ctx.training is not None:
             ctx.training.subscribe(self._training_changed)
+            ctx.training.subscribe_output(self._training_output)
 
     def _safe_check(self, component: Component) -> ComponentState:
         try:
@@ -159,6 +166,13 @@ class ControlCenter:
         except RuntimeError:  # the control center has closed
             with self._training_lock:
                 self._training_checking = False
+
+    def _training_output(self, run_id: str, serial: int, n: int, text: str) -> None:
+        """One line of the trainer's output (called from the thread that reads it): show it in the dashboard's terminal.
+
+        The serial tells the run from another that has the same name, so the page knows when lines begin again at 1.
+        """
+        self.bus.publish("training.output", {"run_id": run_id, "serial": serial, "n": n, "text": text})
 
     def _recheck_training(self) -> None:
         component = self.components["mlagents"]  # only subscribed to when there is one
@@ -362,6 +376,10 @@ class ControlCenter:
         project = status["project"] or self.ctx.settings.unity_project or None
         # The earlier runs with a model: after a restart there is no current run, and "use the trained model" needs an id.
         return {"ok": True, "installed": installed, **status, "project": project, "runs": recent_runs(project)}
+
+    def mlagents_output(self, after: int = 0) -> dict:
+        """What the trainer printed, from the line after `after`: the same lines the `training.output` events carry."""
+        return self.ctx.training.output(after)
 
     def mlagents_train(self, run_id: str, config_yaml: str | None = None, resume: bool = False,
                        overwrite: bool = False) -> dict:
@@ -649,6 +667,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json(200, self.center.mlagents_status())
             except TrainingError as exc:
                 return self._error(409, str(exc))
+        if path == "/api/mlagents/output":
+            return self._json(200, self.center.mlagents_output(_after(url.query)))
         return self._error(404, "Not found")
 
     def _picture(self, command_id: str, number: int) -> None:

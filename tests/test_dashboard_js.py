@@ -824,5 +824,1122 @@ class SentPictureTest(unittest.TestCase):
         self.assertNotIn("filter: blur", css)  # no floating glass (see DESIGN.md)
 
 
+TERMINAL_PAGE = """
+class Node {}
+class FakeElement extends Node {
+  constructor(tag, id = "") {
+    super();
+    this.tag = tag; this.id = id; this.attrs = {}; this.children = []; this.listeners = {}; this.className = "";
+    this.textContent = ""; this.dataset = {}; this.hidden = false; this.disabled = false; this.parent = null;
+    this.scrollTop = 0; this.clientHeight = 100; this.focused = 0;
+  }
+  get scrollHeight() { return this.children.length * 20; }
+  setAttribute(name, value) { this.attrs[name] = value; }
+  addEventListener(type, handler) { (this.listeners[type] = this.listeners[type] || []).push(handler); }
+  append(...kids) { for (const kid of kids) { if (kid instanceof FakeElement) kid.parent = this; this.children.push(kid); } }
+  replaceChildren() { this.children = []; this.scrollTop = 0; }
+  get firstChild() { return this.children[0] || null; }
+  remove() { if (this.parent) this.parent.children = this.parent.children.filter((kid) => kid !== this); }
+  fire(type) { (this.listeners[type] || []).forEach((handler) => handler({ target: this })); }
+  focus() { this.focused += 1; }
+}
+const ids = ["terminal", "terminal-run", "terminal-status", "terminal-led", "terminal-stop", "terminal-close",
+             "terminal-log", "terminal-jump", "announcer"];
+const page = Object.fromEntries(ids.map((id) => [id, new FakeElement("x", id)]));
+page.terminal.hidden = true;
+page["terminal-stop"].hidden = true;
+page["terminal-jump"].hidden = true;
+const document = {
+  getElementById: (id) => page[id] || null,
+  createElement: (tag) => new FakeElement(tag),
+  createTextNode: (text) => ({ text }),
+  querySelector: () => null,
+  activeElement: null,
+};
+const ran = [];
+const runAction = (cid, aid) => { ran.push([cid, aid]); };
+let busyNow = false;
+const isBusy = () => busyNow;
+const runningJob = () => (busyNow ? { action: "stop" } : null);
+const asked = [];
+let answers = [];
+const getJSON = async (path) => { asked.push(path); const next = answers.shift(); if (next instanceof Error) throw next; return next; };
+const el = (id) => page[id];
+const texts = () => page["terminal-log"].children.map((line) => line.textContent);
+// A run name has a serial of its own, so two runs with different names are different runs; pass a serial to make
+// the same name another run (resume, overwrite).
+const serials = {};
+const serialFor = (run) => { if (!(run in serials)) serials[run] = 1000 + Object.keys(serials).length; return serials[run]; };
+const say = (run, n, text, serial = serialFor(run)) => onTrainingOutput({ run_id: run, serial, n, text });
+const answer = (run, lines, serial = serialFor(run)) => ({ run_id: run, serial, first: lines.length ? lines[0].n : 0, lines });
+const trainer = (state, run = "run1", extra = {}) => ({
+  id: "mlagents", name: "ML-Agents", health: "ready", summary: extra.summary || `Training ${run}: step 10000, mean reward 0.42.`,
+  details: state === "idle" ? [] : [["Last run", `${run} · ${state}`]],
+  actions: extra.actions || (["waiting", "training"].includes(state) ? [{ id: "stop", label: "Stop training" }] : []),
+  run: state === "idle" ? null
+    : { run_id: run, serial: extra.serial === undefined ? serialFor(run) : extra.serial, state, listening: extra.listening === undefined ? true : extra.listening },
+});
+const setTrainer = (comp) => { S.state = { components: [comp] }; };
+const store = {};
+let storageBroken = false;
+const sessionStorage = {
+  getItem: (key) => { if (storageBroken) throw new Error("no storage"); return key in store ? store[key] : null; },
+  setItem: (key, value) => { if (storageBroken) throw new Error("no storage"); store[key] = String(value); },
+};
+const refreshed = [];
+const refresh = () => { refreshed.push(1); };
+"""
+
+TERMINAL_CONSTS = ("TERM_MAX", "TERM_LIVE", "TERM_LEDS", "TERM_SAYS", "TERM_STARTING", "TERM_IDLE", "TERM_CLOSED_KEY",
+                   "TERM_EXCEPTION")
+TERMINAL_FUNCTIONS = ("h", "$", "component", "components", "announce", "termKind", "trainerRun", "terminalStatus",
+                      "startTerminalRun", "termAppend", "onTrainingOutput", "takeOutput", "fillTerminal", "noteTrainer",
+                      "renderTerminal", "rememberClosed", "recallClosed", "closeTerminal", "jumpToLatest", "onTerminalScroll",
+                      "wireTerminal", "onComponentUpdated")
+
+
+def block(source: str, name: str) -> str:
+    """The `const NAME = …;` (on one line or several), `const $ = …` or `function NAME(…) {…}` of app.js, whole."""
+    if name == "$" or name.startswith("TERM_"):
+        start = re.search(rf"^const {re.escape(name)} = .*$", source, re.MULTILINE)
+        assert start, f"{name} is not where this test expects it"
+        if start.group(0).split(" // ")[0].rstrip().endswith(";"):
+            return start.group(0) + "\n"
+        match = re.compile(r"^.*?^[}\]];\n", re.DOTALL | re.MULTILINE).match(source, start.start())
+    else:
+        match = re.search(rf"^(?:async )?function {name}\(.*?^\}}\n", source, re.DOTALL | re.MULTILINE)
+    assert match, f"{name} is not where this test expects it"
+    return match.group(0)
+
+
+def terminal(body: str, stubs: str = ""):
+    """Run `body` against the real terminal-panel code in app.js and a small stand-in page. `body` sets `out`."""
+    source = APP_JS.read_text()
+    state = re.search(r"^const S = \{.*?^\};\n", source, re.DOTALL | re.MULTILINE)
+    assert state, "S is not where this test expects it"
+    parts = [state.group(0), *(block(source, name) for name in TERMINAL_CONSTS),
+             *(block(source, name) for name in TERMINAL_FUNCTIONS)]
+    program = (f"{TERMINAL_PAGE}\n{chr(10).join(parts)}\n{stubs}\nlet out = null;\n"
+               f"(async () => {{\n{body}\n}})().then(() => console.log(JSON.stringify(out)));\n")
+    done = subprocess.run([NODE, "-e", program], capture_output=True, text=True, timeout=30)
+    assert done.returncode == 0, done.stderr
+    return json.loads(done.stdout)
+
+
+TERM_STARTING_TEXT = "ML-Agents is starting up. Press Play once it says it is waiting for Unity."
+
+
+@unittest.skipUnless(NODE, "node isn't installed")
+class TerminalPanelTest(unittest.TestCase):
+    """The ML-Agents terminal panel: the real functions of app.js against a stand-in page."""
+
+    def test_it_stays_hidden_while_there_is_no_run(self):
+        out = terminal("""
+          setTrainer(trainer("idle", null, { summary: "Ready to train" }));
+          renderTerminal();
+          out = { hidden: el("terminal").hidden };
+        """)
+        self.assertEqual(out, {"hidden": True})
+
+    def test_the_first_event_shows_the_panel_with_the_run_and_the_line(self):
+        out = terminal("""
+          setTrainer(trainer("waiting", "Mover-1"));
+          const before = el("terminal").hidden;
+          say("Mover-1", 1, "[INFO] Listening on port 5004.");
+          out = { before, hidden: el("terminal").hidden, run: el("terminal-run").textContent, lines: texts() };
+        """)
+        self.assertEqual(out, {"before": True, "hidden": False, "run": "Mover-1", "lines": ["[INFO] Listening on port 5004."]})
+
+    def test_the_first_event_shows_it_even_before_the_page_knows_the_trainer(self):
+        out = terminal("""
+          S.state = null;
+          say("Mover-1", 1, "hello");
+          out = { hidden: el("terminal").hidden, run: el("terminal-run").textContent };
+        """)
+        self.assertEqual(out, {"hidden": False, "run": "Mover-1"})
+
+    def test_lines_are_added_in_order_and_one_it_already_has_is_skipped(self):
+        out = terminal("""
+          for (const [n, text] of [[1, "a"], [2, "b"], [2, "b again"], [1, "a again"], [3, "c"], [3, "c"], [4, "d"]]) say("run1", n, text);
+          out = texts();
+        """)
+        self.assertEqual(out, ["a", "b", "c", "d"])
+
+    def test_a_blank_line_is_a_line(self):
+        out = terminal("""
+          say("run1", 1, ""); say("run1", 2, "   "); say("run1", 3, "x");
+          out = texts();
+        """)
+        self.assertEqual(out, ["", "   ", "x"])
+
+    def test_a_line_with_markup_in_it_shows_literally(self):
+        out = terminal("""
+          say("run1", 1, "<b>bold</b> & <img src=x onerror=alert(1)>");
+          const line = el("terminal-log").children[0];
+          out = { text: line.textContent, kids: line.children.length, tag: line.tag };
+        """)
+        self.assertEqual(out, {"text": "<b>bold</b> & <img src=x onerror=alert(1)>", "kids": 0, "tag": "div"})
+
+    def test_only_the_last_1000_lines_stay_on_the_page(self):
+        out = terminal("""
+          for (let n = 1; n <= 1200; n += 1) say("run1", n, `line ${n}`);
+          const all = texts();
+          out = { count: all.length, first: all[0], last: all[all.length - 1], max: TERM_MAX };
+        """)
+        self.assertEqual(out, {"count": 1000, "first": "line 201", "last": "line 1200", "max": 1000})
+
+    def test_a_batch_that_is_too_long_is_cut_to_the_last_1000_too(self):
+        out = terminal("""
+          answers = [{ run_id: "run1", serial: serialFor("run1"), first: 1, lines: Array.from({ length: 1500 }, (_, i) => ({ n: i + 1, text: `line ${i + 1}` })) }];
+          await fillTerminal();
+          const all = texts();
+          out = { count: all.length, first: all[0], last: all[all.length - 1] };
+        """)
+        self.assertEqual(out, {"count": 1000, "first": "line 501", "last": "line 1500"})
+
+    def test_close_hides_it_until_another_run_starts(self):
+        out = terminal("""
+          setTrainer(trainer("training", "run1"));
+          say("run1", 1, "a");
+          el("terminal-close").fire("click");
+          const closed = el("terminal").hidden;
+          say("run1", 2, "b");
+          say("run1", 3, "c");
+          renderTerminal();
+          const stillClosed = el("terminal").hidden;
+          setTrainer(trainer("waiting", "run2"));
+          say("run2", 1, "x");
+          out = { closed, stillClosed, hidden: el("terminal").hidden, run: el("terminal-run").textContent, lines: texts() };
+        """, "wireTerminal();")
+        self.assertEqual(out, {"closed": True, "stillClosed": True, "hidden": False, "run": "run2", "lines": ["x"]})
+
+    def test_a_closed_run_stays_closed_when_the_page_catches_up_or_the_trainer_state_changes(self):
+        out = terminal("""
+          setTrainer(trainer("training", "run1"));
+          say("run1", 1, "a");
+          closeTerminal();
+          answers = [{ run_id: "run1", serial: serialFor("run1"), first: 1, lines: [{ n: 1, text: "a" }, { n: 2, text: "b" }] }];
+          await fillTerminal();
+          setTrainer(trainer("finished", "run1"));
+          renderTerminal();
+          out = { hidden: el("terminal").hidden, lines: texts() };
+        """)
+        self.assertEqual(out, {"hidden": True, "lines": ["a"]})
+
+    def test_a_late_line_of_a_run_that_was_closed_does_not_take_the_panel_back_from_the_run_after_it(self):
+        out = terminal("""
+          say("run1", 1, "a");
+          closeTerminal();
+          say("run2", 1, "b");
+          say("run1", 2, "late line of the closed run");
+          out = { hidden: el("terminal").hidden, run: el("terminal-run").textContent, lines: texts() };
+        """)
+        self.assertEqual(out, {"hidden": False, "run": "run2", "lines": ["b"]})
+
+    def test_after_close_the_focus_goes_to_the_voice_keys_which_are_still_there(self):
+        out = terminal("""
+          const asked = [];
+          const target = new FakeElement("button");
+          document.querySelector = (selector) => { asked.push(selector); return target; };
+          say("run1", 1, "a");
+          closeTerminal();
+          out = { focused: target.focused, asked };
+        """)
+        self.assertEqual(out["focused"], 1)
+        self.assertEqual(len(out["asked"]), 1)
+        self.assertIn("voice", out["asked"][0])
+
+    def test_close_with_nothing_shown_does_nothing(self):
+        out = terminal("""
+          closeTerminal();
+          say("run1", 1, "a");
+          out = { hidden: el("terminal").hidden, lines: texts() };
+        """)
+        self.assertEqual(out, {"hidden": False, "lines": ["a"]})
+
+    def test_stop_is_there_only_while_the_trainer_offers_it(self):
+        out = terminal("""
+          const seen = [];
+          for (const state of ["waiting", "training", "stopping", "stopped", "finished", "failed"]) {
+            setTrainer(trainer(state));
+            say("run1", seen.length + 1, state);
+            seen.push([state, !el("terminal-stop").hidden]);
+          }
+          out = seen;
+        """)
+        self.assertEqual(out, [["waiting", True], ["training", True], ["stopping", False], ["stopped", False],
+                               ["finished", False], ["failed", False]])
+
+    def test_pressing_stop_runs_the_ml_agents_stop_action(self):
+        out = terminal("""
+          setTrainer(trainer("training"));
+          say("run1", 1, "a");
+          el("terminal-stop").fire("click");
+          out = ran;
+        """, "wireTerminal();")
+        self.assertEqual(out, [["mlagents", "stop"]])
+
+    def test_stop_waits_while_a_job_is_busy_and_says_so(self):
+        out = terminal("""
+          setTrainer(trainer("training"));
+          say("run1", 1, "a");
+          const idle = { disabled: el("terminal-stop").disabled, label: el("terminal-stop").textContent };
+          busyNow = true;
+          renderTerminal();
+          out = { idle, busy: { disabled: el("terminal-stop").disabled, label: el("terminal-stop").textContent } };
+        """)
+        self.assertEqual(out, {"idle": {"disabled": False, "label": "Stop training"},
+                               "busy": {"disabled": True, "label": "Stopping…"}})
+
+    def test_the_status_line_is_the_units_summary_and_the_light_follows_the_state(self):
+        out = terminal("""
+          const rows = [];
+          for (const state of ["waiting", "training", "stopping", "finished", "failed"]) {
+            setTrainer(trainer(state, "run1", { summary: `summary of ${state}` }));
+            say("run1", rows.length + 1, state);
+            rows.push([state, el("terminal-status").textContent, el("terminal-led").dataset.led]);
+          }
+          out = rows;
+        """)
+        self.assertEqual(out, [["waiting", "summary of waiting", "standby"], ["training", "summary of training", "live"],
+                               ["stopping", "summary of stopping", "busy"], ["finished", "summary of finished", "off"],
+                               ["failed", "summary of failed", "fault"]])
+
+    def test_the_status_line_says_starting_up_until_the_trainer_is_listening(self):
+        out = terminal("""
+          const rows = [];
+          setTrainer(trainer("waiting", "run1", { listening: false, summary: "Waiting for Unity: press Play in the Editor to start training." }));
+          say("run1", 1, "banner");
+          rows.push([el("terminal-status").textContent, el("terminal-led").dataset.led]);
+          setTrainer(trainer("waiting", "run1", { listening: true, summary: "Waiting for Unity: press Play in the Editor to start training." }));
+          renderTerminal();
+          rows.push([el("terminal-status").textContent, el("terminal-led").dataset.led]);
+          // not listening any more, but not waiting either: the unit's own words
+          setTrainer(trainer("training", "run1", { listening: false, summary: "Training run1: step 10000, mean reward 0.42." }));
+          renderTerminal();
+          rows.push([el("terminal-status").textContent, el("terminal-led").dataset.led]);
+          out = rows;
+        """)
+        self.assertEqual(out, [[TERM_STARTING_TEXT, "busy"],
+                               ["Waiting for Unity: press Play in the Editor to start training.", "standby"],
+                               ["Training run1: step 10000, mean reward 0.42.", "live"]])
+
+    def test_a_trainer_that_is_running_shows_the_panel_on_load_even_with_no_lines_yet(self):
+        out = terminal("""
+          answers = [{ run_id: "run1", serial: serialFor("run1"), first: 0, lines: [] }];
+          await fillTerminal();
+          const beforeState = el("terminal").hidden;
+          setTrainer(trainer("waiting", "run1"));
+          renderTerminal();
+          out = { beforeState, hidden: el("terminal").hidden, run: el("terminal-run").textContent };
+        """)
+        self.assertEqual(out, {"beforeState": True, "hidden": False, "run": "run1"})
+
+    def test_a_running_trainer_shows_the_panel_with_its_run_before_any_output_has_been_heard(self):
+        out = terminal("""
+          setTrainer(trainer("training", "run7"));
+          renderTerminal();
+          out = { hidden: el("terminal").hidden, run: el("terminal-run").textContent, stop: !el("terminal-stop").hidden };
+        """)
+        self.assertEqual(out, {"hidden": False, "run": "run7", "stop": True})
+
+    def test_a_finished_run_with_nothing_kept_does_not_show_an_empty_panel(self):
+        out = terminal("""
+          setTrainer(trainer("finished", "run1"));
+          answers = [{ run_id: "run1", serial: serialFor("run1"), first: 0, lines: [] }];
+          await fillTerminal();
+          out = { hidden: el("terminal").hidden };
+        """)
+        self.assertEqual(out, {"hidden": True})
+
+    # --- catching up -------------------------------------------------------------------------------------------
+    def test_on_load_it_asks_for_everything_and_shows_what_comes_back(self):
+        out = terminal("""
+          answers = [{ run_id: "run1", serial: serialFor("run1"), first: 1, lines: [{ n: 1, text: "a" }, { n: 2, text: "b" }] }];
+          await fillTerminal();
+          out = { asked, lines: texts(), hidden: el("terminal").hidden, run: el("terminal-run").textContent };
+        """)
+        self.assertEqual(out, {"asked": ["/api/mlagents/output?after=0"], "lines": ["a", "b"], "hidden": False, "run": "run1"})
+
+    def test_after_a_reconnect_it_asks_only_for_what_came_after_the_last_line_shown(self):
+        out = terminal("""
+          for (const n of [1, 2, 3, 4, 5, 6, 7]) say("run1", n, `l${n}`);
+          answers = [{ run_id: "run1", serial: serialFor("run1"), first: 1, lines: [{ n: 8, text: "l8" }, { n: 9, text: "l9" }] }];
+          await fillTerminal();
+          out = { asked, lines: texts() };
+        """)
+        self.assertEqual(out["asked"], ["/api/mlagents/output?after=7"])
+        self.assertEqual(out["lines"], ["l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8", "l9"])
+
+    def test_lines_the_events_already_brought_are_not_shown_twice(self):
+        out = terminal("""
+          say("run1", 1, "l1");
+          answers = [{ run_id: "run1", serial: serialFor("run1"), first: 1, lines: [{ n: 1, text: "l1" }, { n: 2, text: "l2" }, { n: 3, text: "l3" }] }];
+          const pending = fillTerminal();
+          say("run1", 2, "l2");  // arrives while the answer is on its way
+          await pending;
+          out = texts();
+        """)
+        self.assertEqual(out, ["l1", "l2", "l3"])
+
+    def test_a_different_run_clears_the_page_and_is_asked_for_again_from_the_start(self):
+        out = terminal("""
+          for (const n of [1, 2, 3, 4, 5]) say("old", n, `old ${n}`);
+          answers = [
+            { run_id: "new", serial: serialFor("new"), first: 1, lines: [] },
+            { run_id: "new", serial: serialFor("new"), first: 1, lines: [{ n: 1, text: "new 1" }, { n: 2, text: "new 2" }] },
+          ];
+          await fillTerminal();
+          out = { asked, lines: texts(), run: el("terminal-run").textContent };
+        """)
+        self.assertEqual(out, {"asked": ["/api/mlagents/output?after=5", "/api/mlagents/output?after=0"],
+                               "lines": ["new 1", "new 2"], "run": "new"})
+
+    def test_a_different_run_that_has_more_lines_than_were_shown_is_not_cut_short(self):
+        out = terminal("""
+          for (const n of [1, 2]) say("old", n, `old ${n}`);
+          answers = [
+            { run_id: "new", serial: serialFor("new"), first: 1, lines: [{ n: 3, text: "new 3" }, { n: 4, text: "new 4" }] },
+            { run_id: "new", serial: serialFor("new"), first: 1, lines: [{ n: 1, text: "new 1" }, { n: 2, text: "new 2" }, { n: 3, text: "new 3" },
+                                               { n: 4, text: "new 4" }] },
+          ];
+          await fillTerminal();
+          out = texts();
+        """)
+        self.assertEqual(out, ["new 1", "new 2", "new 3", "new 4"])
+
+    def test_a_failed_fetch_changes_nothing_and_can_be_tried_again(self):
+        out = terminal("""
+          say("run1", 1, "a");
+          answers = [new Error("HTTP 500")];
+          await fillTerminal();
+          const after = texts();
+          answers = [{ run_id: "run1", serial: serialFor("run1"), first: 1, lines: [{ n: 2, text: "b" }] }];
+          await fillTerminal();
+          out = { after, lines: texts(), asked };
+        """)
+        self.assertEqual(out, {"after": ["a"], "lines": ["a", "b"],
+                               "asked": ["/api/mlagents/output?after=1", "/api/mlagents/output?after=1"]})
+
+    def test_no_run_at_all_shows_nothing(self):
+        out = terminal("""
+          answers = [{ run_id: null, first: 0, lines: [] }];
+          await fillTerminal();
+          out = { hidden: el("terminal").hidden, lines: texts() };
+        """)
+        self.assertEqual(out, {"hidden": True, "lines": []})
+
+    def test_a_missed_line_is_fetched_instead_of_leaving_a_hole(self):
+        out = terminal("""
+          say("run1", 1, "l1"); say("run1", 2, "l2");
+          answers = [{ run_id: "run1", serial: serialFor("run1"), first: 1, lines: [{ n: 3, text: "l3" }, { n: 4, text: "l4" }, { n: 5, text: "l5" }] }];
+          say("run1", 5, "l5");  // 3 and 4 never came
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          out = { asked, lines: texts() };
+        """)
+        self.assertEqual(out, {"asked": ["/api/mlagents/output?after=2"], "lines": ["l1", "l2", "l3", "l4", "l5"]})
+
+    def test_a_run_started_again_under_the_same_name_clears_the_screen_and_shows_only_the_new_lines(self):
+        """The reviewer's case: the page last saw the run training, and the same name is resumed before it saw "ended"."""
+        out = terminal("""
+          setTrainer(trainer("training", "run1", { serial: 1 }));
+          renderTerminal();
+          for (let n = 1; n <= 5; n += 1) say("run1", n, `old ${n}`, 1);
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          asked.length = 0;  // what the page asked when it first saw the run is not what this is about
+          setTrainer(trainer("waiting", "run1", { serial: 2 }));
+          for (let n = 1; n <= 4; n += 1) say("run1", n, `NEW ${n}`, 2);  // numbers 1 to 4 are ones the page already has
+          renderTerminal();
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          out = { asked, lines: texts(), run: el("terminal-run").textContent, hidden: el("terminal").hidden };
+        """)
+        self.assertEqual(out, {"asked": [], "lines": ["NEW 1", "NEW 2", "NEW 3", "NEW 4"], "run": "run1", "hidden": False})
+
+    def test_a_run_started_again_under_the_same_name_is_noticed_from_the_unit_alone_and_its_lines_are_fetched(self):
+        out = terminal("""
+          setTrainer(trainer("training", "run1", { serial: 1 }));
+          renderTerminal();
+          for (let n = 1; n <= 4; n += 1) say("run1", n, `old ${n}`, 1);
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          asked.length = 0;
+          answers = [answer("run1", [{ n: 1, text: "NEW 1" }, { n: 2, text: "NEW 2" }], 2)];
+          setTrainer(trainer("waiting", "run1", { serial: 2 }));  // no ended state in between, and no line yet
+          renderTerminal();
+          const cleared = texts();
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          out = { cleared, asked, lines: texts(), hidden: el("terminal").hidden };
+        """)
+        self.assertEqual(out, {"cleared": [], "asked": ["/api/mlagents/output?after=0"], "lines": ["NEW 1", "NEW 2"],
+                               "hidden": False})
+
+    def test_an_answer_about_the_run_the_page_has_already_left_is_not_taken_back(self):
+        out = terminal("""
+          answers = [answer("run1", [{ n: 1, text: "old 1" }], 1)];
+          setTrainer(trainer("training", "run1", { serial: 1 }));
+          renderTerminal();  // the first sighting asks for the run's lines; the answer will be about serial 1
+          setTrainer(trainer("waiting", "run1", { serial: 2 }));
+          say("run1", 1, "NEW 1", 2);  // before the answer is in, the page has moved on to the next run
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          out = { lines: texts(), run: el("terminal-run").textContent, serial: S.term.serial };
+        """)
+        self.assertEqual(out, {"lines": ["NEW 1"], "run": "run1", "serial": 2})
+
+    def test_a_run_going_back_to_waiting_in_the_middle_is_not_a_new_run(self):
+        # Unity lost its connection and training waits for Play again: the same run, so its lines stay.
+        out = terminal("""
+          setTrainer(trainer("training"));
+          renderTerminal();
+          for (const n of [1, 2, 3]) say("run1", n, `l${n}`);
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          asked.length = 0;
+          setTrainer(trainer("waiting", "run1", { listening: false }));
+          renderTerminal();
+          say("run1", 4, "l4");
+          out = { asked, lines: texts() };
+        """)
+        self.assertEqual(out, {"asked": [], "lines": ["l1", "l2", "l3", "l4"]})
+
+    def test_a_closed_run_that_is_resumed_under_the_same_name_opens_the_panel_again(self):
+        out = terminal("""
+          setTrainer(trainer("stopped", "run1", { serial: 1 }));
+          renderTerminal();
+          say("run1", 1, "a", 1);
+          closeTerminal();
+          const closed = el("terminal").hidden;
+          say("run1", 2, "late line of the closed run", 1);  // still the same run: stays closed
+          const stillClosed = el("terminal").hidden;
+          setTrainer(trainer("waiting", "run1", { serial: 2 }));
+          say("run1", 1, "b", 2);
+          out = { closed, stillClosed, hidden: el("terminal").hidden, lines: texts(), run: el("terminal-run").textContent };
+        """)
+        self.assertEqual(out, {"closed": True, "stillClosed": True, "hidden": False, "lines": ["b"], "run": "run1"})
+
+    def test_a_closed_run_that_is_resumed_opens_the_panel_from_the_unit_alone_too(self):
+        out = terminal("""
+          setTrainer(trainer("stopped", "run1", { serial: 1 }));
+          say("run1", 1, "a", 1);
+          closeTerminal();
+          answers = [answer("run1", [{ n: 1, text: "b" }], 2)];
+          setTrainer(trainer("waiting", "run1", { serial: 2 }));
+          renderTerminal();
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          out = { hidden: el("terminal").hidden, lines: texts() };
+        """)
+        self.assertEqual(out, {"hidden": False, "lines": ["b"]})
+
+    def test_closing_remembers_the_serial_and_not_the_run_name(self):
+        out = terminal("""
+          say("run1", 1, "a", 41);
+          closeTerminal();
+          out = { dismissed: S.term.dismissed, serial: S.term.serial, stored: store[TERM_CLOSED_KEY] };
+        """)
+        self.assertEqual(out, {"dismissed": 41, "serial": 41, "stored": "41"})
+
+    def test_a_reload_keeps_the_panel_closed_for_that_run_and_opens_it_for_the_next(self):
+        out = terminal("""
+          say("run1", 1, "a", 7);
+          closeTerminal();
+          // the page is loaded again: nothing is in memory but the browser's storage
+          S.term.runId = null; S.term.serial = null; S.term.last = 0; S.term.shown = false; S.term.dismissed = null; S.term.seen = null;
+          el("terminal-log").replaceChildren();
+          S.term.dismissed = recallClosed();
+          const recalled = S.term.dismissed;
+          setTrainer(trainer("training", "run1", { serial: 7 }));
+          answers = [answer("run1", [{ n: 1, text: "a" }, { n: 2, text: "b" }], 7)];
+          renderTerminal();
+          await fillTerminal();
+          const sameRun = { hidden: el("terminal").hidden, lines: texts() };
+          setTrainer(trainer("waiting", "run1", { serial: 8 }));  // the same name resumed
+          say("run1", 1, "fresh", 8);
+          out = { recalled, sameRun, resumed: { hidden: el("terminal").hidden, lines: texts() } };
+        """)
+        self.assertEqual(out, {"recalled": 7, "sameRun": {"hidden": True, "lines": []},
+                               "resumed": {"hidden": False, "lines": ["fresh"]}})
+
+    def test_a_browser_that_will_not_keep_the_choice_still_closes_the_panel_and_loads(self):
+        out = terminal("""
+          storageBroken = true;
+          say("run1", 1, "a");
+          closeTerminal();
+          out = { hidden: el("terminal").hidden, recalled: recallClosed() };
+        """)
+        self.assertEqual(out, {"hidden": True, "recalled": None})
+
+    def test_nothing_or_junk_in_storage_is_no_closed_run(self):
+        out = terminal("""
+          const empty = recallClosed();
+          const kept = [];
+          for (const junk of ["", "abc", "-1", "1.5", "1e3", "null", "7;8"]) { store[TERM_CLOSED_KEY] = junk; kept.push(recallClosed()); }
+          out = { empty, kept };
+        """)
+        self.assertEqual(out, {"empty": None, "kept": [None] * 7})
+
+    def test_only_one_fetch_is_out_at_a_time_and_one_more_follows_if_asked_meanwhile(self):
+        out = terminal("""
+          answers = [
+            { run_id: "run1", serial: serialFor("run1"), first: 1, lines: [{ n: 1, text: "l1" }] },
+            { run_id: "run1", serial: serialFor("run1"), first: 1, lines: [{ n: 2, text: "l2" }] },
+          ];
+          const a = fillTerminal();
+          const b = fillTerminal();
+          await a; await b;
+          out = { asked, lines: texts() };
+        """)
+        self.assertEqual(out, {"asked": ["/api/mlagents/output?after=0", "/api/mlagents/output?after=1"],
+                               "lines": ["l1", "l2"]})
+
+    def test_events_that_are_not_lines_are_ignored(self):
+        out = terminal("""
+          for (const bad of [null, {}, { run_id: "r", n: "1", text: "x" }, { run_id: "r", n: 1 }, { run_id: 4, n: 1, text: "x" }]) {
+            onTrainingOutput(bad);
+          }
+          out = { hidden: el("terminal").hidden, lines: texts() };
+        """)
+        self.assertEqual(out, {"hidden": True, "lines": []})
+
+    # --- the unit's own news -----------------------------------------------------------------------------------
+    def test_a_component_update_for_the_trainer_reaches_the_panel_at_once(self):
+        out = terminal("""
+          setTrainer(trainer("training", "run1", { summary: "Training run1: step 10000, mean reward 0.42." }));
+          say("run1", 1, "[INFO] a line");
+          const before = { status: el("terminal-status").textContent, stop: !el("terminal-stop").hidden };
+          // the payload of a component.updated event; nothing has been fetched, and no timer has run
+          onComponentUpdated(trainer("stopping", "run1", { summary: "Stopping training run1. Waiting for it to save the model." }));
+          const during = { status: el("terminal-status").textContent, stop: !el("terminal-stop").hidden, led: el("terminal-led").dataset.led,
+                           stored: component("mlagents").summary, asked };
+          onComponentUpdated(trainer("stopped", "run1", { summary: "Training run1 stopped. Its model was saved and is ready to use." }));
+          out = { before, during, after: { status: el("terminal-status").textContent, led: el("terminal-led").dataset.led, announced: el("announcer").textContent } };
+        """)
+        self.assertEqual(out, {
+            "before": {"status": "Training run1: step 10000, mean reward 0.42.", "stop": True},
+            "during": {"status": "Stopping training run1. Waiting for it to save the model.", "stop": False, "led": "busy",
+                       "stored": "Stopping training run1. Waiting for it to save the model.", "asked": []},
+            "after": {"status": "Training run1 stopped. Its model was saved and is ready to use.", "led": "off",
+                      "announced": "ML-Agents training stopped."},
+        })
+
+    def test_a_component_update_with_a_new_run_clears_and_fills_the_panel_without_waiting_for_a_refresh(self):
+        out = terminal("""
+          setTrainer(trainer("training", "run1", { serial: 1 }));
+          say("run1", 1, "old", 1);
+          answers = [answer("run1", [{ n: 1, text: "new" }], 2)];
+          onComponentUpdated(trainer("waiting", "run1", { serial: 2, listening: false }));
+          const cleared = { lines: texts(), status: el("terminal-status").textContent };
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          out = { cleared, lines: texts(), asked, refreshed: refreshed.length };
+        """)
+        self.assertEqual(out["cleared"], {"lines": [], "status": TERM_STARTING_TEXT})
+        self.assertEqual(out["lines"], ["new"])
+        self.assertEqual(out["asked"], ["/api/mlagents/output?after=0"])
+        self.assertEqual(out["refreshed"], 0)  # the refresh is a debounce: it has not run yet
+
+    def test_the_general_refresh_still_follows_a_changed_component_a_moment_later(self):
+        out = terminal("""
+          setTrainer(trainer("training", "run1", { summary: "one" }));
+          onComponentUpdated(trainer("training", "run1", { summary: "two" }));
+          onComponentUpdated(trainer("training", "run1", { summary: "three" }));
+          const early = refreshed.length;
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          out = { early, late: refreshed.length };
+        """)
+        self.assertEqual(out, {"early": 0, "late": 1})  # one refresh for both
+
+    def test_an_update_that_changes_nothing_the_page_shows_asks_for_no_refresh(self):
+        out = terminal("""
+          setTrainer(trainer("training", "run1", { summary: "same" }));
+          onComponentUpdated(trainer("training", "run1", { summary: "same" }));
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          out = refreshed.length;
+        """)
+        self.assertEqual(out, 0)
+
+    def test_an_update_for_another_unit_is_left_to_the_refresh(self):
+        out = terminal("""
+          setTrainer(trainer("training", "run1"));
+          const other = { id: "voice", name: "Voice", health: "ready", summary: "new", details: [], actions: [] };
+          onComponentUpdated(other);
+          out = { components: components().map((c) => c.id), refreshAsked: true };
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          out.refreshed = refreshed.length;
+        """)
+        self.assertEqual(out, {"components": ["mlagents"], "refreshAsked": True, "refreshed": 1})
+
+    def test_an_update_before_the_page_has_its_first_state_is_left_to_the_refresh(self):
+        out = terminal("""
+          S.state = null;
+          onComponentUpdated(trainer("training", "run1"));
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          out = { state: S.state, hidden: el("terminal").hidden, refreshed: refreshed.length };
+        """)
+        self.assertEqual(out, {"state": None, "hidden": True, "refreshed": 1})
+
+    # --- focus ---------------------------------------------------------------------------------------------------
+    def test_the_focus_moves_to_the_log_when_stop_goes_away_under_it(self):
+        out = terminal("""
+          setTrainer(trainer("training", "run1"));
+          say("run1", 1, "a");
+          document.activeElement = el("terminal-stop");
+          setTrainer(trainer("stopping", "run1"));  // the unit stops offering Stop
+          renderTerminal();
+          out = { stopHidden: el("terminal-stop").hidden, logFocus: el("terminal-log").focused };
+        """)
+        self.assertEqual(out, {"stopHidden": True, "logFocus": 1})
+
+    def test_the_focus_is_left_alone_when_it_was_not_on_stop(self):
+        out = terminal("""
+          setTrainer(trainer("training", "run1"));
+          say("run1", 1, "a");
+          document.activeElement = el("terminal-close");
+          setTrainer(trainer("stopping", "run1"));
+          renderTerminal();
+          document.activeElement = null;
+          setTrainer(trainer("stopped", "run1"));
+          renderTerminal();
+          out = el("terminal-log").focused;
+        """)
+        self.assertEqual(out, 0)
+
+    def test_the_focus_stays_on_stop_while_it_is_still_offered(self):
+        out = terminal("""
+          setTrainer(trainer("training", "run1"));
+          say("run1", 1, "a");
+          document.activeElement = el("terminal-stop");
+          for (let n = 2; n <= 6; n += 1) say("run1", n, `l${n}`);
+          setTrainer(trainer("waiting", "run1"));
+          renderTerminal();
+          out = { logFocus: el("terminal-log").focused, stopHidden: el("terminal-stop").hidden };
+        """)
+        self.assertEqual(out, {"logFocus": 0, "stopHidden": False})
+
+    # --- looking at it -----------------------------------------------------------------------------------------
+    def test_lines_are_coloured_by_what_they_are(self):
+        warn = ["[WARNING] Restarting worker[0] after 'The Unity environment took too long to respond.'"]
+        error = [
+            "[ERROR] UnityEnvironment worker 0: environment raised an unexpected exception.",
+            "Traceback (most recent call last):",
+            "mlagents_envs.exception.UnityTimeOutException: The Unity environment took too long to respond.",
+            "OSError: [Errno 48] Address already in use",
+            "ValueError: something unexpected went wrong",
+            "mlagents.trainers.exception.UnityTrainerException: Previous data from this run ID was found.",
+        ]
+        progress = ["[INFO] Mover. Step: 10000. Time Elapsed: 20.100 s. Mean Reward: 0.500. Std of Reward: 0.200. Training."]
+        plain = [
+            "[INFO] Listening on port 5004. Start training by pressing the Play button in the Unity Editor.",
+            "[INFO] Connected new brain: Mover?team=0", "", "            ┐  ╖",
+            '  File "/x/venv/bin/mlagents-learn", line 12, in <module>', "    sys.exit(main())",
+            "\t The environment does not need user interaction to launch",
+            "[INFO] Exported results/run1/Mover/Mover-50000.onnx", "An Error happened here",
+            "  OSError: indented lines are not exception lines", "During handling of the above exception, another exception occurred:",
+        ]
+        cases = [(text, "warn") for text in warn] + [(text, "error") for text in error] + \
+                [(text, "progress") for text in progress] + [(text, None) for text in plain]
+        out = terminal(f"const cases = {json.dumps(cases)};\nout = cases.map(([text]) => termKind(text));")
+        self.assertEqual(out, [kind for _, kind in cases])
+
+    def test_each_line_carries_its_colour_as_data_the_styles_pick_up(self):
+        out = terminal("""
+          say("run1", 1, "[WARNING] careful"); say("run1", 2, "plain"); say("run1", 3, "[ERROR] bad");
+          say("run1", 4, "[INFO] Mover. Step: 1. Time Elapsed: 2.000 s. Training.");
+          out = page["terminal-log"].children.map((line) => [line.className, line.attrs["data-kind"] || null]);
+        """)
+        self.assertEqual(out, [["term-line", "warn"], ["term-line", None], ["term-line", "error"], ["term-line", "progress"]])
+
+    # --- following the newest line -----------------------------------------------------------------------------
+    def test_it_follows_the_newest_line(self):
+        out = terminal("""
+          for (let n = 1; n <= 30; n += 1) say("run1", n, `l${n}`);
+          const log = el("terminal-log");
+          out = { atBottom: log.scrollTop >= log.scrollHeight - log.clientHeight, jump: el("terminal-jump").hidden };
+        """)
+        self.assertEqual(out, {"atBottom": True, "jump": True})
+
+    def test_the_panel_opening_after_lines_arrived_still_starts_at_the_newest(self):
+        out = terminal("""
+          for (let n = 1; n <= 30; n += 1) say("run1", n, `l${n}`);
+          const log = el("terminal-log");
+          el("terminal").hidden = true;   // a hidden box can't be scrolled, so its position is lost
+          log.scrollTop = 0;
+          renderTerminal();
+          out = { hidden: el("terminal").hidden, atBottom: log.scrollTop >= log.scrollHeight - log.clientHeight };
+        """)
+        self.assertEqual(out, {"hidden": False, "atBottom": True})
+
+    def test_scrolling_up_stops_following_and_offers_jump_to_latest(self):
+        out = terminal("""
+          for (let n = 1; n <= 30; n += 1) say("run1", n, `l${n}`);
+          const log = el("terminal-log");
+          log.scrollTop = 40;  // the reader scrolled up
+          log.fire("scroll");
+          const top = log.scrollTop;
+          say("run1", 31, "l31");
+          out = { stayed: log.scrollTop === top, jump: el("terminal-jump").hidden, count: texts().length };
+        """, "wireTerminal();")
+        self.assertEqual(out, {"stayed": True, "jump": False, "count": 31})
+
+    def test_jump_to_latest_goes_to_the_end_and_follows_again(self):
+        out = terminal("""
+          for (let n = 1; n <= 30; n += 1) say("run1", n, `l${n}`);
+          const log = el("terminal-log");
+          log.scrollTop = 40; log.fire("scroll");
+          say("run1", 31, "l31");
+          el("terminal-jump").fire("click");
+          const jumped = { atBottom: log.scrollTop >= log.scrollHeight - log.clientHeight, jump: el("terminal-jump").hidden,
+                           focus: log.focused };
+          say("run1", 32, "l32");
+          out = { jumped, followsAgain: log.scrollTop >= log.scrollHeight - log.clientHeight };
+        """, "wireTerminal();")
+        self.assertEqual(out, {"jumped": {"atBottom": True, "jump": True, "focus": 1}, "followsAgain": True})
+
+    def test_scrolling_back_down_by_hand_follows_again(self):
+        out = terminal("""
+          for (let n = 1; n <= 30; n += 1) say("run1", n, `l${n}`);
+          const log = el("terminal-log");
+          log.scrollTop = 40; log.fire("scroll");
+          const away = !el("terminal-jump").hidden;
+          log.scrollTop = log.scrollHeight - log.clientHeight; log.fire("scroll");
+          say("run1", 31, "l31");
+          out = { away, jump: el("terminal-jump").hidden, atBottom: log.scrollTop >= log.scrollHeight - log.clientHeight };
+        """, "wireTerminal();")
+        self.assertEqual(out, {"away": True, "jump": True, "atBottom": True})
+
+    def test_a_new_run_starts_at_the_bottom_with_no_jump_key(self):
+        out = terminal("""
+          for (let n = 1; n <= 30; n += 1) say("old", n, `l${n}`);
+          el("terminal-log").scrollTop = 40; el("terminal-log").fire("scroll");
+          say("new", 1, "first");
+          out = { jump: el("terminal-jump").hidden, lines: texts() };
+        """, "wireTerminal();")
+        self.assertEqual(out, {"jump": True, "lines": ["first"]})
+
+    # --- what is said aloud ------------------------------------------------------------------------------------
+    def test_only_these_state_changes_are_announced(self):
+        out = terminal("""
+          const said = [], counts = {};
+          setTrainer(trainer("idle", null, { summary: "Ready to train" }));
+          renderTerminal();
+          const steps = [["a", "waiting"], ["a", "training"], ["a", "stopping"], ["a", "stopped"],
+                         ["b", "waiting"], ["b", "training"], ["b", "finished"], ["c", "waiting"], ["c", "failed"]];
+          for (const [run, state] of steps) {
+            el("announcer").textContent = "";
+            setTrainer(trainer(state, run, { summary: `Because ${state}.` }));
+            counts[run] = (counts[run] || 0) + 1;
+            say(run, counts[run], state);
+            said.push([state, el("announcer").textContent]);
+          }
+          out = said;
+        """)
+        ready = "ML-Agents is ready. Press Play in Unity to start training."
+        self.assertEqual(out, [
+            ["waiting", ready],
+            ["training", "ML-Agents training started."],
+            ["stopping", ""],
+            ["stopped", "ML-Agents training stopped."],
+            ["waiting", ready],
+            ["training", "ML-Agents training started."],
+            ["finished", "ML-Agents training finished."],
+            ["waiting", ready],
+            ["failed", "ML-Agents training failed. Because failed."],
+        ])
+
+    STARTING = "ML-Agents is starting up. It will say when it is ready."
+    READY = "ML-Agents is ready. Press Play in Unity to start training."
+
+    def test_waiting_is_announced_as_starting_up_until_the_trainer_is_listening_and_as_ready_only_then(self):
+        out = terminal("""
+          const said = [];
+          setTrainer(trainer("idle", null, { summary: "Ready to train" }));
+          renderTerminal();
+          const step = (comp) => { el("announcer").textContent = ""; setTrainer(comp); renderTerminal(); said.push(el("announcer").textContent); };
+          step(trainer("waiting", "run1", { listening: false }));
+          step(trainer("waiting", "run1", { listening: false, summary: "still starting up" }));  // nothing new
+          step(trainer("waiting", "run1", { listening: true }));
+          step(trainer("waiting", "run1", { listening: true, summary: "waiting a bit more" }));  // nothing new
+          out = said;
+        """)
+        self.assertEqual(out, [self.STARTING, "", self.READY, ""])
+
+    def test_ready_is_not_said_before_listening_even_when_the_summary_says_to_press_play(self):
+        out = terminal("""
+          setTrainer(trainer("idle", null, { summary: "Ready to train" }));
+          renderTerminal();
+          el("announcer").textContent = "";
+          setTrainer(trainer("waiting", "run1", { listening: false, summary: "Waiting for Unity: press Play in the Editor." }));
+          say("run1", 1, "banner");
+          out = el("announcer").textContent;
+        """)
+        self.assertEqual(out, self.STARTING)
+        self.assertNotIn("Press Play", out)
+
+    def test_after_a_lost_connection_it_is_starting_up_again_and_then_ready_again(self):
+        out = terminal("""
+          const said = [];
+          setTrainer(trainer("training", "run1"));
+          renderTerminal();
+          const step = (comp) => { el("announcer").textContent = ""; setTrainer(comp); renderTerminal(); said.push(el("announcer").textContent); };
+          step(trainer("waiting", "run1", { listening: false }));  // Unity stopped answering: the worker restarts
+          step(trainer("waiting", "run1", { listening: true }));   // and listens again
+          step(trainer("training", "run1"));
+          out = said;
+        """)
+        self.assertEqual(out, [self.STARTING, self.READY, "ML-Agents training started."])
+
+    def test_a_page_opened_while_the_trainer_is_starting_says_nothing_until_it_is_ready(self):
+        out = terminal("""
+          setTrainer(trainer("waiting", "run1", { listening: false }));
+          renderTerminal();
+          const atLoad = el("announcer").textContent;
+          setTrainer(trainer("waiting", "run1", { listening: true }));
+          renderTerminal();
+          out = { atLoad, later: el("announcer").textContent };
+        """)
+        self.assertEqual(out, {"atLoad": "", "later": self.READY})
+
+    def test_a_resumed_run_with_the_same_name_is_announced_again(self):
+        out = terminal("""
+          setTrainer(trainer("waiting", "run1", { serial: 1 }));
+          renderTerminal();
+          setTrainer(trainer("finished", "run1", { serial: 1 }));
+          renderTerminal();
+          el("announcer").textContent = "";
+          setTrainer(trainer("waiting", "run1", { serial: 2, listening: false }));
+          renderTerminal();
+          out = el("announcer").textContent;
+        """)
+        self.assertEqual(out, self.STARTING)
+
+    def test_a_failure_is_announced_without_the_path_of_the_log(self):
+        out = terminal("""
+          const said = [];
+          setTrainer(trainer("waiting", "run1"));
+          renderTerminal();
+          const summaries = [
+            "Training stopped with an error. The log is at /Users/me/Library/Application Support/GazeVoice/logs/mlagents-run1.log.",
+            "Unity stopped answering for 2 minutes during training, so training ended. The log is at /Users/me/logs/mlagents-run2.log.",
+            "Another training run is already using ML-Agents' connection to Unity. Stop it first.",
+          ];
+          summaries.forEach((summary, i) => {
+            setTrainer(trainer("waiting", `run${i + 1}`));
+            say(`run${i + 1}`, 1, "[INFO] banner");
+            el("announcer").textContent = "";
+            setTrainer(trainer("failed", `run${i + 1}`, { summary }));
+            renderTerminal();
+            said.push(el("announcer").textContent);
+          });
+          out = { said, panel: el("terminal-status").textContent };
+        """)
+        self.assertEqual(out["said"], [
+            "ML-Agents training failed. Training stopped with an error.",
+            "ML-Agents training failed. Unity stopped answering for 2 minutes during training, so training ended.",
+            "ML-Agents training failed. Another training run is already using ML-Agents' connection to Unity. Stop it first.",
+        ])
+        self.assertTrue(all("/" not in said and "log is at" not in said for said in out["said"]))
+
+    def test_the_same_state_is_not_announced_again_and_a_line_is_never_announced(self):
+        out = terminal("""
+          setTrainer(trainer("training"));
+          renderTerminal();
+          el("announcer").textContent = "";
+          for (let n = 1; n <= 5; n += 1) { say("run1", n, `[WARNING] line ${n}`); renderTerminal(); }
+          setTrainer(trainer("training", "run1", { summary: "Training run1: step 20000, mean reward 0.9." }));
+          renderTerminal();
+          out = el("announcer").textContent;
+        """)
+        self.assertEqual(out, "")
+
+    def test_a_page_that_loads_in_the_middle_of_a_run_announces_nothing(self):
+        out = terminal("""
+          setTrainer(trainer("training"));
+          renderTerminal();
+          out = el("announcer").textContent;
+        """)
+        self.assertEqual(out, "")
+
+    def test_a_unit_that_is_still_checking_is_not_taken_for_a_change(self):
+        out = terminal("""
+          setTrainer(trainer("training"));
+          renderTerminal();
+          S.state = { components: [{ id: "mlagents", health: "checking", summary: "Still checking…", details: [], actions: [] }] };
+          renderTerminal();
+          setTrainer(trainer("training"));
+          renderTerminal();
+          out = el("announcer").textContent;
+        """)
+        self.assertEqual(out, "")
+
+    def test_state_changes_are_not_announced_by_a_panel_that_was_closed(self):
+        out = terminal("""
+          setTrainer(trainer("training"));
+          say("run1", 1, "a");
+          closeTerminal();
+          el("announcer").textContent = "";
+          setTrainer(trainer("finished"));
+          renderTerminal();
+          out = el("announcer").textContent;
+        """)
+        self.assertEqual(out, "")
+
+    def test_the_trainers_run_is_read_from_the_units_run_field(self):
+        out = terminal("""
+          const live = trainer("training", "Mover-1", { serial: 5, listening: false });
+          live.details = [["Last run", "something else · finished"]];  // the words for people are not what the panel reads
+          out = [
+            trainerRun(live),
+            trainerRun(trainer("idle")),
+            trainerRun({ id: "mlagents", health: "checking", details: [], actions: [], run: null }),
+            trainerRun({ id: "mlagents", health: "missing", details: [], actions: [], run: null }),
+            trainerRun({ id: "mlagents", health: "ready", details: [], actions: [] }),
+            trainerRun(null),
+          ];
+        """)
+        self.assertEqual(out, [{"run_id": "Mover-1", "serial": 5, "state": "training", "listening": False}, None,
+                               None, None, None, None])
+
+    def test_a_unit_that_is_still_being_checked_is_not_the_same_as_one_with_no_run(self):
+        out = terminal("""
+          out = [trainerRun({ id: "mlagents", health: "checking" }) === undefined, trainerRun(null) === undefined,
+                 trainerRun(trainer("idle")) === null];
+        """)
+        self.assertEqual(out, [True, True, True])
+
+    def test_the_panel_follows_the_units_run_and_ignores_the_last_run_text(self):
+        out = terminal("""
+          const comp = trainer("training", "run1", { serial: 5 });
+          comp.details = [["Last run", "another · stopped"]];
+          setTrainer(comp);
+          renderTerminal();
+          out = { hidden: el("terminal").hidden, run: el("terminal-run").textContent, led: el("terminal-led").dataset.led };
+        """)
+        self.assertEqual(out, {"hidden": False, "run": "run1", "led": "live"})
+
+
+class TerminalWiringTest(unittest.TestCase):
+    """The parts of the page that are not functions: the markup, the listeners and the styles."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.html = (STATIC / "index.html").read_text()
+        cls.js = APP_JS.read_text()
+        cls.css = (STATIC / "app.css").read_text()
+
+    def tag(self, element_id):
+        return re.search(rf"<[a-z0-9]+[^>]*id=\"{element_id}\"[^>]*>", self.html).group(0)
+
+    def test_the_panel_sits_directly_under_voice_and_starts_hidden(self):
+        voice = self.html.index('<section class="voice"')
+        terminal_at = self.html.index('id="terminal"')
+        desk = self.html.index('<div class="desk">')
+        self.assertLess(self.html.index("</section>", voice), terminal_at)
+        self.assertLess(terminal_at, desk)
+        self.assertEqual(self.html[self.html.index("</section>", voice):terminal_at].count("<section"), 1)  # nothing between
+        tag = self.tag("terminal")
+        self.assertTrue(tag.startswith("<section"))
+        self.assertIn(" hidden", tag)
+        self.assertIn('aria-labelledby="terminal-h"', tag)
+        self.assertIn('<h2 id="terminal-h">ML-Agents terminal</h2>', self.html)
+
+    def test_the_output_area_is_a_quiet_log_the_keyboard_can_scroll(self):
+        tag = self.tag("terminal-log")
+        self.assertIn('role="log"', tag)
+        self.assertIn('aria-live="off"', tag)
+        self.assertIn('tabindex="0"', tag)
+        self.assertIn("aria-label=", tag)
+
+    def test_the_buttons_have_names_and_focus_keys(self):
+        stop = re.search(r"<button[^>]*id=\"terminal-stop\"[^>]*>(.*?)</button>", self.html, re.DOTALL)
+        self.assertIn(" hidden", stop.group(0))
+        self.assertEqual(stop.group(1).strip(), "Stop training")
+        jump = re.search(r"<button[^>]*id=\"terminal-jump\"[^>]*>(.*?)</button>", self.html, re.DOTALL)
+        self.assertIn(" hidden", jump.group(0))
+        self.assertEqual(jump.group(1).strip(), "Jump to latest")
+        self.assertIn("aria-label=", self.tag("terminal-close"))
+        for button in ("terminal-stop", "terminal-close", "terminal-jump"):
+            tag = self.tag(button)
+            self.assertIn('type="button"', tag)
+            self.assertIn(f'data-focus-key="{button}"', tag)
+
+    def test_the_status_line_is_not_a_live_region(self):
+        tag = self.tag("terminal-status")
+        self.assertNotIn("aria-live", tag)
+        self.assertNotIn("role=", tag)
+
+    def test_events_and_page_loads_feed_the_panel(self):
+        self.assertRegex(self.js, r'source\.addEventListener\("training\.output", \(event\) => \{\s*'
+                                  r'onTrainingOutput\(JSON\.parse\(event\.data\)\);')
+        opened = re.search(r'source\.addEventListener\("open", \(\) => \{.*?\n  \}\);', self.js, re.DOTALL).group(0)
+        self.assertIn("fillTerminal();", opened)  # on a reconnect
+        started = re.search(r"^function start\(\) \{.*?^\}\n", self.js, re.DOTALL | re.MULTILINE).group(0)
+        self.assertIn("wireTerminal();", started)
+        self.assertLess(started.index("fillTerminal();"), started.index("if (SNAPSHOT) return;"))  # on load
+        render_all = re.search(r"^function renderAll\(\) \{.*?^\}\n", self.js, re.DOTALL | re.MULTILINE).group(0)
+        self.assertIn("renderTerminal();", render_all)
+
+    def test_lines_are_only_ever_put_in_as_text(self):
+        for unsafe in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"):
+            self.assertNotIn(unsafe, self.js)
+        self.assertIn("text: record.text", self.js)
+
+    def test_the_run_comes_from_the_units_run_field_and_not_from_its_text(self):
+        for gone in ("trainerNow", "renewTerminal", "terminalRun", "Last run", "TERM_ENDED"):
+            self.assertNotIn(gone, self.js)
+        self.assertIn("comp.run", self.js)
+
+    def test_component_updates_are_taken_in_straight_away(self):
+        self.assertRegex(self.js, r'source\.addEventListener\("component\.updated", \(event\) => \{\s*'
+                                  r'onComponentUpdated\(JSON\.parse\(event\.data\)\);')
+        update = re.search(r"^function onComponentUpdated\(late\) \{.*?^\}\n", self.js, re.DOTALL | re.MULTILINE).group(0)
+        self.assertLess(update.index("renderTerminal();"), update.index("setTimeout(refresh, 400)"))  # the panel does not wait
+        self.assertNotIn("connectEvents.lateTimer", self.js)
+
+    def test_a_closed_panel_is_read_back_before_the_first_draw_and_the_storage_is_always_guarded(self):
+        started = re.search(r"^function start\(\) \{.*?^\}\n", self.js, re.DOTALL | re.MULTILINE).group(0)
+        recalled = started.index("S.term.dismissed = recallClosed();")
+        self.assertLess(recalled, started.index("  wireTerminal();\n  renderAll();"))  # before the first draw
+        self.assertLess(recalled, started.index("fillTerminal();"))
+        for call in ("sessionStorage.getItem", "sessionStorage.setItem"):
+            at = self.js.index(call)
+            self.assertIn("try {", self.js[at - 80:at])  # never outside a try
+        self.assertEqual(self.js.count("sessionStorage."), 2)
+        self.assertNotIn("localStorage", self.js[self.js.index("// ---------- ML-Agents terminal"):])
+
+    def test_a_serial_is_what_a_line_is_checked_against(self):
+        taken = re.search(r"^function onTrainingOutput\(data\) \{.*?^\}\n", self.js, re.DOTALL | re.MULTILINE).group(0)
+        self.assertIn("data.serial", taken)
+        self.assertNotIn("data.run_id === t.", taken)
+        self.assertNotIn("data.run_id !== t.", taken)
+
+    def test_the_styles_make_a_dark_scrolling_monospace_screen(self):
+        rule = re.search(r"^\.term-screen \{(.*?)\}", self.css, re.DOTALL | re.MULTILINE).group(1)
+        self.assertIn("max-height: 22rem", rule)
+        self.assertIn("overflow: auto", rule)
+        self.assertIn("var(--font-mono)", rule)
+        self.assertIn("background: var(--readout)", rule)
+
+    def test_the_screen_gets_the_same_focus_ring_as_the_other_controls(self):
+        self.assertIn(".term-screen:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }", self.css)
+        self.assertIn(".key:focus-visible { outline: 2px solid var(--focus)", self.css)  # the buttons are .key
+
+    def test_lines_that_warn_fail_or_report_progress_have_their_own_colours(self):
+        for kind in ("warn", "error", "progress"):
+            self.assertRegex(self.css, rf'\.term-line\[data-kind="{kind}"\] \{{[^}}]*color: var\(--term-{kind}\)')
+            self.assertRegex(self.css, rf"--term-{kind}: #[0-9a-fA-F]{{6}};")
+        self.assertRegex(self.css, r'\.term-line\[data-kind="progress"\] \{[^}]*font-weight: 500')
+
+    def test_the_panel_never_scrolls_smoothly(self):
+        # Following the newest line and Jump to latest move at once, so there is no motion to take away from anyone.
+        self.assertNotIn("scroll-behavior: smooth", self.css)
+        section = re.search(r"^// ---------- ML-Agents terminal ----------\n.*?(?=^// ----------)", self.js,
+                            re.DOTALL | re.MULTILINE).group(0)
+        self.assertNotIn("smooth", section)
+        self.assertNotIn("scrollTo(", section)
+        self.assertNotIn("scrollIntoView", section)
+        self.assertIn("prefers-reduced-motion", self.css)
+
+    def test_no_new_script_font_or_stylesheet_is_loaded(self):
+        self.assertEqual(re.findall(r"<script[^>]*>", self.html), ['<script src="/static/app.js" defer>'])
+        self.assertEqual(re.findall(r"<link[^>]*>", self.html), ['<link rel="stylesheet" href="/static/app.css">'])
+        self.assertNotIn("@import", self.css)
+        self.assertNotIn("url(", self.css)
+
+
 if __name__ == "__main__":
     unittest.main()

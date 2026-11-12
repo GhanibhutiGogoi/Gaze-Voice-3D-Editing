@@ -249,6 +249,13 @@ class LocalToolsTest(unittest.TestCase):
         self.assertIn("Play", said["mlagents_train"])
         self.assertIn("installs nothing", said["mlagents_train"])
         self.assertIn("listening", said["mlagents_train"])  # Play is pressed once the trainer is listening
+        train = said["mlagents_train"]
+        # the user presses Play by default: the editor tells them once the trainer is listening, and presses it only if asked
+        self.assertIn("when the reply says listening is true, tell the user to press Play in Unity", train)
+        self.assertIn("press Play yourself with execute_csharp (EditorApplication.isPlaying = true;) only if the "
+                      "command asked you to", train)
+        self.assertLess(train.index("tell the user to press Play in Unity"), train.index("press Play yourself"))
+        self.assertNotIn("press Play with execute_csharp", train)  # the old default: the editor pressing it every time
         self.assertNotIn("right after this returns", said["mlagents_train"])
         self.assertIn("listening", said["mlagents_status"])
         self.assertIn("runs", said["mlagents_status"])

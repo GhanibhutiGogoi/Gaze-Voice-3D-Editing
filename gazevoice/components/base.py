@@ -47,6 +47,8 @@ class ComponentState:
     details: tuple[tuple[str, str], ...] = ()
     actions: tuple[ActionSpec, ...] = ()
     provider: dict | None = None  # API provider units: what the dashboard's key form needs (never the key)
+    run: dict | None = None  # the ML-Agents unit: {"run_id", "serial", "state", "listening"} of its run, None when idle
+    reports_run: bool = False  # the unit has runs, so `run` is in its dict even while it is None
 
     def offers(self, action_id: str) -> bool:
         return any(a.id == action_id for a in self.actions)
@@ -64,6 +66,7 @@ class ComponentState:
             "details": [[k, v] for k, v in self.details],
             "actions": [a.to_dict() for a in self.actions],
             **({"provider": self.provider} if self.provider is not None else {}),
+            **({"run": self.run} if self.reports_run else {}),
         }
 
 
@@ -115,6 +118,7 @@ class Component(ABC):
     id: ClassVar[str]
     name: ClassVar[str]
     role: ClassVar[str]
+    reports_run: ClassVar[bool] = False  # a unit that trains: its state names the run (see ComponentState.run)
 
     def __init__(self, ctx: Context):
         self.ctx = ctx
@@ -150,6 +154,7 @@ class Component(ABC):
         details: Iterable[tuple[str, object]] = (),
         actions: Iterable[ActionSpec] = (),
         provider: dict | None = None,
+        run: dict | None = None,
     ) -> ComponentState:
         return ComponentState(
             id=self.id,
@@ -160,6 +165,8 @@ class Component(ABC):
             details=tuple((str(k), str(v)) for k, v in details),
             actions=tuple(actions),
             provider=provider,
+            run=run,
+            reports_run=self.reports_run,
         )
 
     def run_action(self, action: str, job: Job) -> dict | None:

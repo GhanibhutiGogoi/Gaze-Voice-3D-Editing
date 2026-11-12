@@ -58,6 +58,29 @@ FORM: Direction 3 of 7: console channel strip plus outboard rack.
       <div class="unit transport" id="voice"></div>
     </section>
 
+    <section class="terminal" id="terminal" aria-labelledby="terminal-h" hidden>
+      <div class="section-head">
+        <h2 id="terminal-h">ML-Agents terminal</h2>
+        <p class="section-note term-run" id="terminal-run"></p>
+      </div>
+      <div class="unit transport term">
+        <div class="transport-top">
+          <div class="term-readout">
+            <span class="led" id="terminal-led" data-led="off" aria-hidden="true"></span>
+            <p class="term-status" id="terminal-status"></p>
+          </div>
+          <div class="term-keys">
+            <button class="key" id="terminal-stop" type="button" data-focus-key="terminal-stop" hidden>Stop training</button>
+            <button class="key key-quiet term-close" id="terminal-close" type="button" data-focus-key="terminal-close" aria-label="Close the ML-Agents terminal" title="Close">×</button>
+          </div>
+        </div>
+        <div class="term-view">
+          <div class="term-screen" id="terminal-log" role="log" aria-live="off" aria-label="What ML-Agents is printing" tabindex="0" data-empty="Nothing printed yet."></div>
+          <button class="key term-jump" id="terminal-jump" type="button" data-focus-key="terminal-jump" hidden>Jump to latest</button>
+        </div>
+      </div>
+    </section>
+
     <div class="desk">
       <section class="rack" aria-labelledby="rack-h">
         <div class="section-head">
