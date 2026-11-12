@@ -16,7 +16,7 @@ from gazevoice.events import EventBus
 from gazevoice.voice.audio import MicError
 from gazevoice.voice.gaze import Area
 from gazevoice.voice.gaze_tracker import GazeError, GazeTracker
-from gazevoice.components.brains import CLAUDE_ISOLATION
+from gazevoice.components.brains import CLAUDE_ISOLATION, codex_mcp_args
 from gazevoice.voice.brains import claude_session_argv
 from gazevoice.voice.picture import PICTURE_MODEL, PICTURE_RULES, Describer
 from gazevoice.voice.service import PointerTracker, VoiceError
@@ -431,6 +431,107 @@ class BuildVoiceTest(unittest.TestCase):
         server = json.loads(config_path.read_text())["mcpServers"]["unity"]
         self.assertEqual(server["args"], ["-m", "gazevoice.unity_mcp"])
         self.assertIn("PYTHONPATH", server["env"])
+
+    def unity_editor(self, source, control_url="http://127.0.0.1:8977", settings=None, **kwargs):
+        changes = {"voice_host": "unity", **(settings or {})}
+        self.t.ctx.settings = update_settings(self.t.ctx.settings, changes)
+        voice = build_voice(self.t.ctx, EventBus(), {"refiner": "claude", "editor": source}, control_url=control_url, **kwargs)
+        return voice.factories.editor()
+
+    def test_claude_gets_the_dashboards_address_in_the_unity_servers_environment(self):
+        editor = self.unity_editor("claude")
+        config_path = Path(editor.argv[editor.argv.index("--mcp-config") + 1])
+        server = json.loads(config_path.read_text())["mcpServers"]["unity"]
+        self.assertEqual(server["env"]["GAZEVOICE_URL"], "http://127.0.0.1:8977")
+        self.assertIn("PYTHONPATH", server["env"])
+
+    def test_codex_gets_the_dashboards_address_too(self):
+        editor = self.unity_editor("codex")
+        self.assertEqual(editor.mcp_cmd["env"]["GAZEVOICE_URL"], "http://127.0.0.1:8977")
+        args = codex_mcp_args(editor.mcp_cmd, editor.mcp_server)
+        env_line = next(arg for arg in args if arg.startswith("mcp_servers.unity.env="))
+        self.assertIn('GAZEVOICE_URL = "http://127.0.0.1:8977"', env_line)
+
+    def test_an_api_provider_gets_the_dashboards_address_too(self):
+        keys = MagicMock()
+        keys.get.return_value = "sk-test"
+        settings = {"editor_api_model": "deepseek-v4-pro", "providers": [preset("deepseek").to_dict()],
+                    "editor_source": "deepseek"}
+        with patch("gazevoice.voice.wiring.host_mcp") as host_mcp:
+            self.unity_editor("deepseek", settings=settings, keys=keys)
+        self.assertEqual(host_mcp.call_args.args[0]["env"]["GAZEVOICE_URL"], "http://127.0.0.1:8977")
+
+    def test_without_an_address_the_unity_server_gets_none(self):
+        editor = self.unity_editor("claude", control_url=None)
+        config_path = Path(editor.argv[editor.argv.index("--mcp-config") + 1])
+        server = json.loads(config_path.read_text())["mcpServers"]["unity"]
+        self.assertNotIn("GAZEVOICE_URL", server["env"])
+
+    def test_your_own_unity_server_is_not_given_the_address(self):
+        editor = self.unity_editor("claude", settings={"unity_mcp_command": "/opt/unity-mcp", "unity_mcp_args": ["--stdio"]})
+        config_path = Path(editor.argv[editor.argv.index("--mcp-config") + 1])
+        server = json.loads(config_path.read_text())["mcpServers"]["unity"]
+        self.assertEqual(server, {"command": "/opt/unity-mcp", "args": ["--stdio"]})
+
+    def test_blender_ignores_the_address(self):
+        voice = build_voice(self.t.ctx, EventBus(), {"refiner": "claude", "editor": "claude"},
+                            control_url="http://127.0.0.1:8977")
+        editor = voice.factories.editor()
+        config_path = Path(editor.argv[editor.argv.index("--mcp-config") + 1])
+        self.assertNotIn("GAZEVOICE_URL", config_path.read_text())
+
+    def training_that(self, state, run_id="run1"):
+        training = MagicMock()
+        training.status.return_value = {"state": state, "run_id": run_id if state != "idle" else None}
+        self.t.ctx.training = training
+        return training
+
+    def test_unity_commands_say_when_a_training_run_has_unity_in_play_mode(self):
+        self.t.ctx.settings = update_settings(self.t.ctx.settings, {"voice_host": "unity"})
+        voice = build_voice(self.t.ctx, EventBus(), {"refiner": "claude", "editor": "claude"})
+        for state in ("training", "stopping"):
+            with self.subTest(state):
+                self.training_that(state, run_id="Mover-1")
+                self.assertEqual(voice.factories.editor_notice(),
+                                 "Training: Mover-1 is running, so Unity is in Play mode for it.")
+
+    def test_a_run_that_is_still_waiting_for_play_does_not_say_unity_is_in_play_mode(self):
+        """Unity is still in Edit mode then, so scene edits survive, and the line must not make the editor refuse them."""
+        self.t.ctx.settings = update_settings(self.t.ctx.settings, {"voice_host": "unity"})
+        voice = build_voice(self.t.ctx, EventBus(), {"refiner": "claude", "editor": "claude"})
+        self.training_that("waiting", run_id="Mover-1")
+        notice = voice.factories.editor_notice()
+        self.assertEqual(notice, "Training: Mover-1 is waiting for Unity to press Play.")
+        self.assertNotIn("Play mode", notice)
+
+    def test_unity_commands_say_nothing_when_no_run_is_going(self):
+        self.t.ctx.settings = update_settings(self.t.ctx.settings, {"voice_host": "unity"})
+        voice = build_voice(self.t.ctx, EventBus(), {"refiner": "claude", "editor": "claude"})
+        for state in ("idle", "stopped", "finished", "failed"):
+            with self.subTest(state):
+                self.training_that(state)
+                self.assertIsNone(voice.factories.editor_notice())
+
+    def test_the_line_follows_the_run_as_it_starts_and_ends(self):
+        self.t.ctx.settings = update_settings(self.t.ctx.settings, {"voice_host": "unity"})
+        voice = build_voice(self.t.ctx, EventBus(), {"refiner": "claude", "editor": "claude"})
+        training = self.training_that("idle")
+        self.assertIsNone(voice.factories.editor_notice())
+        training.status.return_value = {"state": "training", "run_id": "run2"}
+        self.assertIn("run2", voice.factories.editor_notice())
+        training.status.return_value = {"state": "finished", "run_id": "run2"}
+        self.assertIsNone(voice.factories.editor_notice())
+
+    def test_blender_commands_never_get_the_line(self):
+        self.training_that("training")
+        voice = build_voice(self.t.ctx, EventBus(), {"refiner": "claude", "editor": "claude"})
+        self.assertIsNone(voice.factories.editor_notice)
+
+    def test_a_training_service_that_cannot_answer_costs_the_command_nothing(self):
+        self.t.ctx.settings = update_settings(self.t.ctx.settings, {"voice_host": "unity"})
+        self.t.ctx.training = None
+        voice = build_voice(self.t.ctx, EventBus(), {"refiner": "claude", "editor": "claude"})
+        self.assertIsNone(voice.factories.editor_notice())
 
     def test_a_provider_without_a_key_fails_with_a_plain_message(self):
         self.t.ctx.settings = update_settings(self.t.ctx.settings, {

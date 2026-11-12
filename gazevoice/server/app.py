@@ -13,6 +13,7 @@ import re
 import sys
 import threading
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,6 +27,7 @@ from ..components.brains import resolve_sources, sources_pending
 from ..components.gaze import camera_gaze_installed
 from ..events import EventBus
 from ..jobs import Job, JobAlreadyRunning, JobError, JobManager
+from ..mlagents import TrainingError, recent_runs
 from ..probes import ProbeTimedOut
 from ..providers import (
     ChatClient,
@@ -64,6 +66,7 @@ _PROVIDER_PATH = re.compile(r"/api/providers/([a-z0-9_]+)(/remove|/models)?")
 # A command's id (date, time, number) and which of its pointing words the picture was for: plain digits, no leading zero.
 _PICTURE_PATH = re.compile(r"/api/voice/pictures/([0-9]{8}-[0-9]{6}-[0-9]{1,9})/(0|[1-9][0-9]{0,2})")
 MODEL_LIST_SECONDS = 600
+STOP_WAIT_SECONDS = 40.0  # how long Stop training waits for the model to be saved before it answers anyway
 _MAX_BODY = 64 * 1024
 _CSP = "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'"
 
@@ -93,11 +96,18 @@ class ControlCenter:
         self._last: dict[str, ComponentState] = {}
         self._start_lock = threading.Lock()
         self.keys = keys or KeyStore(ctx.runner)
-        self._voice_factory = voice_factory or (lambda sources: build_voice(self.ctx, self.bus, sources, self.keys))
+        self.url: str | None = None  # where this server is listening; make_server sets it
+        self._voice_factory = voice_factory or (
+            lambda sources: build_voice(self.ctx, self.bus, sources, self.keys, control_url=self.url))
         self._models: dict[str, tuple[float, list[str]]] = {}  # provider id → (when, model ids)
         self._provider_lock = threading.Lock()
         self.voice = None
         self._voice_config: tuple | None = None
+        self._training_lock = threading.Lock()
+        self._training_checking = False  # an ML-Agents re-check is queued or running
+        self._training_again = False  # and training changed again meanwhile
+        if "mlagents" in self.components and ctx.training is not None:
+            ctx.training.subscribe(self._training_changed)
 
     def _safe_check(self, component: Component) -> ComponentState:
         try:
@@ -132,6 +142,44 @@ class ControlCenter:
         state = future.result()  # _safe_check never raises
         self._last = {**self._last, cid: state}
         self.bus.publish("component.updated", state.to_dict())
+
+    def _training_changed(self) -> None:
+        """Training changed state (called from its threads): show the ML-Agents unit as it is now.
+
+        The check runs on the pool, not here: it may probe, and the thread that reads training's output must not wait.
+        Changes that arrive during a check are folded into one more check, so the newest state is published last.
+        """
+        with self._training_lock:
+            if self._training_checking:
+                self._training_again = True
+                return
+            self._training_checking = True
+        try:
+            self._pool.submit(self._recheck_training)
+        except RuntimeError:  # the control center has closed
+            with self._training_lock:
+                self._training_checking = False
+
+    def _recheck_training(self) -> None:
+        component = self.components["mlagents"]  # only subscribed to when there is one
+        try:
+            while True:
+                state = self._safe_check(component)
+                self._last = {**self._last, "mlagents": state}
+                self.bus.publish("component.updated", state.to_dict())
+                with self._training_lock:
+                    if not self._training_again:
+                        self._training_checking = False
+                        return
+                    self._training_again = False
+        except BaseException:
+            # Whatever went wrong, the next change must be able to start a check again. (Not a `finally`: after a normal
+            # return another check may already have been started, and its flags must stay as they are.)
+            traceback.print_exc(file=sys.stderr)
+            with self._training_lock:
+                self._training_checking = False
+                self._training_again = False
+            raise
 
     def sources(self, states: dict[str, ComponentState]) -> dict[str, str | None]:
         """Each step's brain: Claude Code, Codex or a provider id (None when none is ready)."""
@@ -235,10 +283,16 @@ class ControlCenter:
         return None if voice is None else voice.picture(command_id, number)
 
     def shutdown(self) -> None:
-        """Stop everything this process started (ffmpeg, the speech worker, brain sessions)."""
-        if self.voice is not None:
-            self.voice.stop()
-        self._pool.shutdown(wait=False, cancel_futures=True)
+        """Stop everything this process started (ffmpeg, the speech worker, brain sessions, a training run)."""
+        try:
+            if self.voice is not None:
+                self.voice.stop()
+        finally:
+            try:
+                if self.ctx.training is not None:
+                    self.ctx.training.shutdown()  # saves the model first; leaves no helper holding the Unity port
+            finally:
+                self._pool.shutdown(wait=False, cancel_futures=True)
 
     def run_action(self, component_id: str, action: str, params: dict | None = None) -> Job:
         component = self.components.get(component_id)
@@ -282,6 +336,66 @@ class ControlCenter:
             page.alive(job)
         else:
             page.shown(job, body.get("number"))
+
+    # --- ML-Agents: what the Unity AI's training tools ask for -------------------------------
+    # A refusal is a TrainingError whose message is a plain sentence. Nothing here installs anything: only the
+    # ML-Agents unit's Install button does.
+    def _mlagents_installed(self) -> bool:
+        unit = self.components.get("mlagents")
+        if unit is None:
+            return False
+        try:
+            return unit.installed()
+        except ProbeTimedOut:
+            raise TrainingError("Still checking whether ML-Agents is installed. Try again in a moment.") from None
+
+    def _unity_project(self) -> Path:
+        project = self.ctx.settings.unity_project
+        if not project:
+            raise TrainingError("Pick your Unity project in the dashboard first.")
+        return Path(project)
+
+    def mlagents_status(self) -> dict:
+        installed = self._mlagents_installed()
+        status = self.ctx.training.status()
+        # The run's own project once there is a run; until then, the one picked in the dashboard.
+        project = status["project"] or self.ctx.settings.unity_project or None
+        # The earlier runs with a model: after a restart there is no current run, and "use the trained model" needs an id.
+        return {"ok": True, "installed": installed, **status, "project": project, "runs": recent_runs(project)}
+
+    def mlagents_train(self, run_id: str, config_yaml: str | None = None, resume: bool = False,
+                       overwrite: bool = False) -> dict:
+        if not self._mlagents_installed():
+            raise TrainingError("ML-Agents' Python side isn't installed. Press Install on the ML-Agents unit in the dashboard.")
+        project = self._unity_project()
+        return self.ctx.training.start(self.components["mlagents"].mlagents_learn, project, run_id,
+                                       config_yaml, resume, overwrite)
+
+    def mlagents_stop(self) -> dict:
+        """Stop the run. The model is saved first, which can outlast a tool's time limit, so this waits up to
+        STOP_WAIT_SECONDS; after that it answers with the status ("stopping") and the stop carries on by itself."""
+        training = self.ctx.training
+        outcome: list = []
+        finished = threading.Event()
+
+        def work() -> None:
+            try:
+                outcome.append(training.stop())
+            except BaseException as exc:  # noqa: BLE001 - handed to the request that is waiting for it
+                outcome.append(exc)
+            finally:
+                finished.set()
+
+        threading.Thread(target=work, daemon=True, name="mlagents-stop").start()
+        finished.wait(STOP_WAIT_SECONDS)
+        if not finished.is_set():  # asked after the wait, not taken from its answer: the stop may end just as it runs out
+            return training.status()
+        if isinstance(outcome[0], BaseException):
+            raise outcome[0]
+        return outcome[0]
+
+    def mlagents_import(self, run_id: str, behavior: str | None = None) -> dict:
+        return self.ctx.training.import_model(self._unity_project(), run_id, behavior)
 
     def settings_dict(self) -> dict:
         return self.ctx.settings.to_dict()
@@ -530,6 +644,11 @@ class _Handler(BaseHTTPRequestHandler):
             return self._picture(picture.group(1), int(picture.group(2)))
         if path == "/api/voice":
             return self._json(200, self.center.voice_snapshot())
+        if path == "/api/mlagents":
+            try:
+                return self._json(200, self.center.mlagents_status())
+            except TrainingError as exc:
+                return self._error(409, str(exc))
         return self._error(404, "Not found")
 
     def _picture(self, command_id: str, number: int) -> None:
@@ -579,6 +698,29 @@ class _Handler(BaseHTTPRequestHandler):
             return self._error(409, "Already running", job_id=exc.job_id)
         return self._error(404, "Not found")
 
+    def _mlagents_post(self, path: str, body: dict) -> None:
+        center = self.center
+        run_id, config_yaml, behavior = body.get("run_id"), body.get("config_yaml"), body.get("behavior")
+        resume, overwrite = body.get("resume", False), body.get("overwrite", False)
+        try:
+            if path == "/api/mlagents/stop":
+                return self._json(200, center.mlagents_stop())
+            if path in ("/api/mlagents/train", "/api/mlagents/import"):
+                if not isinstance(run_id, str) or not run_id:
+                    return self._error(400, "Send {\"run_id\": \"…\"}")
+                if path == "/api/mlagents/import":
+                    if behavior is not None and not isinstance(behavior, str):
+                        return self._error(400, "behavior must be text")
+                    return self._json(200, center.mlagents_import(run_id, behavior))
+                if config_yaml is not None and not isinstance(config_yaml, str):
+                    return self._error(400, "config_yaml must be text")
+                if not isinstance(resume, bool) or not isinstance(overwrite, bool):
+                    return self._error(400, "resume and overwrite must be true or false")
+                return self._json(200, center.mlagents_train(run_id, config_yaml, resume, overwrite))
+        except TrainingError as exc:
+            return self._error(409, str(exc))
+        return self._error(404, "Not found")
+
     def do_POST(self) -> None:  # noqa: N802
         if not self._host_ok() or not self._write_ok():
             self.close_connection = True
@@ -592,6 +734,11 @@ class _Handler(BaseHTTPRequestHandler):
             if body is None:
                 return self._error(400, "Send a JSON object")
             return self._voice_post(path, body)
+        if path.startswith("/api/mlagents/"):
+            body = self._parse_json(raw)
+            if body is None:
+                return self._error(400, "Send a JSON object")
+            return self._mlagents_post(path, body)
         provider = _PROVIDER_PATH.fullmatch(path)
         if provider and provider.group(2) != "/models":
             body = self._parse_json(raw) if raw.strip() else {}
@@ -657,4 +804,6 @@ class _Server(ThreadingHTTPServer):
 
 def make_server(center: ControlCenter, host: str = "127.0.0.1", port: int = 8977) -> ThreadingHTTPServer:
     handler = type("GazeVoiceHandler", (_Handler,), {"center": center})
-    return _Server((host, port), handler)
+    server = _Server((host, port), handler)
+    center.url = f"http://127.0.0.1:{server.server_address[1]}"  # the Unity MCP server voice starts calls back here
+    return server

@@ -9,6 +9,7 @@ from enum import Enum
 from typing import ClassVar, Iterable, Sequence
 
 from ..jobs import Job, JobError
+from ..mlagents import Training
 from ..paths import AppPaths
 from ..probes import ProbeCache
 from ..runner import CommandResult, CommandRunner
@@ -103,6 +104,11 @@ class Context:
     settings: Settings
     probes: ProbeCache = field(default_factory=ProbeCache)
     camera: CameraClaim = field(default_factory=CameraClaim)
+    training: Training | None = None  # the one ML-Agents training run; made here when not given
+
+    def __post_init__(self) -> None:
+        if self.training is None:
+            self.training = Training(self.paths.logs)
 
 
 class Component(ABC):

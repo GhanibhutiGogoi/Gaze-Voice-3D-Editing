@@ -458,6 +458,257 @@ class UnityReloadTest(VoiceTestBase):
         self.assertGreater(self.build(host="unity").busy_wait, self.build().busy_wait)
 
 
+class EditorNoticeTest(VoiceTestBase):
+    """A line the host's wiring can add to what the editing AI is told with each command."""
+
+    NOTICE = "Training: run1 is running, so Unity is in Play mode for it."
+
+    def run_with(self, notice, host="unity"):
+        self.build(host=host)
+        self.service.factories.editor_notice = notice
+        self.service.start()
+        record = self.speak()
+        self.assertEqual(record["stage"], "done", record.get("error"))
+        return self.editor.sent[0]
+
+    def test_the_line_comes_after_the_focus_in_the_message_the_editor_gets(self):
+        sent = self.run_with(lambda: self.NOTICE)
+        self.assertEqual(sent.splitlines()[-1], self.NOTICE)
+        self.assertTrue(sent.splitlines()[-2].startswith("Focus: "))
+
+    def test_it_is_asked_again_for_every_command(self):
+        lines = iter([self.NOTICE, None])
+        self.stt.texts.append("add a cube")
+        self.build(host="unity")
+        self.service.factories.editor_notice = lambda: next(lines)
+        self.service.start()
+        self.speak()
+        self.service.ptt("down", 1004.0)
+        self.service.ptt("up", 1005.0)
+        wait_for(lambda: len(self.service.recent) == 2 and self.last_record()["stage"] in ("done", "failed"))
+        self.assertIn(self.NOTICE, self.editor.sent[0])
+        self.assertNotIn("Training:", self.editor.sent[1])
+
+    def test_the_cleanup_step_is_told_the_same_line(self):
+        self.run_with(lambda: self.NOTICE)
+        self.assertEqual(json.loads(self.refiner.sent[0])["notice"], self.NOTICE)
+
+    def test_both_brains_get_the_line_as_it_was_when_the_command_began(self):
+        lines = iter([self.NOTICE, None])  # a second ask would find the run over
+        self.run_with(lambda: next(lines))
+        self.assertEqual(json.loads(self.refiner.sent[0])["notice"], self.NOTICE)
+        self.assertEqual(self.editor.sent[0].splitlines()[-1], self.NOTICE)
+
+    def test_the_cleanup_step_gets_no_notice_key_without_a_line(self):
+        for notice in (None, lambda: None):
+            with self.subTest(notice):
+                self.tearDown()
+                self.setUp()
+                self.run_with(notice)
+                self.assertNotIn("notice", json.loads(self.refiner.sent[0]))
+
+    def test_a_host_with_no_notice_gets_the_message_it_always_got(self):
+        self.assertNotIn("Training:", self.run_with(None))
+
+    def test_a_notice_with_nothing_to_say_adds_nothing(self):
+        sent = self.run_with(lambda: None)
+        self.assertEqual(sent.splitlines()[-1][:7], "Focus: ")
+
+    def test_an_empty_notice_adds_nothing(self):
+        sent = self.run_with(lambda: "")
+        self.assertEqual(sent.splitlines()[-1][:7], "Focus: ")
+
+    def test_a_broken_notice_does_not_stop_the_command(self):
+        def broken():
+            raise RuntimeError("training can't be asked")
+
+        sent = self.run_with(broken)
+        self.assertTrue(sent.startswith("Command: "))
+        self.assertNotIn("Training:", sent)
+
+
+class UndoDuringTrainingTest(VoiceTestBase):
+    """Play mode throws scene changes away, and an Undo done there can scramble the undo history once Play ends."""
+
+    IN_PLAY = "Training: run1 is running, so Unity is in Play mode for it."
+    WAITING = "Training: run1 is waiting for Unity to press Play."
+    REFUSED = "Couldn't: training is running. Stop it first."
+
+    def run_unity(self, text, notice, host="unity"):
+        self.stt.texts = [text]
+        self.build(host=host)
+        self.service.factories.editor_notice = notice
+        self.service.start()
+        return self.speak()
+
+    def test_undo_is_refused_while_unity_is_in_play_mode_for_training(self):
+        record = self.run_unity("Undo that.", lambda: self.IN_PLAY)
+        self.assertEqual((record["kind"], record["stage"]), ("undo", "failed"))
+        self.assertEqual(record["error"], self.REFUSED)
+        self.assertEqual(record["reply"], self.REFUSED)
+        self.assertEqual((self.bridge.undos, self.bridge.redos), (0, 0))
+        self.assertEqual(self.bridge.statuses[-1][0], f"✗ {self.REFUSED}")
+        self.assertEqual((self.refiner.sent, self.editor.sent), ([], []))
+
+    def test_redo_is_refused_the_same_way(self):
+        record = self.run_unity("Redo that.", lambda: self.IN_PLAY)
+        self.assertEqual((record["kind"], record["stage"], record["error"]), ("redo", "failed", self.REFUSED))
+        self.assertEqual((self.bridge.undos, self.bridge.redos), (0, 0))
+
+    def test_the_undo_button_is_refused_too(self):
+        self.build(host="unity")
+        self.service.factories.editor_notice = lambda: self.IN_PLAY
+        self.service.start()
+        self.service.undo()
+        wait_for(lambda: self.service.recent and self.last_record()["stage"] in ("done", "failed"))
+        self.assertEqual((self.last_record()["stage"], self.last_record()["error"]), ("failed", self.REFUSED))
+        self.assertEqual(self.bridge.undos, 0)
+
+    def test_an_undo_the_cleanup_step_recognised_is_refused_too(self):
+        self.refiner = FakeSession([TurnResult(json.dumps({"kind": "undo", "text": ""}), False)])
+        record = self.run_unity("uh take back whatever you did there", lambda: self.IN_PLAY)
+        self.assertEqual((record["kind"], record["stage"], record["error"]), ("undo", "failed", self.REFUSED))
+        self.assertEqual(self.bridge.undos, 0)
+
+    def test_the_notice_is_asked_for_each_time_so_undo_works_again_once_training_ends(self):
+        notices = iter([self.IN_PLAY, None])
+        self.stt.texts = ["Undo that.", "Undo that."]
+        self.build(host="unity")
+        self.service.factories.editor_notice = lambda: next(notices)
+        self.service.start()
+        self.assertEqual(self.speak()["stage"], "failed")
+        self.service.ptt("down", 1004.0)
+        self.service.ptt("up", 1005.0)
+        wait_for(lambda: len(self.service.recent) == 2 and self.last_record()["stage"] in ("done", "failed"))
+        self.assertEqual((self.last_record()["stage"], self.bridge.undos), ("done", 1))
+
+    def test_undo_works_as_usual_when_no_run_is_going(self):
+        record = self.run_unity("Undo that.", lambda: None)
+        self.assertEqual((record["kind"], record["stage"]), ("undo", "done"))
+        self.assertEqual(self.bridge.undos, 1)
+        self.assertEqual(record["reply"], "Undid the last change.")
+
+    def test_undo_works_while_a_run_is_only_waiting_for_play(self):
+        """Unity is still in Edit mode then, so the Undo history is the normal one."""
+        record = self.run_unity("Undo that.", lambda: self.WAITING)
+        self.assertEqual((record["stage"], self.bridge.undos), ("done", 1))
+
+    def test_undo_works_when_the_notice_cannot_be_had(self):
+        def broken():
+            raise RuntimeError("training can't be asked")
+
+        record = self.run_unity("Undo that.", broken)
+        self.assertEqual((record["stage"], self.bridge.undos), ("done", 1))
+
+    def test_a_host_with_no_notice_undoes_as_it_always_did(self):
+        record = self.run_unity("Undo that.", None)
+        self.assertEqual((record["stage"], self.bridge.undos), ("done", 1))
+
+
+class StopWhileTrainingTest(VoiceTestBase):
+    """"Stop it" cancels a command that is running. With none running and a training run going, it means the run."""
+
+    IN_PLAY = "Training: run1 is running, so Unity is in Play mode for it."
+    WAITING = "Training: run1 is waiting for Unity to press Play."
+
+    def fresh(self):
+        """A new service and temporary folder for the next case, without leaving the last one behind."""
+        self.tearDown()
+        self.setUp()
+
+    def unity(self, notice):
+        self.editor = FakeSession([TurnResult("Stopped training.", False, ["mlagents_stop"])])
+        self.build(host="unity")
+        self.service.factories.editor_notice = notice
+        self.service.start()
+
+    def test_with_nothing_running_it_becomes_the_command_stop_training(self):
+        for notice in (self.IN_PLAY, self.WAITING):
+            for said in ("Stop it.", "Stop that.", "Cancel it."):
+                with self.subTest(notice=notice, said=said):
+                    self.fresh()
+                    self.stt.texts = [said]
+                    self.unity(lambda: notice)
+                    record = self.speak()
+                    self.assertEqual((record["kind"], record["stage"], record["refined"]),
+                                     ("command", "done", "Stop training"))
+                    self.assertEqual(record["heard"], said)  # what was heard is kept
+                    self.assertIn("Command: Stop training", self.editor.sent[0])
+                    self.assertIn(notice, self.editor.sent[0])
+                    self.assertEqual(self.refiner.sent, [])  # said as it is, not worded again
+                    self.assertEqual(record["reply"], "Stopped training.")
+
+    def test_a_typed_stop_it_is_sent_on_the_same_way(self):
+        self.unity(lambda: self.IN_PLAY)
+        record = self.service.say("stop it")
+        wait_for(lambda: self.record(record)["stage"] in ("done", "failed"))
+        self.assertIn("Command: Stop training", self.editor.sent[0])
+
+    def test_a_command_in_progress_is_cancelled_as_always(self):
+        self.editor = FakeSession(block=threading.Event())
+        self.build(host="unity")
+        self.service.factories.editor_notice = lambda: self.IN_PLAY
+        self.service.start()
+        running = self.service.say("make it red")
+        wait_for(lambda: len(self.editor.sent) == 1)
+        stop = self.service.say("stop it")
+        wait_for(lambda: self.record(running)["stage"] == "stopped")
+        self.assertEqual((self.record(stop)["kind"], self.record(stop)["stage"], self.record(stop)["reply"]),
+                         ("stop", "done", "Stopped."))
+        self.assertTrue(self.editor.interrupted)
+        self.assertEqual(len(self.editor.sent), 1)  # no "stop training" went out
+
+    def test_commands_waiting_in_the_queue_are_cancelled_as_always(self):
+        gate = threading.Event()
+        self.editor = FakeSession(block=gate)
+        self.build(host="unity")
+        self.service.factories.editor_notice = lambda: self.IN_PLAY
+        self.service.start()
+        running = self.service.say("make it red")
+        wait_for(lambda: len(self.editor.sent) == 1)
+        queued = self.service.say("make it blue")
+        self.service.say("stop it")
+        wait_for(lambda: self.record(queued)["stage"] == "stopped")
+        gate.set()
+        wait_for(lambda: self.record(running)["stage"] in ("stopped", "done", "failed"))
+        self.assertEqual(len(self.editor.sent), 1)
+
+    def test_with_no_training_line_it_still_says_nothing_was_running(self):
+        for notice in (lambda: None, lambda: ""):
+            with self.subTest(notice):
+                self.fresh()
+                self.stt.texts = ["Stop it."]
+                self.unity(notice)
+                record = self.speak()
+                self.assertEqual((record["kind"], record["stage"], record["reply"]), ("stop", "done", "Nothing was running."))
+                self.assertEqual((self.editor.sent, self.refiner.sent), ([], []))
+
+    def test_a_notice_that_cannot_be_had_leaves_it_as_nothing_was_running(self):
+        def broken():
+            raise RuntimeError("training can't be asked")
+
+        self.stt.texts = ["Stop it."]
+        self.unity(broken)
+        self.assertEqual(self.speak()["reply"], "Nothing was running.")
+
+    def test_other_ways_of_saying_wait_are_not_taken_for_stop_training(self):
+        for said in ("Never mind.", "Wait.", "Hold on."):
+            with self.subTest(said):
+                self.fresh()
+                self.stt.texts = [said]
+                self.unity(lambda: self.IN_PLAY)
+                record = self.speak()
+                self.assertEqual((record["kind"], record["reply"]), ("stop", "Nothing was running."))
+                self.assertEqual(self.editor.sent, [])
+
+    def test_blender_is_unchanged(self):
+        self.stt.texts = ["Stop it."]
+        self.build().start()
+        record = self.speak()
+        self.assertEqual((record["kind"], record["reply"]), ("stop", "Nothing was running."))
+        self.assertEqual(self.editor.sent, [])
+
+
 class VoiceServiceTest(VoiceTestBase):
     def test_happy_path(self):
         self.build().start()

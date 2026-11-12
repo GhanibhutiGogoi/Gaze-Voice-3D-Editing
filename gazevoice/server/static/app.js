@@ -17,6 +17,7 @@ const NAMES = {
   unity_project: "Project",
   unity_mcp: "MCP server",
   unity_bridge: "Bridge",
+  mlagents: "ML-Agents",
   brain: "no brain logged in",
   workflow: "Workflow check",
 };
@@ -25,7 +26,7 @@ const GROUPS = [
   { label: "Input", hint: "Hears what you say and sees where you look", ids: ["microphone", "speech", "gaze"] },
   { label: "Brain", hint: "Cleans up what you said, then edits the scene", ids: ["claude", "codex"], providers: true },
   { label: "Blender", hint: "Where the edits land", ids: ["blender", "mcp_addon", "mcp_server", "bridge"] },
-  { label: "Unity", hint: "Where the edits land", ids: ["unity", "unity_project", "unity_mcp", "unity_bridge"] },
+  { label: "Unity", hint: "Where the edits land", ids: ["unity", "unity_project", "unity_mcp", "unity_bridge", "mlagents"] },
 ];
 
 const HEALTH = {
@@ -289,6 +290,7 @@ function resultLine(job) {
     const selected = r.selection.selected || [];
     return selected.length ? `Connected · selected: ${selected.join(", ")}` : "Connected · nothing selected";
   }
+  if (typeof r.state === "string" && typeof r.message === "string") return r.message; // a training run's status
   if (r.project) return `Project: ${r.project.split("/").pop()}`;
   if (r.launched) return "Launched";
   if (r.calibrated) return typeof r.median === "number" ? `Typically off by ${Math.round(r.median * 100)}% of the screen` : "Calibrated";
