@@ -25,11 +25,11 @@ class UnityBridge(FakeBridge):
         if cmd == "gaze_view":
             return {"ok": not self.no_view, "viewport_id": self.view,
                     "screen_area": {"left": 100, "top": 80, "width": 800, "height": 600}}
+        if cmd == "gaze_validate":
+            return {"ok": self.valid}
         if cmd in ("gaze_pick", "gaze_piece", "gaze_validate", "gaze_ground") or (cmd == "gaze_show" and req.get("marks")):
             if req.get("viewport_id") != self.view:
                 return {"ok": False, "error": "stale_viewport"}
-            if cmd == "gaze_validate":
-                return {"ok": self.valid}
             if cmd == "gaze_ground":
                 return {"ok": True, "point": [2.0, 0.0, 3.0], "plane": "y=0"}
         return super().request(req, timeout)
@@ -73,18 +73,52 @@ class UnityGazeTest(VoiceTestBase):
         self.assertEqual(record["gaze"]["misses"][0]["point"], [2.0, 0.0, 3.0])
         self.assertIn("placement point (2.00, 0.00, 3.00)", self.editor.sent[0])
         self.assertIn("placement point (2.00, 0.00, 3.00)", json.loads(self.refiner.sent[0])["gaze"])
-        self.assertEqual([r["uids"] for r in self.bridge.requests if r["cmd"] == "gaze_validate"], [[]])
+        self.assertFalse([r for r in self.bridge.requests if r["cmd"] == "gaze_validate"])
 
-    def test_empty_here_does_not_authorize_existing_object_edit(self):
+    def test_polite_plural_creation_uses_empty_space_point(self):
+        self.bridge.selected = []
+        self.bridge.pick_reply = lambda points: [None] * len(points)
+        self.stt = FakeStt(["Can you add two lamps there"], words=[{"text": "there", "start": 1.0, "end": 1.2}])
+        self.start()
+        record = self.speak()
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertIn("placement point (2.00, 0.00, 3.00)", self.editor.sent[0])
+
+    def test_named_object_move_uses_empty_space_destination(self):
+        self.bridge.selected = []
+        self.bridge.pick_reply = lambda points: [None] * len(points)
+        self.stt = FakeStt(["Move the lamp there"], words=[{"text": "there", "start": 1.0, "end": 1.2}])
+        self.refiner = FakeSession([TurnResult('{"kind":"command","text":"Move the lamp there."}', False)])
+        self.start()
+        record = self.speak()
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertIn("placement point (2.00, 0.00, 3.00)", self.editor.sent[0])
+
+    def test_typed_command_does_not_request_a_gaze_view(self):
+        self.start()
+        self.bridge.requests.clear()
+        self.service.say("Make a cube")
+        self.assertFalse([r for r in self.bridge.requests if r["cmd"] == "gaze_view"])
+
+    def test_ordinary_creation_with_it_needs_no_gaze_target(self):
+        self.bridge.selected = []
+        self.bridge.no_view = True
+        self.stt = FakeStt(["Add a red cube and call it Bob"], words=[{"text": "it", "start": 1.0, "end": 1.2}])
+        self.start()
+        record = self.speak()
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertTrue(self.editor.sent)
+
+    def test_empty_here_leaves_existing_object_decision_to_editor(self):
         self.bridge.selected = []
         self.bridge.pick_reply = lambda points: [None] * len(points)
         self.stt = FakeStt(["Make this yellow here"], words=[{"text": "here", "start": 1.0, "end": 1.2}])
         self.start()
         record = self.speak()
-        self.assertEqual(record["stage"], "failed")
-        self.assertFalse(self.editor.sent)
+        self.assertEqual(record["stage"], "done")
+        self.assertIn("placement point", self.editor.sent[0])
 
-    def test_empty_here_rejects_changed_view_before_creation(self):
+    def test_empty_here_has_no_target_to_validate(self):
         self.bridge.selected = []
         self.bridge.pick_reply = lambda points: [None] * len(points)
         self.stt = FakeStt(["Make a sofa here"], words=[{"text": "here", "start": 1.0, "end": 1.2}])
@@ -92,10 +126,10 @@ class UnityGazeTest(VoiceTestBase):
         self.start()
         self.bridge.valid = False
         record = self.speak()
-        self.assertEqual(record["stage"], "failed")
-        self.assertFalse(self.editor.sent)
+        self.assertEqual(record["stage"], "done")
+        self.assertFalse([r for r in self.bridge.requests if r["cmd"] == "gaze_validate"])
 
-    def test_empty_here_without_forward_intersection_refuses_creation(self):
+    def test_empty_here_without_forward_intersection_lets_editor_decide(self):
         self.bridge.selected = []
         self.bridge.pick_reply = lambda points: [None] * len(points)
         self.stt = FakeStt(["Make a sofa here"], words=[{"text": "here", "start": 1.0, "end": 1.2}])
@@ -108,9 +142,9 @@ class UnityGazeTest(VoiceTestBase):
         self.bridge.request = no_plane
         self.start()
         record = self.speak()
-        self.assertEqual(record["stage"], "failed")
+        self.assertEqual(record["stage"], "done")
         self.assertEqual(record["gaze"]["misses"], [{"word": "here", "at": record["gaze"]["misses"][0]["at"]}])
-        self.assertFalse(self.editor.sent)
+        self.assertTrue(self.editor.sent)
 
     def test_empty_here_near_neighbor_keeps_empty_destination(self):
         self.bridge.selected = []
@@ -129,11 +163,11 @@ class UnityGazeTest(VoiceTestBase):
         self.stt = FakeStt(["Make a sofa here"], words=[{"text": "here", "start": 1.0, "end": 1.2}])
         self.start()
         record = self.speak()
-        self.assertEqual(record["stage"], "failed")
+        self.assertEqual(record["stage"], "done")
         self.assertFalse([r for r in self.bridge.requests if r["cmd"] == "gaze_ground"])
-        self.assertFalse(self.editor.sent)
+        self.assertTrue(self.editor.sent)
 
-    def test_view_changed_during_refinement_rejects_empty_destination(self):
+    def test_view_changed_during_refinement_keeps_resolved_destination(self):
         self.bridge.selected = []
         self.bridge.pick_reply = lambda points: [None] * len(points)
         self.stt = FakeStt(["Make a sofa here"], words=[{"text": "here", "start": 1.0, "end": 1.2}])
@@ -145,9 +179,8 @@ class UnityGazeTest(VoiceTestBase):
         self.refiner.send = change_view
         self.start()
         record = self.speak()
-        self.assertEqual(record["stage"], "failed")
-        self.assertIn("changed", record["error"])
-        self.assertFalse(self.editor.sent)
+        self.assertEqual(record["stage"], "done", record["error"])
+        self.assertIn("placement point", self.editor.sent[0])
 
     def test_watch_only_records_target_and_leaves_selection_in_the_command(self):
         self.start("shadow")
@@ -164,12 +197,12 @@ class UnityGazeTest(VoiceTestBase):
         self.assertNotIn("gaze", record["focus"])
         self.assertIn("selected Chair", self.editor.sent[0])
 
-    def test_deleted_object_or_changed_view_after_refining_prevents_the_edit(self):
+    def test_deleted_object_after_refining_prevents_the_edit(self):
         self.start()
         self.bridge.valid = False
         record = self.speak()
         self.assertEqual(record["stage"], "failed")
-        self.assertIn("changed", record["error"])
+        self.assertIn("gone", record["error"])
         self.assertFalse(self.editor.sent)
         self.assertFalse(self.bridge.pushed)
 
@@ -202,13 +235,13 @@ class UnityGazeTest(VoiceTestBase):
         self.assertEqual((polls[-1]["gaze_mode"], polls[-1]["gaze_source"], polls[-1]["gaze_live"]),
                          ("shadow", "mouse", True))
 
-    def test_missing_pointer_and_no_selection_never_executes_an_ungrounded_edit(self):
+    def test_missing_pointer_and_no_selection_reaches_editor(self):
         self.bridge.selected = []
         self.start()
         self.bridge.no_view = True
         record = self.speak()
-        self.assertEqual(record["stage"], "failed")
-        self.assertFalse(self.editor.sent)
+        self.assertEqual(record["stage"], "done")
+        self.assertTrue(self.editor.sent)
 
     def test_number_key_choice_is_scoped_to_current_view(self):
         from gazevoice.voice.service import _Choice
@@ -232,10 +265,10 @@ class UnityGazeTest(VoiceTestBase):
         self.assertEqual(record["stage"], "done", record["error"])
         self.assertTrue(self.editor.sent)
 
-    def test_unavailable_camera_view_without_selection_refuses_pointing_edit(self):
+    def test_unavailable_camera_view_without_selection_reaches_editor(self):
         self.bridge.selected = []
         self.start()
         self.service._placed = lambda *_: None
         record = self.speak()
-        self.assertEqual(record["stage"], "failed")
-        self.assertFalse(self.editor.sent)
+        self.assertEqual(record["stage"], "done")
+        self.assertTrue(self.editor.sent)

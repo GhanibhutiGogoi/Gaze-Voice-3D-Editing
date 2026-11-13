@@ -88,9 +88,11 @@ LOCAL_TOOLS = [
                     "presses Install on the dashboard's ML-Agents unit. Use a new run_id each time (an old run's "
                     "folder is kept). This waits up to 45 seconds for ML-Agents to start listening for Unity. Training "
                     "waits for Unity to enter Play mode and gives up after 2 minutes, but it only hears a Play that "
-                    "starts after it is listening. So when the reply says listening is true, press Play with "
-                    "execute_csharp: EditorApplication.isPlaying = true; if it is false, call mlagents_status until "
-                    "it is true first. Unity must be out of Play mode before this is called.",
+                    "starts after it is listening. So when the reply says listening is true, tell the user to press Play in "
+                    "Unity; press Play yourself with execute_csharp (EditorApplication.isPlaying = true;) only if the "
+                    "command asked you to. If listening is false, tell them ML-Agents is still starting; if you were "
+                    "asked to press Play, call mlagents_status until it is true first. Unity must be out of Play "
+                    "mode before this is called.",
      "inputSchema": {**OBJECT, "properties": {
          "run_id": {"type": "string", "description": "Letters, digits, . _ - only; up to 64; starts with a letter or digit. "
                                                      "Such as Mover-20261111-1530"},

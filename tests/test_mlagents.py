@@ -14,6 +14,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from gazevoice import mlagents
@@ -229,7 +230,7 @@ class TrainingCase(unittest.TestCase):
 
 
 class StatusShapeTest(TrainingCase):
-    KEYS = {"state", "run_id", "project", "behaviors", "message", "log", "log_tail", "models", "exit_code",
+    KEYS = {"state", "run_id", "serial", "project", "behaviors", "message", "log", "log_tail", "models", "exit_code",
             "listening"}
 
     def test_idle_before_any_run(self):
@@ -237,6 +238,7 @@ class StatusShapeTest(TrainingCase):
         self.assertEqual(set(status), self.KEYS)
         self.assertEqual(status["state"], "idle")
         self.assertIsNone(status["run_id"])
+        self.assertIsNone(status["serial"])
         self.assertEqual((status["behaviors"], status["log_tail"], status["models"]), ({}, [], []))
         self.assertIsNone(status["exit_code"])
         self.assertIs(status["listening"], False)
@@ -873,6 +875,285 @@ class SubscribeTest(TrainingCase):
             self.training.stop(timeout=10)
         status = self.wait_state("stopped", timeout=5)  # the SIGINT went out before the listeners were told
         self.assertEqual(status["models"], ["Mover"])
+
+
+class OutputTest(TrainingCase):
+    """What mlagents-learn printed, kept line by line for the dashboard's terminal panel."""
+
+    def written(self) -> list[str]:
+        """The lines of the run's log file: every line the reader saw, as it saw it."""
+        return (self.logs / "mlagents-run1.log").read_text(encoding="utf-8").split("\n")[:-1]
+
+    def test_the_cap_is_1000_lines(self):
+        self.assertEqual(mlagents.TERMINAL_LINES, 1000)
+
+    def test_with_no_run_there_is_nothing(self):
+        self.assertEqual(self.training.output(), {"run_id": None, "serial": None, "first": 0, "lines": []})
+        self.assertEqual(self.training.output(after=5), {"run_id": None, "serial": None, "first": 0, "lines": []})
+
+    def test_every_line_is_kept_exactly_as_read_with_its_number_starting_at_1(self):
+        self.begin("finish")
+        self.wait_state("finished")
+        out = self.training.output()
+        self.assertEqual(set(out), {"run_id", "serial", "first", "lines"})
+        self.assertEqual(out["run_id"], "run1")
+        self.assertEqual(out["first"], 1)
+        self.assertEqual([line["n"] for line in out["lines"]], list(range(1, len(out["lines"]) + 1)))
+        self.assertEqual([line["text"] for line in out["lines"]], self.written())  # banner, blanks and spaces too
+        texts = [line["text"] for line in out["lines"]]
+        self.assertEqual(texts[0], "")  # the banner begins with an empty line, and it is kept
+        self.assertIn(" ╬╬╬╜       ╬╬╣╣      ╙╝╣╣╬      ╙╣╣╣╗╖╓╗╣╣╣╜ ╟╣╣╬   ╣╣╣  ╣╣╣  ╟╣╣╦╓    ╣╣╣╣╣", texts)
+        self.assertIn("        ", texts)  # a line of spaces is not trimmed
+        self.assertIn("[INFO] Listening on port 5004. Start training by pressing the Play button in the Unity Editor.", texts)
+        self.assertTrue(any(". Step: 50000. " in text for text in texts))
+        self.assertEqual(set(out["lines"][0]), {"n", "text"})
+
+    def test_after_gives_only_the_lines_after_that_number(self):
+        self.begin("finish")
+        self.wait_state("finished")
+        everything = self.training.output()["lines"]
+        total = len(everything)
+        self.assertGreater(total, 12)
+        later = self.training.output(after=10)
+        self.assertEqual(later["lines"], everything[10:])
+        self.assertEqual(later["lines"][0]["n"], 11)
+        self.assertEqual(later["first"], 1)  # first is about what is kept, not about what was asked for
+        self.assertEqual(later["run_id"], "run1")
+        self.assertEqual(self.training.output(after=total - 1)["lines"], everything[-1:])
+        self.assertEqual(self.training.output(after=total)["lines"], [])
+        self.assertEqual(self.training.output(after=total + 50)["lines"], [])
+        self.assertEqual(self.training.output(after=0)["lines"], everything)
+        self.assertEqual(self.training.output(after=-3)["lines"], everything)
+        self.assertEqual(inspect.signature(Training.output).parameters["after"].default, 0)
+
+    def test_the_banner_is_there_while_it_is_still_starting_up(self):
+        self.begin("wait_interrupt", env={"FAKE_ML_LISTEN_DELAY": "3"}, listen_seconds=0.1)
+        out = wait_for(self, lambda: (o := self.training.output())["lines"] and o, what="the banner")
+        self.assertEqual(out["run_id"], "run1")
+        self.assertFalse(any("Listening on port" in line["text"] for line in out["lines"]))
+
+    def test_only_the_last_lines_are_kept_and_first_says_where_they_begin(self):
+        with mock.patch.object(mlagents, "TERMINAL_LINES", 10):
+            self.begin("finish")
+            self.wait_state("finished")
+            out = self.training.output()
+        total = len(self.written())
+        self.assertGreater(total, 10)
+        self.assertEqual([line["n"] for line in out["lines"]], list(range(total - 9, total + 1)))
+        self.assertEqual(out["first"], total - 9)
+        self.assertEqual([line["text"] for line in out["lines"]], self.written()[-10:])
+        after = self.training.output(after=total - 3)
+        self.assertEqual([line["n"] for line in after["lines"]], [total - 2, total - 1, total])
+        self.assertEqual(after["first"], total - 9)
+        self.assertEqual(self.training.output(after=2)["lines"], out["lines"])  # lines already dropped stay dropped
+
+    def test_a_thousand_and_a_half_lines_leave_the_last_thousand(self):
+        text = "".join(f"[INFO] line {n}\n" for n in range(1, 1501))
+        run = mlagents._Run("big", self.project, self.logs / "big.log", SimpleNamespace(stdout=io.StringIO(text)))
+        self.training._run = run
+        self.training._pump(run, None)
+        run.state = "finished"  # there is no process behind this run, so nothing is left to stop
+        out = self.training.output()
+        self.assertEqual(len(out["lines"]), 1000)
+        self.assertEqual((out["first"], out["lines"][0]), (501, {"n": 501, "text": "[INFO] line 501"}))
+        self.assertEqual(out["lines"][-1], {"n": 1500, "text": "[INFO] line 1500"})
+        self.assertEqual(self.training.output(after=1498)["lines"], [{"n": 1499, "text": "[INFO] line 1499"},
+                                                                       {"n": 1500, "text": "[INFO] line 1500"}])
+
+    def test_a_new_run_starts_counting_again_and_forgets_the_old_lines(self):
+        self.begin("finish")
+        self.wait_state("finished")
+        first = self.training.output()
+        self.begin("finish", run_id="run2")
+        self.wait_state("finished")
+        second = self.training.output()
+        self.assertEqual(second["run_id"], "run2")
+        self.assertEqual((second["first"], second["lines"][0]["n"]), (1, 1))
+        self.assertEqual([line["n"] for line in second["lines"]], [line["n"] for line in first["lines"]])  # from 1 again
+        self.assertEqual(second["lines"][:14], first["lines"][:14])  # the same banner, and none of run1's lines after it
+        self.assertFalse(any("run1" in line["text"] for line in second["lines"]))
+
+    def test_a_new_run_with_the_same_name_starts_counting_again_too(self):
+        self.begin("finish")
+        self.wait_state("finished")
+        before = len(self.training.output()["lines"])
+        self.begin("finish", overwrite=True)
+        self.wait_state("finished")
+        again = self.training.output()
+        self.assertEqual((again["run_id"], again["first"], len(again["lines"])), ("run1", 1, before))
+
+    def test_the_lines_of_a_run_that_failed_are_there_to_read(self):
+        with self.assertRaises(TrainingError):
+            self.begin("previous_run")
+        self.wait_state("failed")
+        texts = [line["text"] for line in self.training.output()["lines"]]
+        self.assertTrue(any(text.startswith("Traceback (most recent call last)") for text in texts))
+        self.assertTrue(any("UnityTrainerException: Previous data from this run ID was found" in text for text in texts))
+
+    def test_the_log_tail_is_not_changed_by_keeping_the_lines(self):
+        self.begin("finish")
+        status = self.wait_state("finished")
+        self.assertEqual(len(status["log_tail"]), 15)
+        self.assertNotIn("", [line.strip() for line in status["log_tail"]])
+        self.assertEqual(set(status), StatusShapeTest.KEYS)
+
+
+class SerialTest(TrainingCase):
+    """Every run has its own serial, so a run that reuses a name (resume, overwrite) can still be told from the one before."""
+
+    def test_a_run_gets_a_serial_from_the_clock_in_microseconds_when_it_starts(self):
+        before = time.time_ns() // 1000
+        status = self.begin("finish")
+        after = time.time_ns() // 1000
+        self.assertIsInstance(status["serial"], int)
+        self.assertTrue(before <= status["serial"] <= after)
+
+    def test_the_serial_is_exact_in_javascript(self):
+        """The page parses it as a double, which holds whole numbers exactly only below 2**53 (raw nanoseconds don't fit)."""
+        status = self.begin("finish")
+        self.assertLess(status["serial"], 2 ** 53)
+        self.assertEqual(float(status["serial"]), status["serial"])
+        self.assertGreater(status["serial"], 10 ** 15)  # still the clock, not a small counter
+
+    def test_two_runs_started_back_to_back_get_different_serials_even_in_the_same_microsecond(self):
+        with mock.patch.object(mlagents.time, "time_ns", return_value=1_778_000_000_000_000_000):  # the clock stands still
+            first = self.begin("finish")
+            self.wait_state("finished")
+            second = self.begin("finish", run_id="run2")
+            self.wait_state("finished")
+            third = self.begin("finish", run_id="run3")
+        self.assertEqual(first["serial"], 1_778_000_000_000_000)
+        self.assertEqual(second["serial"], first["serial"] + 1)
+        self.assertEqual(third["serial"], second["serial"] + 1)
+        self.wait_state("finished")
+
+    def test_the_serial_stays_the_same_for_the_whole_run(self):
+        status = self.begin("wait_interrupt")
+        serial = status["serial"]
+        self.wait_ready()
+        self.assertEqual(self.training.status()["serial"], serial)
+        self.assertEqual(self.training.stop(timeout=10)["serial"], serial)  # stopping is not a new run
+        self.assertEqual(self.training.output()["serial"], serial)
+
+    def test_the_output_names_the_same_serial_as_the_status(self):
+        self.begin("finish")
+        status = self.wait_state("finished")
+        out = self.training.output()
+        self.assertEqual((out["run_id"], out["serial"]), ("run1", status["serial"]))
+        self.assertEqual(self.training.output(after=3)["serial"], status["serial"])
+
+    def test_a_run_started_again_under_the_same_name_by_overwrite_has_a_new_serial(self):
+        first = self.begin("finish")
+        self.wait_state("finished")
+        second = self.begin("finish", overwrite=True)
+        self.wait_state("finished")
+        self.assertEqual(first["run_id"], second["run_id"])
+        self.assertNotEqual(first["serial"], second["serial"])
+        self.assertGreater(second["serial"], first["serial"])
+        self.assertEqual(self.training.output()["serial"], second["serial"])
+
+    def test_a_run_started_again_under_the_same_name_by_resume_has_a_new_serial(self):
+        first = self.begin("finish")
+        self.wait_state("finished")
+        second = self.begin("finish", resume=True)
+        self.wait_state("finished")
+        self.assertEqual(first["run_id"], second["run_id"])
+        self.assertNotEqual(first["serial"], second["serial"])
+
+    def test_a_run_with_another_name_has_another_serial_too(self):
+        first = self.begin("finish")
+        self.wait_state("finished")
+        second = self.begin("finish", run_id="run2")
+        self.wait_state("finished")
+        self.assertNotEqual(first["serial"], second["serial"])
+
+    def test_a_run_that_fails_to_start_leaves_the_serial_of_the_one_before(self):
+        first = self.begin("finish")
+        self.wait_state("finished")
+        with self.assertRaises(TrainingError):
+            self.begin("finish")  # the name is taken, so it is refused before anything starts
+        self.assertEqual(self.training.status()["serial"], first["serial"])
+
+    def test_the_serial_is_not_a_counter_that_a_restart_would_repeat(self):
+        """Two services (two dashboard runs) never start counting at the same number."""
+        run = mlagents._Run("a", self.project, self.logs / "a.log", SimpleNamespace(stdout=io.StringIO("")))
+        self.assertGreater(run.serial, 10 ** 15)  # microseconds since 1970
+        self.assertTrue(abs(run.serial - time.time_ns() // 1000) < 10 ** 7)
+
+
+class SubscribeOutputTest(TrainingCase):
+    def test_every_line_arrives_with_the_run_id_and_its_number_in_order(self):
+        seen = []
+        self.training.subscribe_output(lambda run_id, serial, n, text: seen.append((run_id, serial, n, text)))
+        self.begin("finish")
+        status = self.wait_state("finished")
+        kept = self.training.output()["lines"]
+        wait_for(self, lambda: len(seen) >= len(kept), what="every line to be passed on")
+        self.assertEqual(seen, [("run1", status["serial"], line["n"], line["text"]) for line in kept])
+        self.assertEqual([n for _, _, n, _ in seen], list(range(1, len(seen) + 1)))
+
+    def test_a_second_run_is_passed_on_under_its_own_id_from_1(self):
+        seen = []
+        self.training.subscribe_output(lambda run_id, serial, n, text: seen.append((run_id, serial, n)))
+        self.begin("finish")
+        first = self.wait_state("finished")
+        self.begin("finish", run_id="run2")
+        second = self.wait_state("finished")
+        total = len(self.training.output()["lines"])
+        wait_for(self, lambda: len([1 for run_id, _, _ in seen if run_id == "run2"]) >= total, what="the second run's lines")
+        self.assertEqual({run_id for run_id, _, _ in seen}, {"run1", "run2"})
+        self.assertEqual([n for run_id, _, n in seen if run_id == "run2"], list(range(1, total + 1)))
+        self.assertEqual({serial for run_id, serial, _ in seen if run_id == "run1"}, {first["serial"]})
+        self.assertEqual({serial for run_id, serial, _ in seen if run_id == "run2"}, {second["serial"]})
+
+    def test_the_callback_runs_outside_the_lock_so_it_can_ask_for_the_status_and_the_lines(self):
+        answers = []
+
+        def on_line(run_id, serial, n, text):
+            status = self.training.status()  # would deadlock if the lock were held
+            kept = self.training.output(after=n - 1)
+            answers.append((status["run_id"], [line["n"] for line in kept["lines"]][:1]))
+
+        self.training.subscribe_output(on_line)
+        self.begin("finish")
+        self.wait_state("finished")
+        total = len(self.training.output()["lines"])
+        wait_for(self, lambda: len(answers) >= total, what="every callback to finish")
+        self.assertEqual(answers[0], ("run1", [1]))
+
+    def test_a_callback_that_raises_is_reported_and_does_not_stop_the_reader_or_the_others(self):
+        later, reported = [], io.StringIO()
+        self.training.subscribe_output(lambda run_id, serial, n, text: 1 / 0)
+        self.training.subscribe_output(lambda run_id, serial, n, text: later.append(n))
+        with contextlib.redirect_stderr(reported):
+            self.begin("finish")
+            status = self.wait_state("finished")
+            total = len(self.training.output()["lines"])
+            wait_for(self, lambda: len(later) >= total, what="the second callback to get every line")
+        self.assertEqual(later, list(range(1, total + 1)))
+        self.assertEqual(status["exit_code"], 0)
+        self.assertEqual(status["behaviors"]["Mover"]["step"], 50000)  # the reader went on applying what it read
+        self.assertIn("ZeroDivisionError", reported.getvalue())
+
+    def test_state_listeners_and_output_listeners_are_separate(self):
+        states, lines = [], []
+        self.training.subscribe(lambda: states.append(1))
+        self.training.subscribe_output(lambda run_id, serial, n, text: lines.append(n))
+        self.begin("finish")
+        self.wait_state("finished")
+        wait_for(self, lambda: len(lines) >= len(self.training.output()["lines"]), what="the lines")
+        self.assertGreaterEqual(len(states), 3)
+        self.assertGreater(len(lines), len(states))  # a callback per line, not per change
+
+    def test_a_line_is_passed_on_after_it_can_be_read_back(self):
+        readable = []
+        self.training.subscribe_output(
+            lambda run_id, serial, n, text: readable.append(
+                self.training.output(after=n - 1)["lines"][:1] == [{"n": n, "text": text}]))
+        self.begin("finish")
+        self.wait_state("finished")
+        wait_for(self, lambda: len(readable) >= len(self.training.output()["lines"]), what="the lines")
+        self.assertTrue(all(readable))
 
 
 class ModelsTest(TrainingCase):

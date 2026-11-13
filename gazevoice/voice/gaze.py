@@ -422,6 +422,7 @@ def ground(
     pick: Callable[[list[list[float]]], Sequence[dict | None] | None],
     piece: Callable[[Candidate], dict | None],
     place: Callable[[float, float], dict | None] | None = None,
+    prefer_empty_center: bool = True,
 ) -> Grounding:
     """Work out what each pointing word in `words` refers to.
 
@@ -448,7 +449,11 @@ def ground(
         if not hits:
             continue
         miss = Miss(word.text, word.start)
-        if word.text in ("here", "there") and hits[0] is None and place is not None:
+        candidates = score_hits(points, list(hits))
+        neighbor_is_clear = bool(candidates and candidates[0].score >= CONFIDENT_SCORE
+                                 and is_clear(Target(word.text, word.start, candidates, fixation)))
+        empty_destination = word.text in ("here", "there") and hits[0] is None
+        if empty_destination and (prefer_empty_center or not neighbor_is_clear) and place is not None:
             try:
                 placement = place(*points[0])
                 point = placement.get("point") if isinstance(placement, dict) else None
@@ -458,13 +463,12 @@ def ground(
                         and plane in ("z=0", "y=0")):
                     miss.point, miss.plane = list(point), plane
                     misses.append(miss)
-                    continue  # the centre is empty, even if the patch grazed a neighboring object
+                    continue
             except (OSError, ValueError):
-                pass  # fall back to the original object/miss scoring
-        if word.text in ("here", "there") and hits[0] is None:
+                pass
+        if empty_destination and (prefer_empty_center or not neighbor_is_clear):
             misses.append(miss)
-            continue  # an empty centre cannot become a neighboring object destination
-        candidates = score_hits(points, list(hits))
+            continue
         if not candidates:
             misses.append(miss)
             continue

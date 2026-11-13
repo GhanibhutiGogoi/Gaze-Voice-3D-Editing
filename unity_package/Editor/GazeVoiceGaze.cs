@@ -23,6 +23,7 @@ internal static class GazeVoiceGaze
     static string mode = "off", source = "mouse";
     static bool live;
     static Vector2? pointer, marker;
+    static Vector2? hoverAt;
     static double pointerAt, markerAt, sampledAt, lastPaint;
     static JArray marks = new JArray();
     static Texture2D bubble;
@@ -34,15 +35,15 @@ internal static class GazeVoiceGaze
     internal static void Initialize()
     {
         SceneView.duringSceneGui += OnGUI;
-        EditorApplication.hierarchyChanged += Invalidate;
-        EditorApplication.projectChanged += Invalidate;
+        EditorApplication.hierarchyChanged += () => Invalidate(false);
         EditorApplication.focusChanged += focused => { if (!focused) { pointer = null; Repaint(); } };
     }
 
-    static void Invalidate()
+    static void Invalidate(bool viewportChanged = true)
     {
-        revision++;
+        if (viewportChanged) revision++;
         pointer = marker = null;
+        hoverAt = null;
         marks.Clear();
         hoverName = "";
         Repaint();
@@ -62,8 +63,8 @@ internal static class GazeVoiceGaze
     {
         while (Jobs.Count > 0 && Jobs.Peek().Deadline < Now)
             Jobs.Dequeue().Reply(new { ok = false, error = "no_scene_view" });
-        if (!GazeVoiceBridge.VoiceIsOn && (pointer.HasValue || marker.HasValue || marks.Count > 0))
-            Invalidate();
+        if (!GazeVoiceBridge.VoiceIsOn && (live || pointer.HasValue || marker.HasValue || marks.Count > 0))
+        { live = false; Invalidate(false); }
         if (pointer.HasValue && (Now - pointerAt > 0.25 || EditorWindow.mouseOverWindow != view))
         { pointer = null; hoverName = ""; Repaint(); }
         if (marker.HasValue && Now - markerAt > 0.5) { marker = null; Repaint(); }
@@ -89,6 +90,15 @@ internal static class GazeVoiceGaze
 
     internal static void Request(JObject request, Action<object> reply)
     {
+        if (request.Value<string>("cmd") == "gaze_view")
+        {
+            if (view == null || view != SceneView.lastActiveSceneView || content.width <= 0 || content.height <= 0)
+                reply(new { ok = false, error = "no_scene_view" });
+            else reply(ViewReply());
+            return;
+        }
+        if (request.Value<string>("cmd") == "gaze_validate")
+        { reply(Validate(request)); return; }
         // Clearing an overlay does not need a live SceneView or a viewport token.
         if (request.Value<string>("cmd") == "gaze_show" && request["marks"] is JArray empty && empty.Count == 0)
         { marks.Clear(); marker = null; Repaint(); reply(new { ok = true }); return; }
@@ -150,8 +160,9 @@ internal static class GazeVoiceGaze
             GazeVoiceBridge.PushChoice((int)ev.keyCode - (int)KeyCode.Alpha1 + 1, Token);
             ev.Use();
         }
-        if (EditorApplication.isFocused && EditorWindow.mouseOverWindow == current && content.Contains(ev.mousePosition)
-            && ev.type != EventType.MouseLeaveWindow && live && mode != "off" && source == "mouse")
+        if (GazeVoiceBridge.VoiceIsOn && EditorApplication.isFocused && EditorWindow.mouseOverWindow == current
+            && content.Contains(ev.mousePosition) && ev.type != EventType.MouseLeaveWindow
+            && live && mode != "off" && source == "mouse")
         {
             pointer = UV(ev.mousePosition); pointerAt = Now;
             if (Now - sampledAt >= 0.04)
@@ -172,14 +183,32 @@ internal static class GazeVoiceGaze
                 try { job.Reply(job.Deadline < Now ? new { ok = false, error = "gaze_timeout" } : Handle(job.Request)); }
                 catch (Exception ex) { job.Reply(new { ok = false, error = ex.Message }); }
             }
-            if (pointer.HasValue)
+            if (pointer.HasValue && (!hoverAt.HasValue || hoverAt.Value != pointer.Value))
             {
                 var hit = Pick(pointer.Value);
                 hoverName = hit != null ? JObject.FromObject(hit).Value<string>("name") : "Empty space";
+                hoverAt = pointer;
             }
             geometry = null;
         }
         if (ev.type == EventType.Repaint && GazeVoiceBridge.VoiceIsOn && live && mode != "off") Draw();
+    }
+
+    static object ViewReply() => new { ok = true, viewport_id = Token,
+        width = content.width, height = content.height,
+        screen_area = new { left = desktop.x, top = desktop.y, width = desktop.width, height = desktop.height } };
+
+    static object Validate(JObject request)
+    {
+        if (!(request["uids"] is JArray ids) || ids.Count > 16)
+            return new { ok = false, error = "invalid_ids" };
+        foreach (var id in ids)
+        {
+            var go = GazeVoiceBridge.ObjectWithId(id.Value<long>()) as GameObject;
+            if (go == null || !go.scene.IsValid() || !go.activeInHierarchy)
+                return new { ok = false, error = "object_gone" };
+        }
+        return new { ok = true };
     }
 
     static object Handle(JObject request)
@@ -187,9 +216,7 @@ internal static class GazeVoiceGaze
         string cmd = request.Value<string>("cmd");
         string expected = request.Value<string>("viewport_id");
         if (expected != null && expected != Token) return new { ok = false, error = "stale_viewport" };
-        if (cmd == "gaze_view") return new { ok = true, viewport_id = Token,
-            width = content.width, height = content.height,
-            screen_area = new { left = desktop.x, top = desktop.y, width = desktop.width, height = desktop.height } };
+        if (cmd == "gaze_view") return ViewReply();
         if (cmd == "gaze_status") return new { ok = true, viewport_id = Token, mode, source, live,
             indicator = source == "mouse" ? (pointer.HasValue ? new[] { pointer.Value.x, pointer.Value.y } : null)
                 : (marker.HasValue ? new[] { marker.Value.x, marker.Value.y } : null),
@@ -219,18 +246,7 @@ internal static class GazeVoiceGaze
             var point = ray.GetPoint(distance);
             return new { ok = true, viewport_id = Token, point = new[] { point.x, point.y, point.z }, plane = "y=0" };
         }
-        if (cmd == "gaze_validate")
-        {
-            if (!(request["uids"] is JArray ids) || ids.Count > 16)
-                return new { ok = false, error = "invalid_ids" };
-            foreach (var id in ids)
-            {
-                var go = GazeVoiceBridge.ObjectWithId(id.Value<long>()) as GameObject;
-                if (go == null || !go.scene.IsValid() || !go.activeInHierarchy)
-                    return new { ok = false, error = "object_gone" };
-            }
-            return new { ok = true };
-        }
+        if (cmd == "gaze_validate") return Validate(request);
         if (cmd == "gaze_piece")
         {
             var id = request.Value<long?>("uid");
@@ -255,6 +271,9 @@ internal static class GazeVoiceGaze
         public GameObject Object;
         public Bounds Bounds;
         public Matrix4x4 Matrix;
+        public Renderer Renderer;
+        public Collider Collider;
+        public bool Loaded;
         public Vector3[] Vertices;
         public int[] Triangles;
     }
@@ -262,26 +281,16 @@ internal static class GazeVoiceGaze
     static List<Geometry> SceneGeometry()
     {
         var result = new List<Geometry>();
-        foreach (var renderer in UnityEngine.Object.FindObjectsOfType<Renderer>())
+        foreach (var renderer in UnityEngine.Object.FindObjectsByType<Renderer>(FindObjectsSortMode.None))
         {
             var go = renderer.gameObject;
             if (!go.scene.IsValid() || !renderer.enabled || !go.activeInHierarchy || renderer.forceRenderingOff
                 || (view.camera.cullingMask & (1 << go.layer)) == 0 || SceneVisibilityManager.instance.IsHidden(go)
                 || SceneVisibilityManager.instance.IsPickingDisabled(go)) continue;
-            var entry = new Geometry { Object = go, Bounds = renderer.bounds, Matrix = go.transform.localToWorldMatrix };
-            var filter = go.GetComponent<MeshFilter>();
-            Mesh mesh = filter != null ? filter.sharedMesh : null;
-            Mesh baked = null;
-            try
-            {
-                var skin = go.GetComponent<SkinnedMeshRenderer>();
-                if (skin != null) { baked = new Mesh(); skin.BakeMesh(baked); mesh = baked; }
-                if (mesh != null && mesh.isReadable) { entry.Vertices = mesh.vertices; entry.Triangles = mesh.triangles; }
-                result.Add(entry);
-            }
-            finally { if (baked != null) UnityEngine.Object.DestroyImmediate(baked); }
+            result.Add(new Geometry { Object = go, Bounds = renderer.bounds,
+                Matrix = go.transform.localToWorldMatrix, Renderer = renderer, Collider = go.GetComponent<Collider>() });
         }
-        // Terrain has no Renderer. Until terrain surface picking is supported, its bounds block rays too.
+        // Terrain has no Renderer. Its collider gives an exact surface hit for occlusion.
         foreach (var terrain in Terrain.activeTerrains)
         {
             var go = terrain.gameObject;
@@ -290,9 +299,26 @@ internal static class GazeVoiceGaze
                 || SceneVisibilityManager.instance.IsPickingDisabled(go)) continue;
             var bounds = terrain.terrainData.bounds;
             bounds.center += terrain.GetPosition();
-            result.Add(new Geometry { Object = go, Bounds = bounds });
+            result.Add(new Geometry { Object = go, Bounds = bounds, Collider = go.GetComponent<TerrainCollider>() });
         }
         return result;
+    }
+
+    static void LoadMesh(Geometry item)
+    {
+        if (item.Loaded) return;
+        item.Loaded = true;
+        Mesh baked = null;
+        try
+        {
+            var skin = item.Renderer as SkinnedMeshRenderer;
+            var filter = item.Object.GetComponent<MeshFilter>();
+            Mesh mesh = filter != null ? filter.sharedMesh : null;
+            if (skin != null) { baked = new Mesh(); skin.BakeMesh(baked, true); mesh = baked; }
+            if (mesh != null) { item.Vertices = mesh.vertices; item.Triangles = mesh.triangles; }
+        }
+        catch (UnityException) { item.Vertices = null; item.Triangles = null; }
+        finally { if (baked != null) UnityEngine.Object.DestroyImmediate(baked); }
     }
 
     static object Pick(Vector2 uv)
@@ -304,11 +330,12 @@ internal static class GazeVoiceGaze
         float nearest = float.PositiveInfinity, blocker = float.PositiveInfinity;
         foreach (var item in geometry)
         {
-            if (!item.Bounds.IntersectRay(ray, out float boundsDistance)) continue;
+            if (!item.Bounds.IntersectRay(ray)) continue;
+            if (item.Renderer != null) LoadMesh(item);
             if (item.Vertices == null)
             {
-                // Unsupported renderers can occlude. Do not claim a surface hit from their bounding box.
-                blocker = Mathf.Min(blocker, boundsDistance);
+                if (item.Collider != null && item.Collider.Raycast(ray, out var surface, 10000f))
+                    blocker = Mathf.Min(blocker, surface.distance);
                 continue;
             }
             if (!TriangleHit(ray, item.Vertices, item.Triangles, item.Matrix, out var hit)) continue;
@@ -316,8 +343,7 @@ internal static class GazeVoiceGaze
             if (distance >= nearest) continue;
             nearest = distance; best = item; point = hit;
         }
-        // A non-readable renderer or Terrain blocks this ray. Mark it separately from true empty
-        // space so a "here" command cannot place a new object through visible geometry.
+        // Only an actual collider surface blocks a ray; bounds may contain the camera or empty terrain volume.
         if (blocker < nearest && blocker < float.PositiveInfinity)
             return new { occluded = true, name = "Unpickable surface" };
         if (best == null) return null;

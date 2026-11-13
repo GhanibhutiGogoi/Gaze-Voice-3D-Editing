@@ -487,16 +487,28 @@ class SentPictureRouteTest(unittest.TestCase):
         self.assertEqual(directives["script-src"], ["'self'"])  # and nothing else about the page has loosened
 
 
+SERIALS: dict = {}  # a serial per run name, for the lines a test makes up
+
+
 class FakeTraining:
     """The training service as the control center sees it: something to subscribe to, ask and shut down."""
 
     def __init__(self):
         self.callbacks = []
+        self.output_callbacks = []
         self.message = "idle"
         self.shutdowns = 0
 
     def subscribe(self, callback):
         self.callbacks.append(callback)
+
+    def subscribe_output(self, callback):
+        self.output_callbacks.append(callback)
+
+    def say(self, run_id, n, text, serial=None):
+        serial = SERIALS.setdefault(run_id, 1000 + len(SERIALS)) if serial is None else serial
+        for callback in list(self.output_callbacks):
+            callback(run_id, serial, n, text)
 
     def status(self):
         return {"state": "idle", "message": self.message}
@@ -631,6 +643,53 @@ class TrainingEventsTest(unittest.TestCase):
         self.training.change("two")
         self.assertEqual(self.updates(sub, "two"), ["two"])
 
+    def test_the_control_center_listens_for_training_output_once_when_there_is_an_ml_agents_unit(self):
+        self.center(Trainer(self.t.ctx), Okay(self.t.ctx))
+        self.assertEqual(len(self.training.output_callbacks), 1)
+
+    def test_it_does_not_listen_for_training_output_when_there_is_no_ml_agents_unit(self):
+        self.center(Okay(self.t.ctx))
+        self.assertEqual(self.training.output_callbacks, [])
+
+    def test_every_line_of_output_is_published_in_order_as_a_training_output_event(self):
+        center = self.center(Trainer(self.t.ctx))
+        sub = center.bus.subscribe()
+        for n, text in enumerate(["", "[INFO] Listening on port 5004.", "<b>not bold</b>", "  indented  "], start=1):
+            self.training.say("run1", n, text, serial=111)
+        self.training.say("run2", 1, "[WARNING] Restarting worker[0]", serial=222)
+        events = []
+        while (event := sub.get(timeout=0.3)) is not None:
+            if event.kind == "training.output":
+                events.append(event.data)
+        self.assertEqual(events, [
+            {"run_id": "run1", "serial": 111, "n": 1, "text": ""},
+            {"run_id": "run1", "serial": 111, "n": 2, "text": "[INFO] Listening on port 5004."},
+            {"run_id": "run1", "serial": 111, "n": 3, "text": "<b>not bold</b>"},
+            {"run_id": "run1", "serial": 111, "n": 4, "text": "  indented  "},
+            {"run_id": "run2", "serial": 222, "n": 1, "text": "[WARNING] Restarting worker[0]"},
+        ])
+
+    def test_a_run_that_comes_back_under_the_same_name_is_published_under_its_own_serial(self):
+        center = self.center(Trainer(self.t.ctx))
+        sub = center.bus.subscribe()
+        self.training.say("run1", 1, "old", serial=111)
+        self.training.say("run1", 1, "new", serial=222)
+        events = []
+        while (event := sub.get(timeout=0.3)) is not None:
+            if event.kind == "training.output":
+                events.append(event.data)
+        self.assertEqual([(e["run_id"], e["serial"], e["n"], e["text"]) for e in events],
+                         [("run1", 111, 1, "old"), ("run1", 222, 1, "new")])
+
+    def test_a_line_of_output_does_not_start_an_ml_agents_unit_check(self):
+        trainer = Trainer(self.t.ctx)
+        center = self.center(trainer)
+        sub = center.bus.subscribe()
+        self.training.say("run1", 1, "[INFO] a line")
+        self.assertEqual(sub.get(timeout=0.5).kind, "training.output")
+        self.assertIsNone(sub.get(timeout=0.3))  # no component.updated: the unit's state did not change
+        self.assertEqual(trainer.checks, 0)
+
     def test_a_late_change_after_the_control_center_closed_is_ignored(self):
         center = self.center(Trainer(self.t.ctx))
         center.shutdown()
@@ -666,8 +725,14 @@ class StubTraining(FakeTraining):
 
     def status(self):
         return {"state": self.state, "run_id": "run1" if self.state != "idle" else None,
+                "serial": 1778000000000000 if self.state != "idle" else None,
                 "project": "/p/Game" if self.state != "idle" else None, "behaviors": {},
                 "message": self.message, "log": None, "log_tail": [], "models": [], "exit_code": None}
+
+    def output(self, after=0):
+        self.calls.append(("output", after))
+        return {"run_id": "run1", "serial": 1778000000000000, "first": 3,
+                "lines": [{"n": 4, "text": "[INFO] four"}, {"n": 5, "text": "<b>five</b>"}]}
 
     def _maybe_fail(self):
         if self.error is not None:
@@ -824,6 +889,59 @@ class MLAgentsRoutesTest(unittest.TestCase):
 
     def test_status_with_a_foreign_host_is_refused(self):
         self.assertEqual(self.request("GET", "/api/mlagents", headers={"Host": "evil.example"}, write=False)[0], 403)
+
+    def test_the_output_route_answers_with_what_training_kept(self):
+        status, body = self.request("GET", "/api/mlagents/output?after=3", write=False)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"run_id": "run1", "serial": 1778000000000000, "first": 3,
+                                "lines": [{"n": 4, "text": "[INFO] four"}, {"n": 5, "text": "<b>five</b>"}]})
+        self.assertEqual(self.training.calls, [("output", 3)])
+
+    def test_the_output_route_without_after_asks_for_everything(self):
+        for path in ("/api/mlagents/output", "/api/mlagents/output?"):
+            with self.subTest(path):
+                self.training.calls.clear()
+                self.assertEqual(self.request("GET", path, write=False)[0], 200)
+                self.assertEqual(self.training.calls, [("output", 0)])
+
+    def test_a_bad_after_counts_as_0(self):
+        for bad in ("abc", "-1", "-0", "1.5", "", "1e3", "0x10", "%20", "9" * 5000, "%D9%A1%D9%A2", "3;4", "3x", "+3", "%203"):
+            with self.subTest(bad[:20]):
+                self.training.calls.clear()
+                status, _ = self.request("GET", f"/api/mlagents/output?after={bad}", write=False)
+                self.assertEqual(status, 200)
+                self.assertEqual(self.training.calls, [("output", 0)])
+
+    def test_the_output_route_takes_after_as_a_whole_number(self):
+        for text, expected in (("0", 0), ("7", 7), ("007", 7), ("1000", 1000), ("123456789012", 123456789012)):
+            with self.subTest(text):
+                self.training.calls.clear()
+                self.request("GET", f"/api/mlagents/output?after={text}", write=False)
+                self.assertEqual(self.training.calls, [("output", expected)])
+
+    def test_the_output_route_has_the_same_host_check_as_the_other_gets(self):
+        for path in ("/api/mlagents/output", "/api/mlagents/output?after=2"):
+            with self.subTest(path):
+                self.assertEqual(self.request("GET", path, headers={"Host": "evil.example"}, write=False)[0], 403)
+                self.assertEqual(self.request("GET", path, headers={"Host": f"localhost:{self.port + 1}"}, write=False)[0],
+                                 403)
+        self.assertEqual(self.training.calls, [])
+        self.assertEqual(self.request("GET", "/api/mlagents/output", headers={"Host": f"localhost:{self.port}"},
+                                      write=False)[0], 200)
+
+    def test_the_output_route_is_not_cached_and_is_json(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", "/api/mlagents/output")
+        response = conn.getresponse()
+        response.read()
+        conn.close()
+        self.assertIn("application/json", response.getheader("Content-Type"))
+        self.assertEqual(response.getheader("Cache-Control"), "no-store")
+
+    def test_the_output_route_works_with_no_ml_agents_unit_and_needs_no_install(self):
+        self.unit.is_installed = False
+        self.assertEqual(self.request("GET", "/api/mlagents/output", write=False)[0], 200)
+        self.assertEqual(self.unit.installs, 0)
 
     def test_train_starts_a_run_in_the_chosen_project_and_passes_its_arguments_through(self):
         status, body = self.request("POST", "/api/mlagents/train", {
@@ -1036,8 +1154,8 @@ class MLAgentsRoutesTest(unittest.TestCase):
         self.assertEqual(self.center.jobs.recent(10), [])
 
 
-class TrainingShutdownTest(unittest.TestCase):
-    """Closing the control center in the middle of a real run: the model is saved and nothing is left on port 5004."""
+class RealTrainingCase(unittest.TestCase):
+    """A control center with the real ML-Agents unit and training service, and the fake mlagents-learn as its trainer."""
 
     @classmethod
     def setUpClass(cls):
@@ -1065,6 +1183,10 @@ class TrainingShutdownTest(unittest.TestCase):
         self.center = ControlCenter(self.t.ctx, [self.unit], check_timeout=2.0, sse_ping=0.2)
         self.addCleanup(self.center.shutdown)
 
+
+class TrainingShutdownTest(RealTrainingCase):
+    """Closing the control center in the middle of a real run: the model is saved and nothing is left on port 5004."""
+
     def test_closing_the_control_center_mid_training_saves_the_model_and_leaves_no_helper(self):
         sub = self.center.bus.subscribe()
         env = {"FAKE_ML_SCRIPT": "wait_interrupt", "FAKE_ML_DIR": str(self.fake), "FAKE_ML_HELPER": "sigint"}
@@ -1091,6 +1213,106 @@ class TrainingShutdownTest(unittest.TestCase):
         self.assertTrue(process_gone(main))
         self.assertTrue(process_gone(helper))
         self.assertTrue((self.fake / "helper.sigint").exists(), "the helper should have been sent SIGINT too")
+
+
+class TrainingOutputTest(RealTrainingCase):
+    """A real run, end to end: the lines it prints reach the event stream in order, and the route gives them back."""
+
+    def setUp(self):
+        super().setUp()
+        self.server = make_server(self.center, port=0)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, args=(0.02,), daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    request = ServerTest.request
+
+    def run_to_the_end(self, run_id):
+        env = {"FAKE_ML_SCRIPT": "finish", "FAKE_ML_DIR": str(self.fake)}
+        with mock.patch.dict(os.environ, env):
+            self.t.ctx.training.start(self.unit.mlagents_learn, self.project, run_id)
+        wait_for(self, lambda: self.t.ctx.training.status()["state"] == "finished", what=f"{run_id} to finish")
+
+    def output_events(self, sub):
+        events = []
+        while (event := sub.get(timeout=0.4)) is not None:
+            if event.kind == "training.output":
+                events.append(event.data)
+        return events
+
+    def test_a_run_publishes_every_line_in_order_and_the_route_gives_the_same_lines(self):
+        sub = self.center.bus.subscribe()
+        self.run_to_the_end("run1")
+        events = self.output_events(sub)
+        status, body = self.request("GET", "/api/mlagents/output", write=False)
+        self.assertEqual(status, 200)
+        self.assertGreater(len(events), 15)
+        self.assertEqual([event["n"] for event in events], list(range(1, len(events) + 1)))
+        self.assertEqual({event["run_id"] for event in events}, {"run1"})
+        self.assertEqual({tuple(sorted(event)) for event in events}, {("n", "run_id", "serial", "text")})
+        serial = self.t.ctx.training.status()["serial"]
+        self.assertIsInstance(serial, int)
+        self.assertEqual({event["serial"] for event in events}, {serial})  # every line names its run's serial
+        self.assertEqual([{"n": event["n"], "text": event["text"]} for event in events], body["lines"])
+        self.assertEqual((body["run_id"], body["serial"], body["first"]), ("run1", serial, 1))
+        texts = [event["text"] for event in events]
+        self.assertEqual(texts[0], "")  # exactly as printed: the banner starts with an empty line
+        self.assertIn("[INFO] Listening on port 5004. Start training by pressing the Play button in the Unity Editor.",
+                      texts)
+        self.assertTrue(any(". Step: 50000. " in text for text in texts))
+
+    def test_the_route_gives_only_what_came_after(self):
+        self.run_to_the_end("run1")
+        everything = self.request("GET", "/api/mlagents/output", write=False)[1]["lines"]
+        after = self.request("GET", "/api/mlagents/output?after=12", write=False)[1]
+        self.assertEqual(after["lines"], everything[12:])
+        self.assertEqual(after["first"], 1)
+        self.assertEqual(self.request("GET", f"/api/mlagents/output?after={len(everything)}", write=False)[1]["lines"], [])
+
+    def test_before_any_run_there_is_nothing(self):
+        status, body = self.request("GET", "/api/mlagents/output", write=False)
+        self.assertEqual((status, body), (200, {"run_id": None, "serial": None, "first": 0, "lines": []}))
+
+    def test_the_next_run_publishes_under_its_own_id_from_line_1(self):
+        self.run_to_the_end("run1")
+        sub = self.center.bus.subscribe()
+        self.run_to_the_end("run2")
+        events = [event for event in self.output_events(sub)]
+        self.assertEqual({event["run_id"] for event in events}, {"run2"})
+        self.assertEqual([event["n"] for event in events], list(range(1, len(events) + 1)))
+        self.assertEqual(self.request("GET", "/api/mlagents/output", write=False)[1]["run_id"], "run2")
+
+    def test_a_run_that_reuses_a_name_is_published_under_a_new_serial_from_line_1(self):
+        self.run_to_the_end("run1")
+        first = self.t.ctx.training.status()["serial"]
+        sub = self.center.bus.subscribe()
+        env = {"FAKE_ML_SCRIPT": "finish", "FAKE_ML_DIR": str(self.fake)}
+        with mock.patch.dict(os.environ, env):
+            self.t.ctx.training.start(self.unit.mlagents_learn, self.project, "run1", overwrite=True)
+        wait_for(self, lambda: self.t.ctx.training.status()["state"] == "finished", what="the second run1 to finish")
+        second = self.t.ctx.training.status()["serial"]
+        events = self.output_events(sub)
+        self.assertNotEqual(first, second)
+        self.assertEqual({(event["run_id"], event["serial"]) for event in events}, {("run1", second)})
+        self.assertEqual([event["n"] for event in events], list(range(1, len(events) + 1)))
+        body = self.request("GET", "/api/mlagents/output", write=False)[1]
+        self.assertEqual((body["run_id"], body["serial"]), ("run1", second))
+
+    def test_the_unit_state_the_page_is_sent_names_the_run_and_whether_it_is_listening(self):
+        sub = self.center.bus.subscribe()
+        self.run_to_the_end("run1")
+        serial = self.t.ctx.training.status()["serial"]
+        updates = []
+        while (event := sub.get(timeout=0.4)) is not None:
+            if event.kind == "component.updated" and event.data["id"] == "mlagents":
+                updates.append(event.data["run"])
+        self.assertTrue(updates)
+        self.assertTrue(all(run is None or run["serial"] == serial for run in updates))
+        self.assertEqual(updates[-1], {"run_id": "run1", "serial": serial, "state": "finished", "listening": True})
+        self.assertIn(False, [run["listening"] for run in updates if run])  # it was starting up before it listened
+        states = self.center.snapshot()["components"]
+        self.assertEqual(next(c for c in states if c["id"] == "mlagents")["run"], updates[-1])
 
 
 if __name__ == "__main__":

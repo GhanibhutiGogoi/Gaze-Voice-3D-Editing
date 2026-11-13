@@ -95,6 +95,17 @@ const S = {
   oldThumbs: new Map(), // the ones the draw before this one used, while a draw is under way
   gonePictures: new Set(), // addresses the control center no longer has a picture for
   pictureView: null, // the full-size dialog, once it has been made: {dialog, img, caption, item}
+  term: {
+    runId: null, // the run whose lines are on the page, by name
+    serial: null, // and by serial: what tells it from another run that has the same name (resume, overwrite)
+    last: 0, // the number of the last line on the page; lines count from 1 in each run
+    shown: false, // a line has been shown, so the panel stays up after the run ends
+    dismissed: null, // the serial of the run the person closed the panel for
+    following: true, // the newest line is kept in view
+    filling: false, // a fetch of missed lines is out
+    again: false, // and another is wanted when it comes back
+    seen: null, // the trainer's run as last read, to announce changes
+  },
 };
 
 const VOICE_WORDS = {
@@ -906,9 +917,10 @@ function privacyNote(v) {
 // the command ran on the selection then, so a reading of gaze never reached the editor.
 function gazeLine(r) {
   const gaze = r.gaze;
-  if (!gaze || !gaze.targets || !gaze.targets.length) return null;
+  if (!gaze || !(gaze.targets || []).length && !(gaze.misses || []).some((miss) => miss.point)) return null;
   const said = [...gaze.targets, ...(gaze.misses || [])].sort((a, b) => a.at - b.at).map((word) => {
-    const best = word.candidates ? `${word.candidates[0].name} (${Math.round(word.candidates[0].score * 100)}%)` : "nothing";
+    const best = word.candidates ? `${word.candidates[0].name} (${Math.round(word.candidates[0].score * 100)}%)`
+      : word.point ? `work-plane point (${word.point.map((n) => Number(n).toFixed(2)).join(", ")})` : "nothing";
     return `“${word.word}” → ${best}`;
   });
   return `${r.focus && r.focus.gaze ? "Gaze picked" : "Gaze would have picked"} ${said.join(" · ")}`;
@@ -1474,7 +1486,248 @@ function trackWorkflow(job, line) {
   });
 }
 
+// ---------- ML-Agents terminal ----------
+
+// The trainer's output, read only. Lines arrive as `training.output` events and, to catch up after a load, a reconnect or
+// a missed line, from GET /api/mlagents/output. Every line is put in as text, never as markup.
+const TERM_MAX = 1000; // lines kept on the page: as many as the control center keeps
+const TERM_LIVE = new Set(["waiting", "training", "stopping"]);
+const TERM_LEDS = { waiting: "standby", training: "live", stopping: "busy", finished: "off", stopped: "off", failed: "fault" };
+// "Ready" is said only once the trainer listens for Unity: before that, pressing Play would find nobody.
+const TERM_SAYS = {
+  starting: "ML-Agents is starting up. It will say when it is ready.",
+  waiting: "ML-Agents is ready. Press Play in Unity to start training.",
+  training: "ML-Agents training started.",
+  finished: "ML-Agents training finished.",
+  stopped: "ML-Agents training stopped.",
+  failed: "ML-Agents training failed.",
+};
+const TERM_STARTING = "ML-Agents is starting up. Press Play once it says it is waiting for Unity.";
+const TERM_IDLE = { serial: null, state: "idle", listening: false }; // what the page has seen while no run exists
+const TERM_CLOSED_KEY = "gazevoice.terminal.closed"; // sessionStorage: the serial of the run whose panel was closed
+const TERM_EXCEPTION = /^(?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*(?:Error|Exception)\b/; // "OSError: …", "mlagents_envs.exception.UnityTimeOutException: …"
+
+// What a line is, for its colour: "error", "warn", "progress" or null.
+function termKind(text) {
+  if (/^\s*\[ERROR\]/.test(text) || /^\s*Traceback\b/.test(text) || TERM_EXCEPTION.test(text)) return "error";
+  if (/^\s*\[WARNING\]/.test(text)) return "warn";
+  if (text.includes(". Step: ")) return "progress";
+  return null;
+}
+
+// The run the ML-Agents unit reports: {run_id, serial, state, listening}. null when there is none, and undefined while the
+// unit is still being checked, so that is never taken for a change.
+function trainerRun(comp) {
+  if (!comp || comp.health !== "ready") return undefined;
+  return comp.run || null;
+}
+
+// The panel's line of words. While the trainer isn't listening yet it says so, whatever the unit's summary was made of.
+function terminalStatus(comp, now) {
+  if (now && now.state === "waiting" && !now.listening) return TERM_STARTING;
+  return comp ? comp.summary : "";
+}
+
+// The page is about this run now: forget the lines of the one before (a run with the same name counts its lines from 1
+// again). Closing the panel was for a serial, so a run with another one shows it again.
+function startTerminalRun(runId, serial) {
+  const t = S.term;
+  t.runId = runId;
+  t.serial = serial;
+  t.last = 0;
+  t.shown = false;
+  t.following = true;
+  $("terminal-log").replaceChildren();
+  $("terminal-jump").hidden = true;
+}
+
+// Add lines (numbered above S.term.last, in order) to the screen, keeping the newest in view while it is being followed.
+function termAppend(records) {
+  const screen = $("terminal-log");
+  const follow = S.term.following;
+  screen.append(...records.map((record) => h("div", { class: "term-line", "data-kind": termKind(record.text), text: record.text })));
+  S.term.last = records[records.length - 1].n;
+  S.term.shown = true;
+  while (screen.children.length > TERM_MAX) screen.firstChild.remove();
+  if (follow) screen.scrollTop = screen.scrollHeight;
+}
+
+function onTrainingOutput(data) {
+  const t = S.term;
+  if (!data || typeof data.run_id !== "string" || !Number.isInteger(data.serial) || !Number.isInteger(data.n)
+      || typeof data.text !== "string") return;
+  if (data.serial === t.dismissed) return;
+  if (data.serial !== t.serial) startTerminalRun(data.run_id, data.serial);
+  if (data.n <= t.last) return; // already on the page
+  if (data.n > t.last + 1) fillTerminal(); // a line was missed: ask for it, and for everything after it
+  else termAppend([data]);
+  renderTerminal();
+}
+
+// Show what GET /api/mlagents/output answered, asked (after `asked`) while the page was on the run `from`. True when it was
+// another run than the page's, so that lines before `asked` were left out of it and it has to be asked for again from the start.
+function takeOutput(data, asked, from) {
+  const t = S.term;
+  if (!data || typeof data.run_id !== "string" || !Number.isInteger(data.serial) || !Array.isArray(data.lines)) return false;
+  if (data.serial === t.dismissed) return false;
+  if (t.serial !== from && data.serial === from) return false; // about the run the page has left since it asked
+  if (data.serial !== t.serial) {
+    startTerminalRun(data.run_id, data.serial);
+    if (asked > 0) return true;
+  }
+  const fresh = data.lines.filter((line) => line.n > t.last);
+  if (fresh.length) termAppend(fresh);
+  renderTerminal();
+  return false;
+}
+
+// Ask for the lines after the last one shown. One fetch at a time; one more follows if another was wanted meanwhile.
+async function fillTerminal() {
+  const t = S.term;
+  if (t.filling) {
+    t.again = true;
+    return;
+  }
+  t.filling = true;
+  try {
+    for (let round = 0; round < 3; round += 1) {
+      t.again = false;
+      const asked = t.last;
+      const from = t.serial;
+      let data;
+      try {
+        data = await getJSON(`/api/mlagents/output?after=${asked}`);
+      } catch {
+        return; // the next event, reconnect or load tries again
+      }
+      if (!takeOutput(data, asked, from) && !t.again) break;
+    }
+  } finally {
+    t.filling = false;
+  }
+}
+
+// Say a change of the trainer's run aloud, only for the ones worth hearing and only while the panel is up. A waiting run is
+// "starting up" until it is listening for Unity and "ready" only after that, also when Unity lost it and it starts over.
+// Another run, even one with the same name, is a change too.
+function noteTrainer(now, show) {
+  if (now === undefined) return; // still being checked
+  const here = now || TERM_IDLE;
+  const before = S.term.seen;
+  S.term.seen = here;
+  if (before === null || !show) return;
+  const waiting = here.state === "waiting";
+  if (before.serial === here.serial && before.state === here.state && (!waiting || before.listening === here.listening)) return;
+  const words = waiting && !here.listening ? TERM_SAYS.starting : TERM_SAYS[here.state];
+  if (!words) return;
+  const comp = component("mlagents");
+  // The summary of a failure ends with "The log is at <path>." Aloud, a path is only noise.
+  const why = here.state === "failed" && comp && comp.summary ? comp.summary.replace(/\s*The log is at\b[\s\S]*$/, "") : "";
+  announce(why ? `${words} ${why}` : words);
+}
+
+function renderTerminal() {
+  const box = $("terminal");
+  if (!box) return;
+  const t = S.term;
+  const comp = component("mlagents");
+  const now = trainerRun(comp);
+  if (now && now.serial !== t.serial) {
+    // The unit is on another run than the page: start over, and ask for that run's lines.
+    startTerminalRun(now.run_id, now.serial);
+    fillTerminal();
+  }
+  const live = Boolean(now && TERM_LIVE.has(now.state));
+  const show = t.serial !== null && t.serial !== t.dismissed && (t.shown || live);
+  noteTrainer(now, show);
+  const wasHidden = box.hidden;
+  box.hidden = !show;
+  if (!show) return;
+  $("terminal-run").textContent = t.runId;
+  $("terminal-status").textContent = terminalStatus(comp, now);
+  if (now) $("terminal-led").dataset.led = now.state === "waiting" && !now.listening ? "busy" : TERM_LEDS[now.state] || "off";
+  const stop = Boolean(comp && (comp.actions || []).find((action) => action.id === "stop"));
+  const stopKey = $("terminal-stop");
+  // A key that goes away takes the focus with it, so the focus goes to the log, which can be scrolled with the keyboard.
+  if (!stop && document.activeElement === stopKey) $("terminal-log").focus({ preventScroll: true });
+  stopKey.hidden = !stop;
+  stopKey.disabled = isBusy("mlagents");
+  const job = runningJob("mlagents");
+  stopKey.textContent = job && job.action === "stop" ? "Stopping…" : "Stop training";
+  if (wasHidden && t.following) {
+    const screen = $("terminal-log");
+    screen.scrollTop = screen.scrollHeight; // a hidden box has no scroll position to keep
+  }
+}
+
+// A closed panel stays closed for that run when the page is loaded again. A browser that won't keep it only forgets.
+function rememberClosed(serial) {
+  try {
+    sessionStorage.setItem(TERM_CLOSED_KEY, String(serial));
+  } catch {
+    // not kept
+  }
+}
+
+function recallClosed() {
+  try {
+    const text = sessionStorage.getItem(TERM_CLOSED_KEY);
+    return text !== null && /^\d+$/.test(text) ? Number(text) : null;
+  } catch {
+    return null;
+  }
+}
+
+function closeTerminal() {
+  const t = S.term;
+  if (t.serial === null) return;
+  t.dismissed = t.serial;
+  rememberClosed(t.serial);
+  renderTerminal();
+  const next = document.querySelector("#voice .key"); // the box the focus was in is gone
+  if (next) next.focus();
+}
+
+function jumpToLatest() {
+  const screen = $("terminal-log");
+  S.term.following = true;
+  $("terminal-jump").hidden = true;
+  screen.scrollTop = screen.scrollHeight;
+  screen.focus({ preventScroll: true }); // the key just pressed is gone
+}
+
+// Scrolling up leaves the newest line behind: stop following and offer the way back. Reaching the end follows again.
+function onTerminalScroll() {
+  const screen = $("terminal-log");
+  const atEnd = screen.scrollHeight - screen.scrollTop - screen.clientHeight < 24;
+  S.term.following = atEnd;
+  $("terminal-jump").hidden = atEnd;
+}
+
+function wireTerminal() {
+  $("terminal-close").addEventListener("click", closeTerminal);
+  $("terminal-stop").addEventListener("click", () => runAction("mlagents", "stop"));
+  $("terminal-jump").addEventListener("click", jumpToLatest);
+  $("terminal-log").addEventListener("scroll", onTerminalScroll);
+}
+
 // ---------- live updates ----------
+
+// A unit's state changed after the page got its snapshot (a slow check finished, or a training run moved on). The page asks
+// for a fresh snapshot a moment later. The ML-Agents unit's state is also taken in straight away, so the terminal panel's
+// status, keys and run are never a refresh behind the lines it shows.
+function onComponentUpdated(late) {
+  const shown = component(late.id);
+  const changed = !shown || shown.health !== late.health || shown.summary !== late.summary;
+  if (shown && late.id === "mlagents") {
+    S.state.components[S.state.components.indexOf(shown)] = late;
+    renderTerminal();
+  }
+  if (changed) {
+    clearTimeout(onComponentUpdated.timer);
+    onComponentUpdated.timer = setTimeout(refresh, 400);
+  }
+}
 
 function connectEvents() {
   const source = new EventSource("/api/events");
@@ -1486,6 +1739,7 @@ function connectEvents() {
       wasDown = false;
       loadJobs();
       refresh();
+      fillTerminal();
     }
   });
   source.addEventListener("error", () => {
@@ -1521,6 +1775,9 @@ function connectEvents() {
     renderAll();
     refresh();
   });
+  source.addEventListener("training.output", (event) => {
+    onTrainingOutput(JSON.parse(event.data));
+  });
   source.addEventListener("voice.state", (event) => {
     const data = JSON.parse(event.data);
     const wasOn = voiceOn();
@@ -1533,13 +1790,7 @@ function connectEvents() {
     renderVoice();
   });
   source.addEventListener("component.updated", (event) => {
-    // A slow check finished after the page got its snapshot.
-    const late = JSON.parse(event.data);
-    const shown = component(late.id);
-    if (!shown || shown.health !== late.health || shown.summary !== late.summary) {
-      clearTimeout(connectEvents.lateTimer);
-      connectEvents.lateTimer = setTimeout(refresh, 400);
-    }
+    onComponentUpdated(JSON.parse(event.data));
   });
   source.addEventListener("settings.updated", (event) => {
     if (S.state) S.state.settings = JSON.parse(event.data);
@@ -1599,6 +1850,7 @@ function renderAll() {
     renderRack();
     renderRouting();
     renderLog();
+    renderTerminal();
   });
 }
 
@@ -1630,9 +1882,12 @@ function start() {
     if (S.talkHeld && (event.key === " " || event.key === "Enter")) releaseTalk();
   });
 
+  S.term.dismissed = recallClosed();
+  wireTerminal();
   renderAll();
   loadJobs();
   refresh();
+  fillTerminal();
   if (SNAPSHOT) return;
 
   document.addEventListener("visibilitychange", () => {

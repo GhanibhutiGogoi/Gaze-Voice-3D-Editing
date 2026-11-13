@@ -125,6 +125,9 @@ class CameraListTest(unittest.TestCase):
         self.assertEqual(pick_camera(devices, ""), ("0", "MacBook Air相机"))
         self.assertIsNone(pick_camera(devices, "MacBook Air桌上视角相机"))
 
+    def test_auto_takes_a_traditional_chinese_camera(self):
+        self.assertEqual(pick_camera([("0", "MacBook Air相機")], ""), ("0", "MacBook Air相機"))
+
     def test_auto_never_falls_back_to_a_phone_or_any_other_camera(self):
         phone = [("0", "Nokia Unbreakable V Camera")]
         self.assertIsNone(pick_camera(phone, ""))

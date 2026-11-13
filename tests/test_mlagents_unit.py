@@ -21,13 +21,17 @@ CONFIRM = ("Install ML-Agents' Python side? This sets up its own Python 3.10 env
 class StubTraining:
     """Stands in for the training service: says what it is told to, and records what it is asked."""
 
-    def __init__(self, state="idle", message="No training run has started yet.", run_id=None):
+    def __init__(self, state="idle", message="No training run has started yet.", run_id=None, serial=None,
+                 listening=False):
         self.state, self.message, self.run_id = state, message, run_id
+        self.serial = serial if serial is not None or run_id is None else 1778000000000000
+        self.listening = listening
         self.stop_calls = 0
 
     def status(self):
-        return {"state": self.state, "run_id": self.run_id, "project": None, "behaviors": {}, "message": self.message,
-                "log": None, "log_tail": [], "models": [], "exit_code": None}
+        return {"state": self.state, "run_id": self.run_id, "serial": self.serial, "project": None, "behaviors": {},
+                "message": self.message, "log": None, "log_tail": [], "models": [], "exit_code": None,
+                "listening": self.listening}
 
     def stop(self):
         self.stop_calls += 1
@@ -166,6 +170,47 @@ class MLAgentsTest(unittest.TestCase):
         self.assertEqual(state.health, Health.READY)
         self.assertEqual(state.summary, "Training run1: step 20000, mean reward 1.234.")
         self.assertEqual(state.detail("Last run"), "run1 · training")
+
+    # --- the run, for the dashboard's terminal panel ------------------------------------------------------------
+
+    def test_the_state_carries_the_live_run_and_its_serial_apart_from_the_details_text(self):
+        self.make_venv()
+        self.t.ctx.training = StubTraining("waiting", "Waiting for Unity: press Play in the Editor to start training.",
+                                           "run1", serial=1778000000000123, listening=True)
+        state = self.unit.check()
+        run = {"run_id": "run1", "serial": 1778000000000123, "state": "waiting", "listening": True}
+        self.assertEqual(state.run, run)
+        self.assertEqual(state.to_dict()["run"], run)
+        self.assertEqual(state.detail("Last run"), "run1 · waiting")  # the words for people are as they were
+
+    def test_the_run_says_when_the_trainer_is_not_listening_yet(self):
+        self.make_venv()
+        self.t.ctx.training = StubTraining("waiting", "ML-Agents is starting up.", "run1", serial=5, listening=False)
+        self.assertEqual(self.unit.check().to_dict()["run"],
+                         {"run_id": "run1", "serial": 5, "state": "waiting", "listening": False})
+
+    def test_a_run_that_has_ended_is_still_the_run_the_state_names(self):
+        self.make_venv()
+        for run_state in ("finished", "stopped", "failed", "stopping", "training"):
+            with self.subTest(run_state):
+                self.t.ctx.training = StubTraining(run_state, "x", "run1", serial=9, listening=True)
+                self.assertEqual(self.unit.check().to_dict()["run"],
+                                 {"run_id": "run1", "serial": 9, "state": run_state, "listening": True})
+
+    def test_the_run_is_none_when_nothing_has_run_and_the_key_is_still_there(self):
+        self.make_venv()
+        state = self.unit.check()
+        self.assertIsNone(state.run)
+        self.assertIn("run", state.to_dict())
+        self.assertIsNone(state.to_dict()["run"])
+
+    def test_the_run_key_is_there_while_the_unit_is_missing_or_still_being_checked_too(self):
+        missing = self.unit.check()  # no environment at all
+        self.assertEqual(missing.health, Health.MISSING)
+        checking = self.unit.state(Health.CHECKING, "Still checking…")  # what the control center shows while a probe is slow
+        for state in (missing, checking):
+            self.assertIn("run", state.to_dict())
+            self.assertIsNone(state.to_dict()["run"])
 
     def test_a_finished_run_is_ready_to_train_again(self):
         self.make_venv()

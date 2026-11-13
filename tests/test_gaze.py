@@ -581,6 +581,15 @@ class GroundTest(unittest.TestCase):
         self.assertEqual(result.targets, [])
         self.assertEqual(result.misses[0].point, [2.0, 0.0, 3.0])
 
+    def test_blender_keeps_clear_neighbor_vote_on_empty_center(self):
+        track = track_of(*steady(100.0, 0.4, 0.6))
+        result = ground(said(("there", 0.4, 0.6)), 100.0, track, DEFAULT_RADIUS,
+                        lambda points: [None] + [CHAIR] * (len(points) - 1), self.piece,
+                        lambda u, v: {"point": [2.0, 0.0, 3.0], "plane": "y=0"},
+                        prefer_empty_center=False)
+        self.assertEqual(result.misses, [])
+        self.assertEqual(result.targets[0].candidates[0].name, "Chair")
+
     def test_a_failed_pick_means_no_gaze(self):
         track = track_of(*steady(100.0, 0.4, 0.6))
         words = said(("this", 0.4, 0.6))

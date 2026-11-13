@@ -121,7 +121,6 @@ NO_PICTURE = "GazeVoice: no picture, going on with text only"  # never says why:
 CROP_POLL_SECONDS = 0.05  # between asking Blender whether the crop is ready
 BRIDGE_REPLY_SECONDS = 2.0  # the longest Blender is given to answer one crop request
 COULDNT_TELL = "Couldn't tell what you meant. Select it or say its name."
-_NEW_AT_GAZE = re.compile(r"^\s*(?:please\s+)?(?:make|create|add|build|spawn|place)\s+(?:me\s+)?(?:a|an|some|new)\s+", re.IGNORECASE)
 _NO_NEWS = object()  # a poll that says nothing about the marker leaves it as it is
 _UNKNOWN = object()  # what Blender was last told about the marker, when it may not have heard
 _COULDNT = re.compile(r"(?:could(?:n['’]t| not)|can(?:['’]t|not))\b", re.IGNORECASE)  # the editor saying it failed
@@ -860,7 +859,7 @@ class VoiceService:
 
     def _capture_context(self, record: dict) -> None:
         """What was in focus when the command was spoken (selection now; gaze later)."""
-        if self.host == "unity" and self._gaze is not None:
+        if self.host == "unity" and record["source"] == "voice" and self._gaze is not None and self.gaze_mode != "off":
             view = self._bridge_call({"cmd": "gaze_view"})
             record["_gaze_view"] = view.get("viewport_id") if view and view.get("ok") else None
         selection = self._bridge_call({"cmd": "selection"})
@@ -1354,13 +1353,6 @@ class VoiceService:
         reply = self._gaze_call({"cmd": "gaze_ground", "point": [u, v]})
         return reply if reply and reply.get("ok") else None
 
-    @staticmethod
-    def _new_object_here(record: dict, found: dict) -> bool:
-        """Allow an empty-space point to stand alone only for a new-object request."""
-        heard = record.get("heard") or ""
-        return (bool(_NEW_AT_GAZE.match(heard)) and not re.search(r"\b(?:this|that|these|those|it|them)\b", heard, re.I)
-                and any(m.get("point") for m in found.get("misses", []) if m.get("word") in ("here", "there")))
-
     def _piece(self, candidate) -> dict | None:
         """Which part of the model the best guess is, or None when Blender couldn't say."""
         if len(candidate.point) != 3:
@@ -1577,9 +1569,8 @@ class VoiceService:
         """Work out what the pointing words in a spoken command refer to, from where the person was looking.
 
         The answer goes in record["gaze"]. In "on" mode it also joins the focus the brains read, and guesses that aren't
-        clear (see is_clear) are put to the person first (see _ask_which). Nothing here can stop a command: if gaze is
-        lost or breaks, or nobody says which one, the command runs on the selection. The one exception is that last case
-        with nothing selected. There is nothing to run it on, so the command fails and this returns False. If Blender
+        clear (see is_clear) are put to the person first (see _ask_which). If gaze is lost or breaks, or nobody says
+        which one, the command runs with the available selection and the editor decides whether it needs a target. If Blender
         can't be found on the screen gaze was calibrated on, that is treated like lost gaze, and the status line says so.
         When gaze found nothing because nearly all the readings landed off the screen (a calibration that reads wrong),
         the status line says to calibrate again. The counts for each pointing word go in record["gaze"]["windows"].
@@ -1594,24 +1585,19 @@ class VoiceService:
         if self.host == "unity" and not self._ground_view:
             record["gaze"] = {"status": "none", "targets": [], "reason": "no_viewport"}
             record["_gaze_note"] = "No valid Scene view, using your selection"
-            if self.gaze_mode == "on" and not (record["focus"] or {}).get("selected"):
-                self._fail(record, COULDNT_TELL)
-                return False
             return True
         placed = self._placed(gaze, record["_look"] or GazeTrack())
         if placed is None:
             record["gaze"] = {"status": "none", "targets": [], "radius": [], "matched_selection": None, "asked": False,
                               "not_on_screen": True}
-            record["_gaze_note"] = NOT_ON_SCREEN
-            if self.host == "unity" and self.gaze_mode == "on" and not (record["focus"] or {}).get("selected"):
-                self._fail(record, COULDNT_TELL)
-                return False
+            record["_gaze_note"] = NOT_ON_SCREEN if self.host == "blender" else "Unity isn't on your calibrated screen, using your selection"
             return True
         look, radius = placed
         asked = settled = off_screen = False
         sent: list[int] = []  # which targets had a picture sent: the record says so, and holds nothing of the image
         try:
-            grounding = ground(words, clip_start, look, radius, self._pick, self._piece, self._place)
+            grounding = ground(words, clip_start, look, radius, self._pick, self._piece, self._place,
+                               prefer_empty_center=self.host == "unity")
             off_screen = not grounding.targets and mostly_off_screen(grounding.windows)
             if self.gaze_mode == "on" and grounding.status == "clarify":
                 asked, settled = True, self._settle(record, grounding, run)
@@ -1632,16 +1618,9 @@ class VoiceService:
                 self._gaze_matched += matched
         if self.gaze_mode != "on":
             return True
-        placement = self._new_object_here(record, found)
         has_point = any(m.get("point") for m in found.get("misses", []))
-        if has_point and not found["targets"] and not placement and not (record["focus"] or {}).get("selected"):
-            self._fail(record, COULDNT_TELL)
-            return False
-        if not found["targets"] and self.host == "unity" and not (record["focus"] or {}).get("selected") and not placement:
-            self._fail(record, COULDNT_TELL)
-            return False
         if not found["targets"] and not has_point:
-            record["_gaze_note"] = GAZE_OFF_SCREEN if off_screen else GAZE_LOST
+            record["_gaze_note"] = (GAZE_OFF_SCREEN.replace("Blender", self.host_label) if off_screen else GAZE_LOST)
             return True
         if record["_stop"] or run.stop.is_set():  # "stop" was said while asking; _edit ends the command
             return True
@@ -1720,10 +1699,11 @@ class VoiceService:
             return
         if self.host == "unity" and (record["focus"] or {}).get("gaze"):
             ids = [t["candidates"][0]["uid"] for t in record["focus"]["gaze"]["targets"]]
-            valid = self._gaze_call({"cmd": "gaze_validate", "uids": ids})
-            if not valid or not valid.get("ok"):
-                self._fail(record, "The Scene view or gaze target changed. Point at it and speak again.")
-                return
+            if ids:
+                valid = self._bridge_call({"cmd": "gaze_validate", "uids": ids})
+                if not valid or not valid.get("ok"):
+                    self._fail(record, "The gaze target is gone. Point at it and speak again.")
+                    return
         self._stage("editing", record)
         self._status(f"Working: {record['refined']}{self._gaze_hint(record)}", "working")
         self._bridge_call({"cmd": "begin_edit"})  # from here, the host tracks changes for undo

@@ -34,7 +34,7 @@ _DEVICE = re.compile(r"\]\s*\[(\d+)\]\s+(.+?)\s*$")
 _DEVICES_HEADER = re.compile(r"AVFoundation (audio|video) devices")
 # AVFoundation localizes Apple camera names with the system language. Keep the Mac/FaceTime
 # identity check, but accept localized camera words and exclude localized Desk View devices.
-_BUILT_IN_CAMERA = re.compile(r"(?=.*(MacBook|FaceTime))(?=.*(Camera|HD|相机|攝影機))", re.IGNORECASE)
+_BUILT_IN_CAMERA = re.compile(r"(?=.*(MacBook|FaceTime))(?=.*(Camera|HD|相机|相機|攝影機))", re.IGNORECASE)
 _NOT_A_FACE_CAMERA = re.compile(r"desk view|桌上视角|桌上視角|capture screen", re.IGNORECASE)
 
 
