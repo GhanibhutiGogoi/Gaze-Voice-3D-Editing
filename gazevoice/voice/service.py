@@ -124,6 +124,12 @@ COULDNT_TELL = "Couldn't tell what you meant. Select it or say its name."
 _NO_NEWS = object()  # a poll that says nothing about the marker leaves it as it is
 _UNKNOWN = object()  # what Blender was last told about the marker, when it may not have heard
 _COULDNT = re.compile(r"(?:could(?:n['’]t| not)|can(?:['’]t|not))\b", re.IGNORECASE)  # the editor saying it failed
+_UNRESOLVED_OBJECT = re.compile(
+    r"\b(?:make|set|change|move|rotate|scale|resize|delete|remove|duplicate|rename|select|color|colour|paint|edit)"
+    r"\s+(?:the\s+)?(?P<pronoun>this|that|these|those|it|them)\b",
+    re.IGNORECASE,
+)
+_CREATE_THING = re.compile(r"\b(?:make|create|add|build|spawn)\s+(?:me\s+)?(?:a|an|some|new|two|three|four|five)\s+\w+", re.I)
 
 
 def changes_scene(tools: list[str]) -> bool:
@@ -1362,6 +1368,22 @@ class VoiceService:
             return None
         return {k: v for k, v in reply.items() if k != "ok"}
 
+    @staticmethod
+    def _needs_unavailable_object(record: dict) -> bool:
+        """Whether a refined command uses a demonstrative as an existing-object target without one in focus."""
+        focus = record.get("focus") or {}
+        gaze = focus.get("gaze") or {}
+        if focus.get("selected") or gaze.get("targets"):
+            return False
+        command = record.get("prompt") or record.get("refined") or ""
+        reference = _UNRESOLVED_OBJECT.search(command)
+        if not reference:
+            return False
+        # "Make a cube and put it there" refers to the newly-created cube, not a missing focus object.
+        if reference.group("pronoun").casefold() in {"it", "them"}:
+            return not any(match.end() <= reference.start() for match in _CREATE_THING.finditer(command))
+        return True
+
     def _calibration_drawing(self) -> bool:
         """Whether gaze's Test may be drawing on the viewport: what it draws there isn't voice's to cover or clear."""
         return self.overlay is not None and self.overlay.holder == "gaze"
@@ -1696,6 +1718,9 @@ class VoiceService:
             record["kind"] = "command"
         if record["_stop"] or run.stop.is_set():
             self._stopped(record, "Stopped.", run)
+            return
+        if self.host == "unity" and self.gaze_mode == "on" and self._needs_unavailable_object(record):
+            self._fail(record, COULDNT_TELL)
             return
         if self.host == "unity" and (record["focus"] or {}).get("gaze"):
             ids = [t["candidates"][0]["uid"] for t in record["focus"]["gaze"]["targets"]]

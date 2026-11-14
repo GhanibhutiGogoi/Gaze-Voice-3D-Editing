@@ -109,6 +109,29 @@ class UnityGazeTest(VoiceTestBase):
         self.assertEqual(record["stage"], "done", record["error"])
         self.assertTrue(self.editor.sent)
 
+    def test_unresolved_this_or_it_is_refused_without_selection_or_gaze_target(self):
+        self.bridge.selected = []
+        self.bridge.no_view = True
+        for heard, refined in (("Make this red", "Make this red."), ("Make it bigger", "Make it bigger.")):
+            with self.subTest(heard=heard):
+                self.stt = FakeStt([heard], words=[{"text": heard.split()[1], "start": 1.0, "end": 1.2}])
+                self.refiner = FakeSession([TurnResult(json.dumps({"kind": "command", "text": refined}), False)])
+                self.editor = FakeSession([TurnResult("Changed it.", False, ["set_color"])])
+                self.editors_made = 0
+                self.start()
+                try:
+                    record = self.speak()
+                    self.assertEqual(record["stage"], "failed")
+                    self.assertIn("Couldn't tell what you meant", record["error"])
+                    self.assertFalse(self.editor.sent)
+                finally:
+                    self.service.stop()
+
+    def test_it_for_a_new_object_is_not_mistaken_for_a_missing_focus(self):
+        from gazevoice.voice.service import VoiceService
+        record = {"focus": None, "prompt": "Make a cube and put it there."}
+        self.assertFalse(VoiceService._needs_unavailable_object(record))
+
     def test_empty_here_leaves_existing_object_decision_to_editor(self):
         self.bridge.selected = []
         self.bridge.pick_reply = lambda points: [None] * len(points)
