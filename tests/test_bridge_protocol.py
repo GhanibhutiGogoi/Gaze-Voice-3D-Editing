@@ -107,6 +107,9 @@ class FakeScene:
             for u, v in points
         ]
 
+    def gaze_ground(self, u, v):
+        return None if self.view is None else [u * 10, v * 10, 0]
+
     def gaze_piece(self, uid, point):
         if uid != 116:
             return None
@@ -166,7 +169,7 @@ def handle(request, scene=None, events=None):
 
 class BridgeProtocolTest(unittest.TestCase):
     def test_constants(self):
-        self.assertEqual((protocol.BRIDGE_PORT, protocol.BRIDGE_VERSION), (9877, "0.3.3"))
+        self.assertEqual((protocol.BRIDGE_PORT, protocol.BRIDGE_VERSION), (9877, "0.3.4"))
 
     def test_decode_lines_keeps_partial(self):
         buf = bytearray(b'{"cmd": "ping"}\n{"cmd": "selection"}\n{"cmd": "sta')
@@ -184,7 +187,7 @@ class BridgeProtocolTest(unittest.TestCase):
     def test_ping(self):
         self.assertEqual(
             handle({"cmd": "ping"}, FakeScene()),
-            {"ok": True, "bridge": "0.3.3", "blender": "5.2.2", "key": "⌥ Space"},
+            {"ok": True, "bridge": "0.3.4", "blender": "5.2.2", "key": "⌥ Space"},
         )
 
     def test_selection(self):
@@ -302,6 +305,19 @@ class BridgeProtocolTest(unittest.TestCase):
 
 
 class GazeProtocolTest(unittest.TestCase):
+    def test_gaze_ground_validates_and_reports_work_plane(self):
+        scene = FakeScene()
+        self.assertEqual(handle({"cmd": "gaze_ground", "point": [0.4, 0.3]}, scene),
+                         {"ok": True, "point": [4.0, 3.0, 0], "plane": "z=0"})
+        for point in ([1.2, 0.3], [float("nan"), 0.4], [True, 0.2], [0.2]):
+            self.assertFalse(handle({"cmd": "gaze_ground", "point": point}, scene)["ok"])
+        scene.view = None
+        self.assertEqual(handle({"cmd": "gaze_ground", "point": [0.4, 0.3]}, scene)["error"], "no 3D viewport")
+        scene.view = (1840, 1100)
+        scene.gaze_ground = lambda u, v: []
+        self.assertEqual(handle({"cmd": "gaze_ground", "point": [0.4, 0.3]}, scene)["error"],
+                         "no_forward_plane_intersection")
+
     def test_gaze_view_reports_the_viewport_size(self):
         self.assertEqual(handle({"cmd": "gaze_view"}), {
             "ok": True, "width": 1840, "height": 1100, "x": 4, "y": 104, "scale": 2,

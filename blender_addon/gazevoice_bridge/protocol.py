@@ -3,7 +3,7 @@
 Newline-delimited JSON over a local TCP socket. This module never imports bpy,
 so it can be tested outside Blender.
 
-    {"cmd": "ping"}                -> {"ok": true, "bridge": "0.3.3", "blender": "5.2.2", "key": "⌥ Space"}
+    {"cmd": "ping"}                -> {"ok": true, "bridge": "0.3.4", "blender": "5.2.2", "key": "⌥ Space"}
     {"cmd": "selection"}           -> {"ok": true, "active": "Cube", "selected": ["Cube"], "mode": "OBJECT"}
     {"cmd": "status", "text": "…", -> {"ok": true}   (shown in the 3D viewport and sidebar)
      "state": "listening"}
@@ -31,6 +31,9 @@ top left. Nothing here edits the scene.
         The viewport's size and its place in its window ("x", "y" from the window's bottom left), in pixels. "scale" is
         how many of those pixels make one point of the window's own size, which is in points. "pid" is Blender's, so
         the app can ask macOS where the window is: the position Blender itself reports is off by some amount.
+    {"cmd": "gaze_ground", "point": [u, v]}
+                                   -> {"ok": true, "point": [x, y, 0], "plane": "z=0"}
+        Empty-space destination on the forward Z=0 work plane; never an object hit.
     {"cmd": "gaze_pick",           -> {"ok": true, "hits": [{"uid": 116, "name": "Eagle", "faces": 5120,
      "points": [[u, v], …]}                                   "point": [x, y, z]} or null, …]}
         One hit per point, in order; null is a miss. "uid" identifies the object for as long as Blender
@@ -82,7 +85,7 @@ import zlib
 from typing import Callable, Protocol
 
 BRIDGE_PORT = 9877
-BRIDGE_VERSION = "0.3.3"
+BRIDGE_VERSION = "0.3.4"
 MAX_STATUS = 200
 MAX_NAMES = 300
 MAX_LINE = 64 * 1024
@@ -152,6 +155,9 @@ class SceneAccess(Protocol):
 
     def gaze_pick(self, points: list[tuple[float, float]]) -> list[dict | None] | None:
         """One hit (uid, name, faces, point) or None for each (u, v); None when there is no 3D viewport."""
+
+    def gaze_ground(self, u: float, v: float) -> list[float] | None:
+        """Intersection with the horizontal Z=0 work plane; [] if none, None if no viewport."""
 
     def gaze_piece(self, uid: int, point: tuple[float, float, float]) -> dict | None:
         """face, part, piece_faces and object_faces, or None when no mesh object has this uid."""
@@ -626,6 +632,8 @@ def handle(request: dict, scene: SceneAccess, events: EventQueue) -> dict:
         return {"ok": True, "width": view[0], "height": view[1], **(scene.gaze_place() or {})}
     if command == "gaze_pick":
         return _gaze_pick(request.get("points"), scene)
+    if command == "gaze_ground":
+        return _gaze_ground(request.get("point"), scene)
     if command == "gaze_piece":
         return _gaze_piece(request.get("uid"), request.get("point"), scene)
     if command == "gaze_show":
@@ -679,6 +687,18 @@ def _gaze_pick(points, scene: SceneAccess) -> dict:
     if hits is None:
         return _no_viewport()
     return {"ok": True, "hits": hits}
+
+
+def _gaze_ground(point, scene: SceneAccess) -> dict:
+    if not (isinstance(point, (list, tuple)) and len(point) == 2 and all(_unit(c) for c in point)):
+        return {"ok": False, "error": "point must be inside the viewport (0 to 1)"}
+    location = scene.gaze_ground(float(point[0]), float(point[1]))
+    if location is None:
+        return _no_viewport()
+    if not (isinstance(location, (list, tuple)) and len(location) == 3
+            and all(_real(c) and math.isfinite(c) for c in location)):
+        return {"ok": False, "error": "no_forward_plane_intersection"}
+    return {"ok": True, "point": list(location), "plane": "z=0"}
 
 
 def _gaze_piece(uid, point, scene: SceneAccess) -> dict:

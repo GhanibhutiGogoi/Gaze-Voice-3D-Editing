@@ -388,6 +388,12 @@ class GazeLineTest(unittest.TestCase):
         self.assertEqual(self.line({"gaze": gaze, "focus": {"gaze": gaze}}),
                          "Gaze picked “this” → Eagle (80%) · “there” → nothing")
 
+    def test_an_empty_space_work_plane_point_is_shown(self):
+        gaze = {"status": "resolved", "targets": [],
+                "misses": [{"word": "there", "at": 1.2, "point": [2, 0, 3]}]}
+        self.assertEqual(self.line({"gaze": gaze, "focus": {"gaze": gaze}}),
+                         "Gaze picked “there” → work-plane point (2.00, 0.00, 3.00)")
+
     def test_nothing_to_show_is_no_line(self):
         for gaze in (None, {"status": "none", "targets": []},
                      {"status": "none", "targets": [], "radius": [], "not_on_screen": True},

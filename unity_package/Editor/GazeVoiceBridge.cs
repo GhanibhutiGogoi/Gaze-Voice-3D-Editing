@@ -17,7 +17,7 @@ using UnityEngine;
 internal static class GazeVoiceBridge
 {
     internal const int Port = 9878;
-    internal const string Version = "0.2.0";
+    internal const string Version = "0.3.1";
     const int MaxLine = 1024 * 1024;  // scripts and C# snippets arrive as one line
     const int MaxConsoleLines = 300;
     const int ShotWidth = 1280, ShotHeight = 720;
@@ -92,6 +92,7 @@ internal static class GazeVoiceBridge
         UnityEditor.Compilation.CompilationPipeline.compilationStarted += OnCompilationStarted;
         UnityEditor.Compilation.CompilationPipeline.assemblyCompilationFinished += OnAssemblyCompiled;
         EditorApplication.update += Pump;
+        GazeVoiceGaze.Initialize();
         StartListener();
         AssemblyReloadEvents.beforeAssemblyReload += BeforeReload;
         EditorApplication.quitting += StopListener;
@@ -126,6 +127,7 @@ internal static class GazeVoiceBridge
 
     static void StopListener()
     {
+        GazeVoiceGaze.Clear();
         try { listener?.Stop(); } catch { }
         listener = null;
         retryListenAt = DateTime.MinValue;
@@ -199,6 +201,7 @@ internal static class GazeVoiceBridge
                 packageError = packageRequest.Error != null ? packageRequest.Error.message : "The package couldn't be added.";
             packageRequest = null;
         }
+        GazeVoiceGaze.Tick();
         while (MainThread.TryDequeue(out var work)) work();
         while (Requests.TryDequeue(out var pending))
         {
@@ -216,7 +219,20 @@ internal static class GazeVoiceBridge
                     StartSnippet(request.arguments != null ? request.arguments.Value<string>("code") : null, pending);
                     answerLater = true;
                 }
-                else pending.Reply = JsonConvert.SerializeObject(Handle(request));
+                else if (request != null && request.cmd.StartsWith("gaze_", StringComparison.Ordinal))
+                {
+                    GazeVoiceGaze.Request(JObject.Parse(pending.Line), reply =>
+                    {
+                        pending.Reply = JsonConvert.SerializeObject(reply);
+                        pending.Done.Set();
+                    });
+                    answerLater = true;
+                }
+                else
+                {
+                    if (request != null && request.cmd == "poll") GazeVoiceGaze.Poll(JObject.Parse(pending.Line));
+                    pending.Reply = JsonConvert.SerializeObject(Handle(request));
+                }
             }
             catch (Exception ex)
             {
@@ -440,11 +456,11 @@ internal static class GazeVoiceBridge
         {
             case "ping":
                 return new { ok = true, bridge = Version, unity = Application.unityVersion, key = TalkKey(),
-                    compiling = IsCompiling() };
+                    compiling = IsCompiling(), gaze = true };
             case "selection":
                 var selected = Selection.gameObjects.Where(go => go != null).Select(go => go.name).ToArray();
                 return new { ok = true, active = Selection.activeGameObject != null ? Selection.activeGameObject.name : null,
-                    selected, mode = "editor" };
+                    selected, selected_ids = Selection.gameObjects.Where(go => go != null).Select(IdOf).ToArray(), mode = "editor" };
             case "scene_names":
                 return new { ok = true, names = Resources.FindObjectsOfTypeAll<GameObject>()
                     .Where(go => go != null && go.scene.IsValid() && go.hideFlags == HideFlags.None)
@@ -669,12 +685,12 @@ internal static class GazeVoiceBridge
 
     // Unity 6000.5 replaced instance IDs with EntityId and made the old calls compile errors.
 #if UNITY_6000_5_OR_NEWER
-    static long IdOf(UnityEngine.Object item) => (long)EntityId.ToULong(item.GetEntityId());
-    static UnityEngine.Object ObjectWithId(long id) => EditorUtility.EntityIdToObject(EntityId.FromULong((ulong)id));
+    internal static long IdOf(UnityEngine.Object item) => (long)EntityId.ToULong(item.GetEntityId());
+    internal static UnityEngine.Object ObjectWithId(long id) => EditorUtility.EntityIdToObject(EntityId.FromULong((ulong)id));
     static System.Reflection.Assembly LoadCompiled(byte[] compiled) => UnityEngine.Assemblies.CurrentAssemblies.LoadFromBytes(compiled);
 #else
-    static long IdOf(UnityEngine.Object item) => item.GetInstanceID();
-    static UnityEngine.Object ObjectWithId(long id) => EditorUtility.InstanceIDToObject((int)id);
+    internal static long IdOf(UnityEngine.Object item) => item.GetInstanceID();
+    internal static UnityEngine.Object ObjectWithId(long id) => EditorUtility.InstanceIDToObject((int)id);
     static System.Reflection.Assembly LoadCompiled(byte[] compiled) => System.Reflection.Assembly.Load(compiled);
 #endif
 
@@ -716,6 +732,24 @@ internal static class GazeVoiceBridge
         Events.Enqueue(new Dictionary<string, object> {
             ["type"] = "ptt", ["state"] = state, ["t"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0,
             ["seq"] = Interlocked.Increment(ref sequence)
+        });
+        while (Events.Count > 256) Events.TryDequeue(out _);
+    }
+
+    internal static void PushChoice(int number, string viewportId)
+    {
+        Events.Enqueue(new Dictionary<string, object> {
+            ["type"] = "gaze_choice", ["number"] = number, ["viewport_id"] = viewportId,
+            ["seq"] = Interlocked.Increment(ref sequence)
+        });
+        while (Events.Count > 256) Events.TryDequeue(out _);
+    }
+
+    internal static void PushPointer(float u, float v, string viewportId)
+    {
+        Events.Enqueue(new Dictionary<string, object> {
+            ["type"] = "pointer", ["t"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0,
+            ["seq"] = Interlocked.Increment(ref sequence), ["u"] = u, ["v"] = v, ["viewport_id"] = viewportId
         });
         while (Events.Count > 256) Events.TryDequeue(out _);
     }

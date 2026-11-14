@@ -917,9 +917,10 @@ function privacyNote(v) {
 // the command ran on the selection then, so a reading of gaze never reached the editor.
 function gazeLine(r) {
   const gaze = r.gaze;
-  if (!gaze || !gaze.targets || !gaze.targets.length) return null;
+  if (!gaze || !(gaze.targets || []).length && !(gaze.misses || []).some((miss) => miss.point)) return null;
   const said = [...gaze.targets, ...(gaze.misses || [])].sort((a, b) => a.at - b.at).map((word) => {
-    const best = word.candidates ? `${word.candidates[0].name} (${Math.round(word.candidates[0].score * 100)}%)` : "nothing";
+    const best = word.candidates ? `${word.candidates[0].name} (${Math.round(word.candidates[0].score * 100)}%)`
+      : word.point ? `work-plane point (${word.point.map((n) => Number(n).toFixed(2)).join(", ")})` : "nothing";
     return `“${word.word}” → ${best}`;
   });
   return `${r.focus && r.focus.gaze ? "Gaze picked" : "Gaze would have picked"} ${said.join(" · ")}`;
@@ -1205,7 +1206,7 @@ function renderRouting() {
     routeRow("Speech engine", "stt_engine", settings.stt_engine, [["parakeet", "Parakeet"], ["whisper", "Whisper"]]),
     ...(settings.voice_host === "unity" ? unityMcpRows(settings) : []),
     inputRow(settings.mic_device),
-    ...(settings.voice_host === "blender" ? [cameraRow(settings.camera_device), ...gazeRows(settings)] : []),
+    cameraRow(settings.camera_device), ...gazeRows(settings),
     stepRow("editor", settings),
     stepRow("refiner", settings),
     h("p", { class: "route-note", text: "Auto uses Claude Code when it's logged in, otherwise Codex. More thinking can make big builds better, but each command takes longer." }),
@@ -1216,10 +1217,10 @@ function gazeRows(settings) {
   return [
     routeRow("Gaze", "gaze_mode", settings.gaze_mode, [["off", "Off"], ["shadow", "Watch only"], ["on", "On"]]),
     routeRow("Gaze source", "gaze_source", settings.gaze_source, [["camera", "Camera"], ["mouse", "Mouse"]]),
-    h("p", { class: "route-note", text: "Gaze tells the editor what you were looking at when you say this, that or there. Watch only records it and compares it with your selection, but changes nothing. Mouse uses the pointer over Blender's 3D viewport while you hold the key. Camera uses the Gaze unit in the rack: it has to be installed and calibrated, and until then voice uses your selection. The camera is only on while voice is on, or while you calibrate or test it, and no picture from the camera is kept." }),
-    routeRow("Pictures · each unnamed target uses a little of your plan", "gaze_pictures", settings.gaze_pictures === true,
+    h("p", { class: "route-note", text: "Gaze tells the editor what you were looking at when you say this, that or there. Watch only records it and compares it with your selection, but changes nothing. Mouse uses the pointer over the active 3D viewport, with an indicator in Unity. Hold the key to speak about that spot. Camera uses the Gaze unit in the rack: it has to be installed and calibrated, and until then voice uses your selection. The camera is only on while voice is on, or while you calibrate or test it, and no picture from the camera is kept." }),
+    ...(settings.voice_host === "blender" ? [routeRow("Pictures · each unnamed target uses a little of your plan", "gaze_pictures", settings.gaze_pictures === true,
       [[false, "Off"], [true, "On"]]),
-    h("p", { class: "route-note", text: "When gaze is On and you look at a big part of a model that has nothing to name it, a picture of just that spot in Blender's viewport (never your camera) goes to a short-lived Claude Code process, which says in a few words what it shows. Only those words reach the editor. Pictures stay off until you turn them on here and press Check pictures get cleaned up on the Gaze unit; a new Claude Code version needs the check again. GazeVoice never saves a picture. Claude Code gets it for one reply, and the check looks for any copy left behind. Anthropic keeps what's sent under your account's terms. The dashboard keeps the last 20 pictures in memory so you can see what the AI was shown, and drops them when it stops." }),
+    h("p", { class: "route-note", text: "When gaze is On and you look at a big part of a model that has nothing to name it, a picture of just that spot in Blender's viewport (never your camera) goes to a short-lived Claude Code process, which says in a few words what it shows. Only those words reach the editor. Pictures stay off until you turn them on here and press Check pictures get cleaned up on the Gaze unit; a new Claude Code version needs the check again. GazeVoice never saves a picture. Claude Code gets it for one reply, and the check looks for any copy left behind. Anthropic keeps what's sent under your account's terms. The dashboard keeps the last 20 pictures in memory so you can see what the AI was shown, and drops them when it stops." })] : []),
   ];
 }
 

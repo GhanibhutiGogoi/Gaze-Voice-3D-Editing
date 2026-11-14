@@ -77,6 +77,7 @@ from .gaze import (
     ground,
     is_clear,
     marker_point,
+    area_from,
     mostly_off_screen,
     pointing_words,
     reach_on_viewport,
@@ -123,6 +124,12 @@ COULDNT_TELL = "Couldn't tell what you meant. Select it or say its name."
 _NO_NEWS = object()  # a poll that says nothing about the marker leaves it as it is
 _UNKNOWN = object()  # what Blender was last told about the marker, when it may not have heard
 _COULDNT = re.compile(r"(?:could(?:n['’]t| not)|can(?:['’]t|not))\b", re.IGNORECASE)  # the editor saying it failed
+_UNRESOLVED_OBJECT = re.compile(
+    r"\b(?:make|set|change|move|rotate|scale|resize|delete|remove|duplicate|rename|select|color|colour|paint|edit)"
+    r"\s+(?:the\s+)?(?P<pronoun>this|that|these|those|it|them)\b",
+    re.IGNORECASE,
+)
+_CREATE_THING = re.compile(r"\b(?:make|create|add|build|spawn)\s+(?:me\s+)?(?:a|an|some|new|two|three|four|five)\s+\w+", re.I)
 
 
 def changes_scene(tools: list[str]) -> bool:
@@ -190,8 +197,8 @@ class PointerTracker:
     def stop(self) -> None:
         self.alive = False
 
-    def feed(self, u: float, v: float, t: float) -> None:
-        self.track.add(GazeSample(t, u, v, 1.0))
+    def feed(self, u: float, v: float, t: float, viewport_id: str | None = None) -> None:
+        self.track.add(GazeSample(t, u, v, 1.0, viewport_id=viewport_id))
 
 
 @dataclass
@@ -467,9 +474,12 @@ class VoiceService:
         self._step(run, "Checking the microphone…")
         if mic.heard_only_silence():
             raise MicError(SILENCE_HELP)
-        if self.host == "blender":
-            self._hide_gaze()  # nothing stale on screen
+        self._hide_gaze()  # nothing stale on screen
+        if self.host == "unity" and self.gaze_mode != "off" and not hello.get("gaze"):
+            self._gaze_unavailable(run, VoiceError("Update the Unity Bridge package to use gaze."))
+        else:
             self._start_gaze(run)
+        if self.host == "blender":
             self._start_pictures(run)
         self._bridge_call({"cmd": "poll"})  # drop key presses (and mouse positions) Blender queued while voice was off
 
@@ -813,6 +823,7 @@ class VoiceService:
             "gaze": None,  # what the pointing words referred to, when gaze was asked
             "timings": {},
             "_gaze_note": "",  # shown beside the status when gaze didn't help
+            "_gaze_view": None,
             "_look": None,  # the gaze for this clip while the command waits its turn; never saved (see _keep_look)
             "_notice": None,  # the host's extra line, asked for once when the command starts, for both brains
             "_command": None,  # the command as the host understood it, when it needs neither gaze nor the refiner
@@ -854,9 +865,14 @@ class VoiceService:
 
     def _capture_context(self, record: dict) -> None:
         """What was in focus when the command was spoken (selection now; gaze later)."""
+        if self.host == "unity" and record["source"] == "voice" and self._gaze is not None and self.gaze_mode != "off":
+            view = self._bridge_call({"cmd": "gaze_view"})
+            record["_gaze_view"] = view.get("viewport_id") if view and view.get("ok") else None
         selection = self._bridge_call({"cmd": "selection"})
         if selection and selection.get("ok"):
             record["focus"] = {k: selection.get(k) for k in ("active", "selected", "mode")}
+            if "selected_ids" in selection:
+                record["focus"]["selected_ids"] = selection["selected_ids"]
         names = self._bridge_call({"cmd": "scene_names"})
         if names and names.get("ok"):
             record["names"] = list(names.get("names") or [])
@@ -924,6 +940,9 @@ class VoiceService:
         if bridge is None:
             return ack, boot
         request = {"cmd": "poll", "ack": ack, "boot": boot}
+        if self.host == "unity":
+            request["gaze_mode"], request["gaze_source"] = self.gaze_mode, self.gaze_source
+            request["gaze_live"] = self._gaze is not None and bool(self._gaze.alive)
         news = self._marker_news()
         if news is not _NO_NEWS:  # the marker rides on this poll: there is no other request or thread for it
             request["marker"] = None if news is None else list(news)
@@ -954,6 +973,14 @@ class VoiceService:
                 self.ptt(event.get("state", ""), event.get("t"))
             elif event.get("type") == "toggle":
                 self.ptt("up" if self._listening else "down", event.get("t"), via="toggle")
+            elif event.get("type") == "gaze_choice" and self.host == "unity":
+                with self._lock:
+                    choice = self._choice
+                    number = event.get("number")
+                    if (choice is not None and event.get("viewport_id") == getattr(self, "_ground_view", None)
+                            and type(number) is int and 1 <= number <= len(choice.names)):
+                        choice.number = number
+                        choice.answered.set()
             elif event.get("type") == "pointer":
                 self._pointer(event)
         self._find_blender()  # after the events, so that the talk key never waits for it
@@ -1012,7 +1039,7 @@ class VoiceService:
                 return  # no one is looking, so there is nothing to place
             self._marker_placed_at = asked = time.monotonic()
             reply = self._bridge_call({"cmd": "gaze_view"}, timeout=MARKER_ASK_SECONDS)
-            view = viewport_area(reply, self.factories.window_frame)
+            view = self._view_area(reply)
             if view is not None:  # a question that failed or ran late leaves the last answer standing, until it is too old
                 self._marker_view, self._marker_view_at = view, asked
         except Exception:  # noqa: BLE001 - see _marker_news
@@ -1035,7 +1062,8 @@ class VoiceService:
         except (KeyError, TypeError, ValueError, OverflowError):
             return
         if math.isfinite(t) and math.isfinite(u) and math.isfinite(v):
-            gaze.feed(u, v, t)
+            view = event.get("viewport_id")
+            gaze.feed(u, v, t, view if isinstance(view, str) else None)
 
     def _stt_loop(self, run: _Run) -> None:
         while True:
@@ -1149,7 +1177,14 @@ class VoiceService:
         if gaze is None or not pointing_words(record["words"], clip_start):
             return
         try:
-            record["_look"] = gaze.track.copy_between(clip_start - BEFORE_WORD, record["_t1"] + TAIL + AFTER_WORD)
+            look = gaze.track.copy_between(clip_start - BEFORE_WORD, record["_t1"] + TAIL + AFTER_WORD)
+            if self.host == "unity" and isinstance(gaze, PointerTracker):
+                scoped = GazeTrack()
+                for sample in look.between(clip_start - BEFORE_WORD, record["_t1"] + TAIL + AFTER_WORD):
+                    if record["_gaze_view"] and sample.viewport_id == record["_gaze_view"]:
+                        scoped.add(sample)
+                look = scoped
+            record["_look"] = look
         except Exception as exc:  # noqa: BLE001
             print(f"GazeVoice: gaze failed: {exc!r}", file=sys.stderr)
 
@@ -1303,20 +1338,51 @@ class VoiceService:
     def _gaze_hint(record: dict) -> str:
         return f" · {record['_gaze_note']}" if record["_gaze_note"] else ""
 
+    def _gaze_call(self, request: dict) -> dict | None:
+        if self.host == "unity":
+            request = {**request, "viewport_id": getattr(self, "_ground_view", None)}
+        return self._bridge_call(request)
+
+    def _view_area(self, reply: dict | None) -> Area | None:
+        if self.host == "unity":
+            return area_from(reply.get("screen_area")) if reply and reply.get("ok") else None
+        return viewport_area(reply, self.factories.window_frame)
+
     def _pick(self, points: list[list[float]]) -> list | None:
         """What is under each point of the viewport, or None when Blender couldn't say."""
-        reply = self._bridge_call({"cmd": "gaze_pick", "points": points})
+        reply = self._gaze_call({"cmd": "gaze_pick", "points": points})
         hits = reply.get("hits") if reply and reply.get("ok") else None
         return hits if isinstance(hits, list) else None
+
+    def _place(self, u: float, v: float) -> dict | None:
+        """Ask the active editor for the forward work-plane intersection at a fixation."""
+        reply = self._gaze_call({"cmd": "gaze_ground", "point": [u, v]})
+        return reply if reply and reply.get("ok") else None
 
     def _piece(self, candidate) -> dict | None:
         """Which part of the model the best guess is, or None when Blender couldn't say."""
         if len(candidate.point) != 3:
             return None
-        reply = self._bridge_call({"cmd": "gaze_piece", "uid": candidate.uid, "point": candidate.point})
+        reply = self._gaze_call({"cmd": "gaze_piece", "uid": candidate.uid, "point": candidate.point})
         if not reply or not reply.get("ok"):
             return None
         return {k: v for k, v in reply.items() if k != "ok"}
+
+    @staticmethod
+    def _needs_unavailable_object(record: dict) -> bool:
+        """Whether a refined command uses a demonstrative as an existing-object target without one in focus."""
+        focus = record.get("focus") or {}
+        gaze = focus.get("gaze") or {}
+        if focus.get("selected") or gaze.get("targets"):
+            return False
+        command = record.get("prompt") or record.get("refined") or ""
+        reference = _UNRESOLVED_OBJECT.search(command)
+        if not reference:
+            return False
+        # "Make a cube and put it there" refers to the newly-created cube, not a missing focus object.
+        if reference.group("pronoun").casefold() in {"it", "them"}:
+            return not any(match.end() <= reference.start() for match in _CREATE_THING.finditer(command))
+        return True
 
     def _calibration_drawing(self) -> bool:
         """Whether gaze's Test may be drawing on the viewport: what it draws there isn't voice's to cover or clear."""
@@ -1345,7 +1411,7 @@ class VoiceService:
                 return None
             if self._calibration_drawing():
                 return None  # the numbers would go over its dot, and its next redraw would take them away
-            shown = self._bridge_call({"cmd": "gaze_show", "dot": None, "ring": None, "marks": marks})
+            shown = self._gaze_call({"cmd": "gaze_show", "dot": None, "ring": None, "marks": marks})
             if not (shown and shown.get("ok")):
                 return None  # nobody can answer numbers they can't see
             self._status(WHICH_ONE, "working")
@@ -1397,6 +1463,9 @@ class VoiceService:
     @staticmethod
     def _matches_selection(gaze: dict, focus: dict | None) -> bool | None:
         """Whether the first pointing word's best guess is selected. None when there is nothing to compare."""
+        if "selected_ids" in (focus or {}) and gaze["targets"]:
+            ids = focus.get("selected_ids") or []
+            return gaze["targets"][0]["candidates"][0]["uid"] in ids if ids else None
         selected = (focus or {}).get("selected") or []
         if not selected or not gaze["targets"]:
             return None
@@ -1410,7 +1479,7 @@ class VoiceService:
         screen = getattr(gaze, "screen", None)
         if screen is None:
             return look, gaze.radius
-        view = viewport_area(self._bridge_call({"cmd": "gaze_view"}), self.factories.window_frame)
+        view = self._view_area(self._gaze_call({"cmd": "gaze_view"}))
         if view is None or not screen.holds(view):
             return None
         return track_on_viewport(look, screen, view), reach_on_viewport(gaze.radius, screen, view)
@@ -1522,9 +1591,8 @@ class VoiceService:
         """Work out what the pointing words in a spoken command refer to, from where the person was looking.
 
         The answer goes in record["gaze"]. In "on" mode it also joins the focus the brains read, and guesses that aren't
-        clear (see is_clear) are put to the person first (see _ask_which). Nothing here can stop a command: if gaze is
-        lost or breaks, or nobody says which one, the command runs on the selection. The one exception is that last case
-        with nothing selected. There is nothing to run it on, so the command fails and this returns False. If Blender
+        clear (see is_clear) are put to the person first (see _ask_which). If gaze is lost or breaks, or nobody says
+        which one, the command runs with the available selection and the editor decides whether it needs a target. If Blender
         can't be found on the screen gaze was calibrated on, that is treated like lost gaze, and the status line says so.
         When gaze found nothing because nearly all the readings landed off the screen (a calibration that reads wrong),
         the status line says to calibrate again. The counts for each pointing word go in record["gaze"]["windows"].
@@ -1535,17 +1603,23 @@ class VoiceService:
         words, clip_start = record["words"], record["_t0"] - PREROLL  # the clip _transcribe cut starts here
         if not pointing_words(words, clip_start):
             return True
+        self._ground_view = record.get("_gaze_view")
+        if self.host == "unity" and not self._ground_view:
+            record["gaze"] = {"status": "none", "targets": [], "reason": "no_viewport"}
+            record["_gaze_note"] = "No valid Scene view, using your selection"
+            return True
         placed = self._placed(gaze, record["_look"] or GazeTrack())
         if placed is None:
             record["gaze"] = {"status": "none", "targets": [], "radius": [], "matched_selection": None, "asked": False,
                               "not_on_screen": True}
-            record["_gaze_note"] = NOT_ON_SCREEN
+            record["_gaze_note"] = NOT_ON_SCREEN if self.host == "blender" else "Unity isn't on your calibrated screen, using your selection"
             return True
         look, radius = placed
         asked = settled = off_screen = False
         sent: list[int] = []  # which targets had a picture sent: the record says so, and holds nothing of the image
         try:
-            grounding = ground(words, clip_start, look, radius, self._pick, self._piece)
+            grounding = ground(words, clip_start, look, radius, self._pick, self._piece, self._place,
+                               prefer_empty_center=self.host == "unity")
             off_screen = not grounding.targets and mostly_off_screen(grounding.windows)
             if self.gaze_mode == "on" and grounding.status == "clarify":
                 asked, settled = True, self._settle(record, grounding, run)
@@ -1556,6 +1630,9 @@ class VoiceService:
             print(f"GazeVoice: gaze failed: {exc!r}", file=sys.stderr)
             found = {"status": "none", "targets": [], "radius": [], "error": repr(exc)}
         matched = self._matches_selection(found, record["focus"])
+        if self.host == "unity":
+            found["host"] = "unity"
+            found["viewport_id"] = self._ground_view
         record["gaze"] = {**found, "matched_selection": matched, "asked": asked, "pictures_sent": sent}
         if matched is not None:
             with self._lock:
@@ -1563,8 +1640,9 @@ class VoiceService:
                 self._gaze_matched += matched
         if self.gaze_mode != "on":
             return True
-        if not found["targets"]:
-            record["_gaze_note"] = GAZE_OFF_SCREEN if off_screen else GAZE_LOST
+        has_point = any(m.get("point") for m in found.get("misses", []))
+        if not found["targets"] and not has_point:
+            record["_gaze_note"] = (GAZE_OFF_SCREEN.replace("Blender", self.host_label) if off_screen else GAZE_LOST)
             return True
         if record["_stop"] or run.stop.is_set():  # "stop" was said while asking; _edit ends the command
             return True
@@ -1641,6 +1719,16 @@ class VoiceService:
         if record["_stop"] or run.stop.is_set():
             self._stopped(record, "Stopped.", run)
             return
+        if self.host == "unity" and self.gaze_mode == "on" and self._needs_unavailable_object(record):
+            self._fail(record, COULDNT_TELL)
+            return
+        if self.host == "unity" and (record["focus"] or {}).get("gaze"):
+            ids = [t["candidates"][0]["uid"] for t in record["focus"]["gaze"]["targets"]]
+            if ids:
+                valid = self._bridge_call({"cmd": "gaze_validate", "uids": ids})
+                if not valid or not valid.get("ok"):
+                    self._fail(record, "The gaze target is gone. Point at it and speak again.")
+                    return
         self._stage("editing", record)
         self._status(f"Working: {record['refined']}{self._gaze_hint(record)}", "working")
         self._bridge_call({"cmd": "begin_edit"})  # from here, the host tracks changes for undo

@@ -394,6 +394,24 @@ class BpyScene:
             })
         return hits
 
+    def gaze_ground(self, u: float, v: float) -> list[float] | None:
+        """Intersect the viewport ray with Blender's horizontal Z=0 work plane."""
+        target = _target()
+        if target is None:
+            return None
+        _window, area, region = target
+        region_3d = area.spaces.active.region_3d
+        coord = (u * region.width, (1.0 - v) * region.height)
+        origin = view3d_utils.region_2d_to_origin_3d(region, region_3d, coord)
+        direction = view3d_utils.region_2d_to_vector_3d(region, region_3d, coord)
+        if abs(direction.z) < 1e-6:
+            return []
+        distance = -origin.z / direction.z
+        if distance <= 1e-6 or distance > 10000:
+            return []
+        point = origin + distance * direction
+        return [round(float(c), 6) for c in point]
+
     def gaze_piece(self, uid: int, point: tuple[float, float, float]) -> dict | None:
         obj = next((o for o in bpy.data.objects if o.session_uid == uid), None)
         if obj is None or obj.type != "MESH":
