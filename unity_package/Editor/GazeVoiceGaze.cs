@@ -110,6 +110,25 @@ internal static class GazeVoiceGaze
 
     static void Repaint() { if (view != null) view.Repaint(); }
 
+    internal static bool TryChoose(Event ev)
+    {
+        if (ev.type != EventType.KeyDown || marks.Count == 0 || EditorGUIUtility.editingTextField) return false;
+        int number = ChoiceNumber(ev);
+        if (number < 1 || number > marks.Count) return false;
+        GazeVoiceBridge.PushChoice(number, Token);
+        ev.Use();
+        return true;
+    }
+
+    internal static int ChoiceNumber(Event ev)
+    {
+        if (ev.keyCode >= KeyCode.Alpha1 && ev.keyCode <= KeyCode.Alpha3)
+            return (int)ev.keyCode - (int)KeyCode.Alpha1 + 1;
+        if (ev.keyCode >= KeyCode.Keypad1 && ev.keyCode <= KeyCode.Keypad3)
+            return (int)ev.keyCode - (int)KeyCode.Keypad1 + 1;
+        return ev.character >= '1' && ev.character <= '3' ? ev.character - '0' : 0;
+    }
+
     static Vector2? UnitPoint(JToken token)
     {
         if (!(token is JArray a) || a.Count != 2) return null;
@@ -154,12 +173,7 @@ internal static class GazeVoiceGaze
             cameraMatrix = camera.worldToCameraMatrix; projection = camera.projectionMatrix;
             Invalidate();
         }
-        if (ev.type == EventType.KeyDown && marks.Count > 0 && !EditorGUIUtility.editingTextField
-            && ev.keyCode >= KeyCode.Alpha1 && ev.keyCode <= KeyCode.Alpha3)
-        {
-            GazeVoiceBridge.PushChoice((int)ev.keyCode - (int)KeyCode.Alpha1 + 1, Token);
-            ev.Use();
-        }
+        TryChoose(ev);
         if (GazeVoiceBridge.VoiceIsOn && EditorApplication.isFocused && EditorWindow.mouseOverWindow == current
             && content.Contains(ev.mousePosition) && ev.type != EventType.MouseLeaveWindow
             && live && mode != "off" && source == "mouse")
@@ -411,6 +425,23 @@ internal static class GazeVoiceGaze
             {
                 var p = Local(new Vector2(item.Value<float>("u"), item.Value<float>("v")));
                 GUI.Label(new Rect(p.x, p.y, 220, 25), item.Value<int>("n") + " · " + item.Value<string>("name"), EditorStyles.helpBox);
+            }
+            if (marks.Count > 0)
+            {
+                // A fixed legend keeps the choices readable when nearby objects' labels overlap.
+                float width = Mathf.Min(340f, Mathf.Max(180f, content.width - 24f));
+                float height = 30f + marks.Count * 22f;
+                var panel = new Rect(content.x + 12f, Mathf.Max(content.y + 12f, content.yMax - height - 12f),
+                    width, height);
+                GUI.Box(panel, GUIContent.none, EditorStyles.helpBox);
+                GUI.Label(new Rect(panel.x + 8f, panel.y + 5f, width - 16f, 20f),
+                    "Which one? Say the number.", EditorStyles.boldLabel);
+                for (int i = 0; i < marks.Count; i++)
+                {
+                    var item = marks[i];
+                    GUI.Label(new Rect(panel.x + 8f, panel.y + 28f + i * 22f, width - 16f, 20f),
+                        item.Value<int>("n") + " · " + item.Value<string>("name"), EditorStyles.label);
+                }
             }
         }
         finally { Handles.EndGUI(); }

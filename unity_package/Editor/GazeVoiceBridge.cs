@@ -17,7 +17,7 @@ using UnityEngine;
 internal static class GazeVoiceBridge
 {
     internal const int Port = 9878;
-    internal const string Version = "0.3.1";
+    internal const string Version = "0.3.3";
     const int MaxLine = 1024 * 1024;  // scripts and C# snippets arrive as one line
     const int MaxConsoleLines = 300;
     const int ShotWidth = 1280, ShotHeight = 720;
