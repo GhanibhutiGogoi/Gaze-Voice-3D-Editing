@@ -220,7 +220,7 @@ class ControlCenter:
     def _voice_config_now(self, sources: dict[str, str | None]) -> tuple:
         s = self.ctx.settings
         # Only voice that would use the camera cares: a Calibrate beside any other voice needs no restart.
-        wants_camera = s.voice_host == "blender" and s.gaze_mode != "off" and s.gaze_source == "camera"
+        wants_camera = s.gaze_mode != "off" and s.gaze_source == "camera"
         return (s.voice_host, s.unity_mcp_command, s.unity_mcp_args,
                 sources["refiner"], sources["editor"], s.stt_engine, s.mic_device, s.gaze_mode, s.gaze_source,
                 s.gaze_pictures, s.camera_device, wants_camera and camera_gaze_installed(self.ctx.paths),

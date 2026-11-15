@@ -21,6 +21,7 @@ internal sealed class GazeVoiceWindow : EditorWindow
         var rect = GUILayoutUtility.GetRect(0, 44, GUILayout.ExpandWidth(true));
         GUI.Box(rect, talking ? "Listening… release to send" : "Hold to talk", EditorStyles.miniButton);
         var e = Event.current;
+        if (GazeVoiceGaze.TryChoose(e)) return;
         if (e.type == EventType.MouseDown && e.button == 0 && rect.Contains(e.mousePosition))
         {
             talking = true;
