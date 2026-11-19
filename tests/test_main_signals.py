@@ -65,22 +65,35 @@ class StopSignalTest(unittest.TestCase):
         if hangup is not None:
             signal.signal(signal.SIGHUP, hangup)
         seen = []
+        serving = threading.Event()
+        make_server = entry.make_server
+
+        def ready_server(*args, **kwargs):
+            server = make_server(*args, **kwargs)
+            serve_forever = server.serve_forever
+
+            def serve():
+                serving.set()
+                serve_forever()
+
+            server.serve_forever = serve
+            return server
 
         def sender():
-            deadline = time.monotonic() + 3
-            while signal.getsignal(signal.SIGTERM) is stand_in and time.monotonic() < deadline:
-                time.sleep(0.02)
-            time.sleep(0.3)  # let the server start serving
-            seen.append(send(stand_in))
+            if serving.wait(20):
+                seen.append(send(stand_in))
 
         thread = threading.Thread(target=sender, daemon=True)
         thread.start()
-        with mock.patch.object(entry, "build_center", return_value=center), contextlib.redirect_stdout(io.StringIO()):
+        with (mock.patch.object(entry, "build_center", return_value=center),
+              mock.patch.object(entry, "make_server", side_effect=ready_server),
+              contextlib.redirect_stdout(io.StringIO())):
             try:
                 code = entry.main(["--port", "0", "--no-browser"])
             except KeyboardInterrupt:  # a signal that cut the shutdown short
                 code = "interrupted"
         thread.join(5)
+        self.assertFalse(thread.is_alive(), "signal sender did not finish")
         return code, seen
 
     def stop_with(self, signum):
@@ -123,6 +136,25 @@ class StopSignalTest(unittest.TestCase):
 
         code, _ = self.run_main(send, training)
         self.assertEqual((code, training.shutdowns, training.finished), (0, 1, True))
+
+
+class StartupSignalTest(unittest.TestCase):
+    def test_a_signal_during_handler_registration_still_closes_the_server(self):
+        center, server = mock.Mock(), mock.Mock()
+        server.server_address = ("127.0.0.1", 8977)
+
+        def register(signum, handler):
+            if signum == signal.SIGTERM and callable(handler):
+                handler(signum, None)
+
+        with (mock.patch.object(entry, "build_center", return_value=center),
+              mock.patch.object(entry, "make_server", return_value=server),
+              mock.patch.object(entry.signal, "signal", side_effect=register),
+              contextlib.redirect_stdout(io.StringIO())):
+            self.assertEqual(entry.main(["--port", "0", "--no-browser"]), 0)
+        center.shutdown.assert_called_once_with()
+        server.server_close.assert_called_once_with()
+        server.serve_forever.assert_not_called()
 
 
 if __name__ == "__main__":

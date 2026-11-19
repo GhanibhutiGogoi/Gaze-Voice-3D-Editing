@@ -2361,10 +2361,19 @@ class GazeMarkerTest(VoiceTestBase):
     # --- finding Blender on the screen -----------------------------------------------------------
     def test_where_blender_is_asked_at_most_once_a_second(self):
         self.assertEqual(voice_service.MARKER_PLACE_SECONDS, 1.0)
-        self.start()
-        wait_for(lambda: [0.25, 0.5] in self.markers())
-        self.settle(10)  # half a second or more of polling
-        self.assertEqual(self.bridge.calls.count("gaze_view"), 1)
+        # Patch only the service's clock: polling and test deadlines still use real time.
+        with patch.object(voice_service, "time", wraps=time) as timer:
+            timer.monotonic.return_value = 10.0
+            self.start()
+            wait_for(lambda: [0.25, 0.5] in self.markers())
+            timer.monotonic.return_value = 10.999
+            self.settle(10)
+            self.assertEqual(self.bridge.calls.count("gaze_view"), 1)
+            timer.monotonic.return_value = 11.0
+            wait_for(lambda: self.bridge.calls.count("gaze_view") == 2)
+            self.settle(4)
+            self.assertEqual(self.bridge.calls.count("gaze_view"), 2)
+            self.service.stop()
 
     def test_it_is_asked_again_to_notice_a_window_that_moved(self):
         self.gaze = FakeGaze(screen=Area(0, 0, 1840, 550))
@@ -2443,12 +2452,16 @@ class GazeMarkerTest(VoiceTestBase):
             return real(cmd, req)
 
         self.bridge.gaze = gaze
-        with patch.object(voice_service, "MARKER_PLACE_SECONDS", 0.5):  # so it is stale after 1 s, not before
+        with patch.object(voice_service, "time", wraps=time) as timer:
+            timer.monotonic.return_value = 10.0
             self.start()
             wait_for(lambda: [0.25, 0.5] in self.markers())
+            timer.monotonic.return_value = 11.0
             wait_for(lambda: len(asked) >= 2)
-            self.settle(4)  # a fifth of a second: well before the answer it already has is too old to use
+            timer.monotonic.return_value = 11.999
+            self.settle(4)  # the last good answer is still less than two seconds old
             self.assertEqual(self.markers(), [None, [0.25, 0.5]])
+            self.service.stop()
 
     def test_a_viewport_not_heard_about_for_two_seconds_is_not_used_any_longer(self):
         real = self.bridge.gaze

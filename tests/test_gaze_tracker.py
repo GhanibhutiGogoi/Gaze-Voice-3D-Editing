@@ -1146,11 +1146,28 @@ class GazeTrackerTest(unittest.TestCase):
             self.tracker.stop()
         self.tmp.cleanup()
 
-    def make(self, calibration="default", args=FAKE, **kw) -> GazeTracker:
+    def make(self, calibration="default", args=FAKE, worker=WORKER, **kw) -> GazeTracker:
         if calibration == "default":
             calibration = a_calibration()
-        self.tracker = GazeTracker(Path(sys.executable), WORKER, "1", calibration, extra_args=args, **kw)
+        self.tracker = GazeTracker(Path(sys.executable), worker, "1", calibration, extra_args=args, **kw)
         return self.tracker
+
+    def collecting_tracker(self):
+        worker = Path(__file__).parent / "fixtures" / "reporting_gaze_worker.py"
+        tracker = self.make(calibration=None, worker=worker)
+        tracker.start(timeout=20)
+        return tracker
+
+    def collect_readings(self, tracker, uv, count, check=False):
+        # Synchronize with rows actually kept in the subprocess, regardless of frame rate or runner load.
+        tracker.collect(uv, check=check)
+        deadline = time.monotonic() + 20
+        while True:
+            reply = tracker._next_reply(deadline, "calibration readings")
+            if (reply.get("target") == list(uv) and reply.get("check") == check
+                    and reply.get("collected", 0) >= count):
+                break
+        tracker.stop_collect()
 
     def test_the_tracker_fills_its_track_from_the_worker(self):
         tracker = self.make()
@@ -1375,15 +1392,10 @@ class GazeTrackerTest(unittest.TestCase):
         self.assertFalse(tracker.alive)
 
     def test_collecting_then_fitting_goes_through_the_worker(self):
-        tracker = self.make(calibration=None)
-        tracker.start(timeout=20)
+        tracker = self.collecting_tracker()
         for uv in ((0.2, 0.3), (0.8, 0.7)):
-            tracker.collect(uv)
-            time.sleep(1.2)
-            tracker.stop_collect()
-        tracker.collect((0.5, 0.5), check=True)
-        time.sleep(0.5)
-        tracker.stop_collect()
+            self.collect_readings(tracker, uv, 24)
+        self.collect_readings(tracker, (0.5, 0.5), 10, check=True)
         result = tracker.fit(timeout=20, screen_width_cm=29.05)
         gaze_model.validate(result["fit"])
         self.assertEqual(result["screen_width_cm"], 29.05)  # the width crossed the pipe to the worker
@@ -1430,11 +1442,8 @@ class GazeTrackerTest(unittest.TestCase):
         self.assertEqual(kept["counts"]["frames"], len([d for d in dots if d]))
 
     def test_a_fit_with_no_check_dots_says_it_was_not_held_out(self):
-        tracker = self.make(calibration=None)
-        tracker.start(timeout=20)
-        tracker.collect((0.4, 0.4))
-        time.sleep(1.5)
-        tracker.stop_collect()
+        tracker = self.collecting_tracker()
+        self.collect_readings(tracker, (0.4, 0.4), 36)
         result = tracker.fit(timeout=20)
         self.assertFalse(result["held_out"])
         self.assertEqual(result["check_rows"], 0)
@@ -1449,11 +1458,8 @@ class GazeTrackerTest(unittest.TestCase):
         self.assertTrue(tracker.alive)
 
     def test_a_fitted_model_can_be_loaded_to_start_the_stream(self):
-        tracker = self.make(calibration=None)
-        tracker.start(timeout=20)
-        tracker.collect((0.3, 0.3))
-        time.sleep(1.5)
-        tracker.stop_collect()
+        tracker = self.collecting_tracker()
+        self.collect_readings(tracker, (0.3, 0.3), 36)
         result = tracker.fit(timeout=20)
         tracker.load({"model": result["fit"], "check": result["check"]})
         self.assertEqual(tracker.radius, tuple(result["check"]["radius"]))
