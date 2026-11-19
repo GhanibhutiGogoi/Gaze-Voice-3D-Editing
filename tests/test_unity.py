@@ -49,7 +49,7 @@ class SetupRunner(FakeRunner):
             log = Path(args[args.index("-logFile") + 1])
             log.write_text(self.create_log)
             if self.create_code == 0:
-                fake_unity_project(project, version=args[0].split("/")[-5])
+                fake_unity_project(project, version=Path(args[0]).parents[3].name)
             else:
                 project.mkdir(parents=True, exist_ok=True)  # a failed run can leave a stub behind
             return CommandResult(args, self.create_code, "", "")
@@ -180,7 +180,7 @@ class UnityUnitTest(unittest.TestCase):
         state = env.unit(Unity).check()
         self.assertEqual(state.health, Health.MISSING)
         self.assertFalse(state.offers("setup"))
-        self.assertIn("brew.sh", state.summary)
+        self.assertIn("unity.com/download", state.summary)
 
     def test_the_confirm_lists_only_whats_left(self):
         self.env.hub.mkdir()
@@ -511,3 +511,14 @@ class ProjectUnitTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# These fixtures describe macOS; Windows adapters have their own tests.
+def setUpModule():
+    global _mac_adapters
+    import importlib
+    from .helpers import macos_adapters
+    _mac_adapters = macos_adapters(*(importlib.import_module(name) for name in ['gazevoice.components.unity']))
+
+def tearDownModule():
+    _mac_adapters.close()

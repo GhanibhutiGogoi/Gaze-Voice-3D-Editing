@@ -10,6 +10,8 @@ an output pipe open, and nothing ever sits waiting for keyboard input.
 
 from __future__ import annotations
 
+from .platforms import KILL, command_argv, process_options, signal_process_tree, spawn
+
 import os
 import shutil
 import signal
@@ -53,7 +55,7 @@ def _as_text(value: str | bytes | None) -> str:
 
 def _kill_group(proc: subprocess.Popen) -> None:
     try:
-        os.killpg(proc.pid, signal.SIGKILL)
+        signal_process_tree(proc, KILL)
     except (ProcessLookupError, PermissionError):
         proc.kill()
 
@@ -75,8 +77,8 @@ class CommandRunner:
     ) -> CommandResult:
         args = tuple(str(a) for a in argv)
         try:
-            proc = subprocess.Popen(
-                args,
+            proc = spawn(
+                command_argv(args),
                 stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -84,10 +86,12 @@ class CommandRunner:
                 errors="replace",
                 env=_merged_env(env),
                 cwd=cwd,
-                start_new_session=True,
+                **process_options(),
             )
         except FileNotFoundError:
             return CommandResult(args, NOT_FOUND, "", f"{args[0]}: not found")
+        except OSError as exc:
+            return CommandResult(args, 126, "", f"{args[0]}: could not start: {exc}")
         try:
             stdout, stderr = proc.communicate(input=input_text, timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -111,8 +115,8 @@ class CommandRunner:
         """Run a command, passing each output line (stdout and stderr merged) to on_line."""
         args = tuple(str(a) for a in argv)
         try:
-            proc = subprocess.Popen(
-                args,
+            proc = spawn(
+                command_argv(args),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -121,11 +125,14 @@ class CommandRunner:
                 bufsize=1,
                 env=_merged_env(env),
                 cwd=cwd,
-                start_new_session=True,
+                **process_options(),
             )
         except FileNotFoundError:
             on_line(f"{args[0]}: not found")
             return NOT_FOUND
+        except OSError as exc:
+            on_line(f"{args[0]}: could not start: {exc}")
+            return 126
 
         timed_out = threading.Event()
         timer = None

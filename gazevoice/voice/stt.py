@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from ..platforms import KILL, command_argv, process_options, signal_process_tree, spawn
+from ..speech_worker import failure_message
+
 import collections
 import itertools
 import json
@@ -42,19 +45,25 @@ class SpeechService:
     def start(self, timeout: float = 180.0) -> float:
         """Start the worker and wait for the model to load. Returns the load time in seconds."""
         try:
-            self.proc = subprocess.Popen(
-                self.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                encoding="utf-8", errors="replace", bufsize=1, env=self.env, start_new_session=True,
+            self.proc = spawn(
+                command_argv(self.argv), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                encoding="utf-8", errors="replace", bufsize=1, env=self.env, **process_options(),
             )
         except FileNotFoundError as exc:
             raise SpeechError("Speech-to-text isn't installed. Install it on the Speech-to-text unit.") from exc
+        except OSError as exc:
+            raise SpeechError(f"Speech-to-text could not start: {exc}") from exc
         self._threads = [
             threading.Thread(target=self._read_stdout, daemon=True, name="stt-out"),
             threading.Thread(target=self._read_stderr, daemon=True, name="stt-err"),
         ]
         for thread in self._threads:
             thread.start()
-        reply = self._next_reply(timeout, waiting_for="the speech model to load")
+        try:
+            reply = self._next_reply(timeout, waiting_for="the speech model to load")
+        except BaseException:
+            self.stop()
+            raise
         if not reply.get("ready"):
             self.stop()
             raise SpeechError(f"Speech-to-text didn't start: {reply}")
@@ -78,7 +87,10 @@ class SpeechService:
             except queue.Empty:
                 if self.proc is None or self.proc.poll() is not None:
                     code = self.proc.returncode if self.proc else "?"
-                    raise SpeechError(f"Speech-to-text stopped (exit {code}): {self._stderr_tail()}") from None
+                    detail = self._stderr_tail()
+                    if isinstance(code, int) and code & 0xFFFFFFFF == 0xC0000005:
+                        raise SpeechError(failure_message(code, detail)) from None
+                    raise SpeechError(f"Speech-to-text stopped (exit {code}): {detail}") from None
                 if time.monotonic() > deadline:
                     raise SpeechError(f"Timed out waiting for {waiting_for}.") from None
                 continue
@@ -124,7 +136,7 @@ class SpeechService:
             proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
+                signal_process_tree(proc, KILL)
             except (ProcessLookupError, PermissionError):
                 proc.kill()
             proc.wait(timeout=2)

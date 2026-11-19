@@ -1,3 +1,4 @@
+from gazevoice.platforms import venv_executable
 import http.client
 import json
 import threading
@@ -232,7 +233,7 @@ class VoiceApiTest(unittest.TestCase):
 
     def install_gaze_but_for_the_calibration(self):
         paths = self.t.paths
-        python = paths.venvs / "gaze" / "bin" / "python"
+        python = venv_executable(paths.venvs / "gaze")
         python.parent.mkdir(parents=True)
         python.write_text("")
         paths.gaze_model_file.parent.mkdir(parents=True, exist_ok=True)

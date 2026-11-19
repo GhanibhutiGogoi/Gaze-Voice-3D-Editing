@@ -161,7 +161,7 @@ class MicrophoneTest(unittest.TestCase):
         self.mic.record = lambda device, out, seconds: write_wav(out, 0.0)
         with self.assertRaises(JobError) as caught:
             self.mic.run_action("test", make_job("microphone"))
-        self.assertIn("Privacy & Security", str(caught.exception))
+        self.assertIn("privacy & security", str(caught.exception).lower())
         self.assertEqual(self.mic.check().health, Health.INSTALLED)
 
     def test_default_recorder_runs_ffmpeg(self):
@@ -173,8 +173,19 @@ class MicrophoneTest(unittest.TestCase):
         with self.assertRaises(JobError) as caught:
             self.mic.run_action("test", make_job("microphone"))
         self.assertIn(tuple(argv), self.t.runner.calls)
-        self.assertIn("Privacy & Security", str(caught.exception))
+        self.assertIn("privacy & security", str(caught.exception).lower())
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# These fixtures describe macOS; Windows adapters have their own tests.
+def setUpModule():
+    global _mac_adapters
+    import importlib
+    from .helpers import macos_adapters
+    _mac_adapters = macos_adapters(*(importlib.import_module(name) for name in ['gazevoice.components.microphone']))
+
+def tearDownModule():
+    _mac_adapters.close()

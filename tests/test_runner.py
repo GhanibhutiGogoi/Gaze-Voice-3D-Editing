@@ -46,7 +46,8 @@ class CommandRunnerTest(unittest.TestCase):
         # `sleep` is a grandchild holding the output pipe open; it must die too.
         lines = []
         started = time.monotonic()
-        code = CommandRunner().stream(["/bin/sh", "-c", "echo start; sleep 30"], lines.append, timeout=1.0)
+        script = "import subprocess,sys; print('start',flush=True); subprocess.run([sys.executable,'-c','import time; time.sleep(30)'])"
+        code = CommandRunner().stream([sys.executable, "-c", script], lines.append, timeout=1.0)
         self.assertLess(time.monotonic() - started, 10)
         self.assertEqual(code, 124)
         self.assertEqual(lines[0], "start")
@@ -54,7 +55,8 @@ class CommandRunnerTest(unittest.TestCase):
 
     def test_run_timeout_kills_children(self):
         started = time.monotonic()
-        r = CommandRunner().run(["/bin/sh", "-c", "sleep 30 & wait"], timeout=0.5)
+        script = "import subprocess,sys; subprocess.run([sys.executable,'-c','import time; time.sleep(30)'])"
+        r = CommandRunner().run([sys.executable, "-c", script], timeout=0.5)
         self.assertLess(time.monotonic() - started, 10)
         self.assertEqual(r.returncode, 124)
 

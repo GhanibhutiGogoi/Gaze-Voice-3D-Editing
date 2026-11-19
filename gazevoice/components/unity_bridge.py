@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from ..platforms import app_data, is_windows
 
 from ..blender_socket import bridge_request, port_open
 from ..jobs import Job, JobError
@@ -15,6 +16,8 @@ from .unity import is_running, project_problem
 
 BRIDGE_PORT = 9878  # matches Port in unity_package/Editor/GazeVoiceBridge.cs
 EDITOR_LOG = Path.home() / "Library" / "Logs" / "Unity" / "Editor.log"
+if is_windows():
+    EDITOR_LOG = app_data("Unity", "Editor", "Editor.log")
 LOG_TAIL_BYTES = 512 * 1024
 CSHARP_CHECK = "return Application.unityVersion;"
 _OUR_COMPILE_ERROR = re.compile(rf"^.*{re.escape(PACKAGE_NAME)}.*error CS\d+.*$", re.MULTILINE)

@@ -149,7 +149,7 @@ class ServerTest(unittest.TestCase):
         self.assertNotRegex(body, r"\sstyle\s*=", "the policy has no inline styles")
         self.assertNotIn("<script>", body)
         self.assertIn("No picture is saved", body)  # the ready card still says so
-        self.assertIn("stay on this Mac", body)  # and where the numbers go
+        self.assertIn("stay on this computer", body)  # and where the numbers go
         for word in ("outline", "dots", "click the circle"):
             self.assertIn(word, body)
 
@@ -1160,6 +1160,9 @@ class RealTrainingCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls._wrapper_dir = tempfile.TemporaryDirectory()
+        if sys.platform == "win32":
+            cls.wrapper = FIXTURE
+            return
         cls.wrapper = Path(cls._wrapper_dir.name) / "mlagents-learn"
         cls.wrapper.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(FIXTURE))} \"$@\"\n")
         cls.wrapper.chmod(0o755)
@@ -1175,7 +1178,13 @@ class RealTrainingCase(unittest.TestCase):
         self.unit = MLAgents(self.t.ctx)
         self.unit.python.parent.mkdir(parents=True)
         self.unit.python.write_text("")
-        self.unit.mlagents_learn.symlink_to(self.wrapper)
+        if sys.platform == "win32":
+            from unittest.mock import PropertyMock
+            prop = mock.patch.object(MLAgents, "mlagents_learn", new_callable=PropertyMock, return_value=FIXTURE)
+            prop.start()
+            self.addCleanup(prop.stop)
+        else:
+            self.unit.mlagents_learn.symlink_to(self.wrapper)
         self.t.runner.add([str(self.unit.python), "-c", "import mlagents.trainers"])
         self.project = fake_unity_project(self.t.root / "Game")
         self.fake = self.t.root / "fake"
@@ -1202,7 +1211,7 @@ class TrainingShutdownTest(RealTrainingCase):
                 waiting = event
         self.assertIsNotNone(waiting, "the unit should say it is waiting, and offer Stop")
         wait_for(self, (self.fake / "ready").exists, what="the fake mlagents-learn to listen")
-        main, helper = int((self.fake / "main.pid").read_text()), int((self.fake / "helper.pid").read_text())
+        main, helper = int((self.fake / "main.pid").read_text(encoding="utf-8")), int((self.fake / "helper.pid").read_text(encoding="utf-8"))
 
         self.center.shutdown()
 

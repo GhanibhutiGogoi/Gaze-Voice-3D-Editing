@@ -1,3 +1,4 @@
+from gazevoice.platforms import KILL, spawn, process_options, signal_process_tree
 import contextlib
 import io
 import json
@@ -73,11 +74,8 @@ def wait_for(condition, seconds=10.0):
 
 
 def gone(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    return False
+    from .helpers import process_alive
+    return not process_alive(pid)
 
 
 STAND_IN_CAMERA = """\
@@ -633,7 +631,7 @@ class WholeRunTest(unittest.TestCase):
         self.look(self.check_rows[:3], self.check_targets[:3], check=True)
         self.look(self.rows[-1:], self.targets[-1:])
         self.session.handle({"cmd": "fit"})
-        kept = json.loads(self.readings.read_text())
+        kept = json.loads(self.readings.read_text(encoding="utf-8"))
         self.assertEqual(kept["held_back"], [False, False, True, True, True, False])
         self.assertEqual(kept["rows"], [[round(v, 5) for v in row[:12]]
                                         for row in self.rows[:2] + self.check_rows[:3] + self.rows[-1:]])
@@ -658,7 +656,7 @@ class WholeRunTest(unittest.TestCase):
 
     def test_the_numbers_of_the_run_are_kept(self):
         self.whole_run()
-        kept = json.loads(self.readings.read_text())
+        kept = json.loads(self.readings.read_text(encoding="utf-8"))
         count = len(self.rows) + len(self.check_rows)
         self.assertEqual(set(kept), {"names", "rows", "targets", "held_back", "counts", "when",
                                      "size", "frame_names", "frames", "row_ms", "eye_score_names", "eye_scores",
@@ -678,7 +676,7 @@ class WholeRunTest(unittest.TestCase):
         before = time.time()
         self.whole_run()
         after = time.time()
-        self.assertTrue(before <= json.loads(self.readings.read_text())["when"] <= after)
+        self.assertTrue(before <= json.loads(self.readings.read_text(encoding="utf-8"))["when"] <= after)
 
     def test_a_run_that_failed_is_kept_too(self):
         self.session.handle({"cmd": "collect", "uv": [0.5, 0.5]})
@@ -686,26 +684,26 @@ class WholeRunTest(unittest.TestCase):
         self.session.see(1.1, gaze_worker.Observation(self.rows[0], 0.9), light=20)
         self.session.handle({"cmd": "fit"})
         self.assertIn("Not enough face readings", self.sent[-1]["error"])
-        kept = json.loads(self.readings.read_text())
+        kept = json.loads(self.readings.read_text(encoding="utf-8"))
         self.assertEqual(len(kept["rows"]), 1)
         self.assertEqual(kept["counts"]["no_face"], 1)
 
     def test_check_rows_alone_are_still_worth_keeping(self):
         self.look(self.check_rows[:3], self.check_targets[:3], check=True)
         self.session.handle({"cmd": "fit"})
-        self.assertEqual(json.loads(self.readings.read_text())["held_back"], [True] * 3)
+        self.assertEqual(json.loads(self.readings.read_text(encoding="utf-8"))["held_back"], [True] * 3)
 
     def test_each_run_replaces_the_last(self):
         self.whole_run()
         self.look(self.rows[:2], self.targets[:2])
         self.session.handle({"cmd": "fit"})
-        self.assertEqual(len(json.loads(self.readings.read_text())["rows"]), 2)
+        self.assertEqual(len(json.loads(self.readings.read_text(encoding="utf-8"))["rows"]), 2)
 
     def test_a_run_with_no_rows_and_no_frames_leaves_the_last_one_alone(self):
         self.readings.parent.mkdir()
         self.readings.write_text("the last run")
         self.session.handle({"cmd": "fit"})
-        self.assertEqual(self.readings.read_text(), "the last run")
+        self.assertEqual(self.readings.read_text(encoding="utf-8"), "the last run")
 
     def test_without_the_flag_nothing_is_kept(self):
         session = gaze_worker.Session(self.sent.append)
@@ -720,7 +718,7 @@ class WholeRunTest(unittest.TestCase):
         with unittest.mock.patch("os.replace", side_effect=OSError("disk full")), contextlib.redirect_stderr(io.StringIO()):
             reply = self.whole_run()
         self.assertIn("fit", reply)  # keeping the numbers is never worth losing the calibration for
-        self.assertEqual(self.readings.read_text(), "the last run")
+        self.assertEqual(self.readings.read_text(encoding="utf-8"), "the last run")
         self.assertEqual(os.listdir(self.readings.parent), [self.readings.name])
 
     def test_a_place_that_cant_be_written_doesnt_stop_the_fit(self):
@@ -731,6 +729,7 @@ class WholeRunTest(unittest.TestCase):
             self.assertIn("fit", self.whole_run())
         self.assertIn("readings", said.getvalue())
 
+    @unittest.skipIf(os.name == "nt", "POSIX mode bits; Windows inherits user profile ACLs")
     def test_only_this_person_can_read_it(self):
         self.whole_run()
         self.assertEqual(self.readings.stat().st_mode & 0o777, 0o600)
@@ -761,7 +760,7 @@ class EachFrameKeptTest(unittest.TestCase):
 
     def fit(self):
         self.session.handle({"cmd": "fit"})
-        return json.loads(self.readings.read_text())
+        return json.loads(self.readings.read_text(encoding="utf-8"))
 
     def test_the_guide_frames_are_dot_0_and_the_dots_count_up_from_1(self):
         self.session.handle({"cmd": "guide", "on": True})
@@ -799,7 +798,7 @@ class EachFrameKeptTest(unittest.TestCase):
         self.frame(2.5, "half-read", light=12.0)
         self.session.handle({"cmd": "fit"})
         self.assertIn("Not enough face readings", self.sent[-1]["error"])
-        kept = json.loads(self.readings.read_text())  # the timeline of the run where nothing was seen is the one wanted
+        kept = json.loads(self.readings.read_text(encoding="utf-8"))  # the timeline of the run where nothing was seen is the one wanted
         self.assertEqual(kept["frames"], [[0, 0, "no face", 100.0], [1000, 1, "no face", 12.0], [1500, 1, "half-read", 12.0]])
         self.assertEqual((kept["rows"], kept["targets"], kept["held_back"]), ([], [], []))
         self.assertEqual((kept["counts"]["frames"], kept["counts"]["no_face"], kept["counts"]["half_read"]), (2, 1, 1))
@@ -923,7 +922,7 @@ class WhatEachRowKeepsTest(unittest.TestCase):
         for t in at:
             self.session.see(t, self.seen())
         self.session.handle({"cmd": "fit"})
-        return json.loads(self.readings.read_text())
+        return json.loads(self.readings.read_text(encoding="utf-8"))
 
     def test_each_row_says_when_it_came_on_the_frames_clock(self):
         kept = self.run_of(10.0, 10.25, 10.5)
@@ -957,7 +956,7 @@ class WhatEachRowKeepsTest(unittest.TestCase):
         self.session.handle({"cmd": "collect", "uv": [0.3, 0.3]})
         self.session.see(1.0, gaze_worker.Observation([0.0] * gaze_model.FEATURE_COUNT, 0.9))  # as the fake face is
         self.session.handle({"cmd": "fit"})
-        kept = json.loads(self.readings.read_text())
+        kept = json.loads(self.readings.read_text(encoding="utf-8"))
         self.assertEqual((kept["row_ms"], kept["eye_scores"], kept["transforms"], kept["face_px"], kept["eye_points"],
                           kept["boxes"]), ([0], [None], [None], [None], [None], [None]))
 
@@ -974,7 +973,7 @@ class WhatEachRowKeepsTest(unittest.TestCase):
         self.session.handle({"cmd": "collect", "uv": [0.3, 0.3]})
         self.session.see(1.0, gaze_worker.FakeDetector().look(b""))
         self.session.handle({"cmd": "fit"})
-        self.assertEqual(json.loads(self.readings.read_text())["boxes"], [list(gaze_worker.FAKE_BOX)])
+        self.assertEqual(json.loads(self.readings.read_text(encoding="utf-8"))["boxes"], [list(gaze_worker.FAKE_BOX)])
 
     def test_a_number_that_isnt_one_is_none_and_the_file_is_still_written(self):
         # JSON has no not-a-number, and the file is written whole or not at all: one would lose the run.
@@ -1033,7 +1032,7 @@ class FrameSourceTest(unittest.TestCase):
             source = self.source(f"import os, time, sys; open({str(pidfile)!r}, 'w').write(str(os.getpid())); "
                                  "sys.stdout.buffer.write(bytes(36)); sys.stdout.buffer.flush(); time.sleep(600)")
             self.assertEqual(len(source.read()), 36)
-            pid = int(pidfile.read_text())
+            pid = int(pidfile.read_text(encoding="utf-8"))
             source.close()
             self.assertTrue(gone(pid))
             self.assertIsNone(source.read())
@@ -1050,7 +1049,7 @@ class FrameSourceTest(unittest.TestCase):
         began = time.monotonic()
         source.close()
         self.assertLess(time.monotonic() - began, gaze_worker.STOP_WAIT * 0.6)
-        self.assertEqual(source.exit_code, 0)  # it left by itself, and wasn't killed
+        self.assertEqual(source.exit_code, 1 if os.name == "nt" else 0)  # it left by itself, and wasn't killed
 
     def test_a_command_that_isnt_there_says_so(self):
         with self.assertRaises(gaze_worker.CameraError) as caught:
@@ -1106,10 +1105,10 @@ class StopDuringLoadTest(unittest.TestCase):
         import subprocess
 
         env = dict(os.environ, PYTHONPATH=str(WORKER.parents[1]))
-        proc = subprocess.Popen(
+        proc = spawn(
             [sys.executable, "-c", SLOW_LOAD, str(self.opened), str(load_seconds), self.camera],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
-            start_new_session=True,
+            **process_options(),
         )
         self.addCleanup(self.reap, proc)
         return proc
@@ -1117,7 +1116,7 @@ class StopDuringLoadTest(unittest.TestCase):
     @staticmethod
     def reap(proc):
         if proc.poll() is None:
-            os.killpg(proc.pid, signal.SIGKILL)  # the worker leads its own group, and the stand-in camera is in it
+            signal_process_tree(proc, KILL)  # the worker leads its own group, and the stand-in camera is in it
         proc.wait()
         proc.stdout.close()
         proc.stderr.close()
@@ -1287,7 +1286,7 @@ class GazeTrackerTest(unittest.TestCase):
             args, pidfile = self.stand_in(code)
             tracker = self.make(args=args)
             tracker.start(timeout=20)
-            pid = int(pidfile.read_text())
+            pid = int(pidfile.read_text(encoding="utf-8"))
             self.assertFalse(gone(pid))
             tracker.stop()
             self.assertEqual(tracker.proc.returncode, 0)  # the worker finished by itself, not under the sweep
@@ -1298,7 +1297,7 @@ class GazeTrackerTest(unittest.TestCase):
             args, pidfile = self.stand_in(code)
             tracker = self.make(args=args)
             tracker.start(timeout=20)
-            pid = int(pidfile.read_text())
+            pid = int(pidfile.read_text(encoding="utf-8"))
             tracker.proc.kill()
             tracker.proc.wait()
             tracker.stop()
@@ -1342,7 +1341,7 @@ class GazeTrackerTest(unittest.TestCase):
         tracker.stop_collect()
         with contextlib.suppress(GazeError):  # too short to fit; the file is written either way
             tracker.fit(timeout=20)
-        self.assertEqual(json.loads(readings.read_text())["camera"], {"width": 1920, "height": 1080, "fps": 30.0})
+        self.assertEqual(json.loads(readings.read_text(encoding="utf-8"))["camera"], {"width": 1920, "height": 1080, "fps": 30.0})
 
     def test_a_worker_that_cannot_load_its_model_reports_why(self):
         tracker = self.make(args=[], model_file=Path(self.tmp.name) / "missing" / "face_landmarker.task")
@@ -1405,7 +1404,7 @@ class GazeTrackerTest(unittest.TestCase):
         tracker.stop_collect()
         with self.assertRaises(GazeError):
             tracker.fit(timeout=20)
-        self.assertGreater(len(json.loads(readings.read_text())["rows"]), 0)
+        self.assertGreater(len(json.loads(readings.read_text(encoding="utf-8"))["rows"]), 0)
 
     def test_the_worker_keeps_each_frame_of_the_guide_and_the_dots_too(self):
         readings = Path(self.tmp.name) / "gaze-last-run.json"
@@ -1420,7 +1419,7 @@ class GazeTrackerTest(unittest.TestCase):
             tracker.stop_collect()
         with contextlib.suppress(GazeError):  # two short dots won't fit; the file is written whether or not they do
             tracker.fit(timeout=20)
-        kept = json.loads(readings.read_text())
+        kept = json.loads(readings.read_text(encoding="utf-8"))
         dots = [frame[1] for frame in kept["frames"]]
         self.assertEqual(dots, sorted(dots))  # the guide's frames, then dot 1's, then dot 2's
         self.assertEqual(sorted(set(dots)), [0, 1, 2])
@@ -1571,10 +1570,21 @@ class GazeTrackerTest(unittest.TestCase):
     def test_the_worker_help_works_without_the_camera_libraries(self):
         import subprocess
 
-        done = subprocess.run([sys.executable, str(WORKER), "--help"], capture_output=True, text=True, timeout=30)
+        done = subprocess.run([sys.executable, str(WORKER), "--help"], capture_output=True, text=True, encoding="utf-8", timeout=30)
         self.assertEqual(done.returncode, 0)
         self.assertIn("--serve", done.stdout)
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def setUpModule():
+    from .helpers import macos_adapters
+    from gazevoice.components import microphone
+    from gazevoice import gaze_worker
+    global _mac_adapters
+    _mac_adapters = macos_adapters(microphone, gaze_worker)
+
+def tearDownModule():
+    _mac_adapters.close()

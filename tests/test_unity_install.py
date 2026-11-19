@@ -32,9 +32,9 @@ class InstallTest(unittest.TestCase):
         self.assertTrue(bridge_current(self.project))
 
     def test_the_manifest_isnt_touched(self):
-        before = (self.project / "Packages" / "manifest.json").read_text()
+        before = (self.project / "Packages" / "manifest.json").read_text(encoding="utf-8")
         add_bridge(self.project)
-        self.assertEqual((self.project / "Packages" / "manifest.json").read_text(), before)
+        self.assertEqual((self.project / "Packages" / "manifest.json").read_text(encoding="utf-8"), before)
 
     def test_every_file_comes_with_its_meta(self):
         add_bridge(self.project)

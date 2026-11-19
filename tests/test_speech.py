@@ -1,3 +1,4 @@
+from gazevoice.platforms import venv_executable
 import contextlib
 import io
 import json
@@ -24,7 +25,7 @@ class SpeechTest(unittest.TestCase):
         self.speech = Speech(self.t.ctx)
         self.speech.hf_home = self.t.root / "hf"
         self.venv = self.t.paths.venvs / "speech"
-        self.py = self.venv / "bin" / "python"
+        self.py = venv_executable(self.venv)
 
     def tearDown(self):
         self.t.cleanup()
@@ -44,7 +45,11 @@ class SpeechTest(unittest.TestCase):
 
     def test_needs_uv(self):
         self.t.runner.set_which("uv", None)
-        self.assertEqual(self.speech.check().health, Health.ERROR)
+        state = self.speech.check()
+        self.assertEqual(state.health, Health.MISSING)
+        self.assertTrue(state.offers("install"))
+        self.assertIn("uv", state.actions[0].confirm)
+        self.assertEqual(self.t.runner.calls, [])
 
     def test_no_venv_offers_install_with_consent(self):
         state = self.speech.check()
@@ -111,7 +116,7 @@ class SpeechTest(unittest.TestCase):
     def make_broken_venv(self):
         """The folder is there, but its python links to a Python that was removed (an uninstalled Anaconda, say)."""
         self.py.parent.mkdir(parents=True)
-        os.symlink(self.t.root / "removed" / "bin" / "python3", self.py)
+        # A removed interpreter is represented by its missing executable.
         (self.venv / "pyvenv.cfg").write_text("home = /opt/anaconda3/bin\n")  # a real environment has this file
 
     def test_a_venv_whose_python_was_removed_says_so_and_offers_install(self):
@@ -162,7 +167,7 @@ class SpeechTest(unittest.TestCase):
         self.assertEqual(str(caught.exception), f"{self.venv} isn't a Python environment, so it's left alone. "
                                                 "Move or delete that folder, then press Install again.")
         self.assertEqual(self.t.runner.calls, [])  # uv was never asked to clear anything
-        self.assertEqual(precious.read_text(), "not an environment")
+        self.assertEqual(precious.read_text(encoding="utf-8"), "not an environment")
 
     def test_install_goes_ahead_over_an_empty_folder(self):
         self.venv.mkdir(parents=True)
@@ -188,8 +193,8 @@ class SpeechTest(unittest.TestCase):
     def test_with_no_venv_folder_it_is_not_installed_and_install_says_nothing_about_making_it_again(self):
         state = self.speech.check()
         self.assertEqual(state.health, Health.MISSING)
-        self.assertEqual(state.summary, "Not installed. Parakeet (NVIDIA) runs locally on Apple silicon, so your voice "
-                                        "never leaves this Mac.")
+        self.assertEqual(state.summary, "Not installed. Parakeet (NVIDIA) runs locally on this computer, so speech "
+                                        "stays on this device.")
         steps = [
             ["uv", "venv", "--clear", "--python", "3.12", str(self.venv)],
             ["uv", "pip", "install", "--python", str(self.py), "parakeet-mlx"],
@@ -293,3 +298,14 @@ class WorkerDownloadTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# These fixtures describe macOS; Windows adapters have their own tests.
+def setUpModule():
+    global _mac_adapters
+    import importlib
+    from .helpers import macos_adapters
+    _mac_adapters = macos_adapters(*(importlib.import_module(name) for name in ['gazevoice.components.speech']))
+
+def tearDownModule():
+    _mac_adapters.close()

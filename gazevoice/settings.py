@@ -6,10 +6,11 @@ import json
 import os
 import tempfile
 from dataclasses import asdict, dataclass, fields, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Mapping
 
 from .providers import THINKING, ProviderConfig
+from .platforms import is_windows
 
 BUILTIN_SOURCES = ("auto", "claude", "codex")  # "auto" = Claude Code when it's logged in, otherwise Codex
 API_THINKING = tuple(dict.fromkeys(value for values in THINKING.values() for value in values))
@@ -75,7 +76,7 @@ def _check(key: str, value: Any) -> None:
     ):
         raise ValueError("unity_mcp_args must be a list of command arguments")
     if key == "unity_project" and not (
-        isinstance(value, str) and len(value) <= 1024 and value.isprintable() and (value == "" or value.startswith("/"))
+        isinstance(value, str) and len(value) <= 1024 and value.isprintable() and (value == "" or PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute())
     ):
         raise ValueError("unity_project must be an absolute folder path")
     if key in ("editor_source", "refiner_source") and not (isinstance(value, str) and value):
@@ -94,7 +95,8 @@ def _check(key: str, value: Any) -> None:
         raise ValueError(f"gaze_source must be one of {', '.join(GAZE_SOURCES)}")
     if key == "gaze_pictures" and not isinstance(value, bool):
         raise ValueError("gaze_pictures must be true or false")
-    if key == "mic_device" and not (isinstance(value, str) and (value == "" or value.isdigit())):
+    if key == "mic_device" and not (isinstance(value, str) and len(value) <= 1024 and
+                                   (value == "" or value.isdigit() or (is_windows() and value.isprintable()))):
         raise ValueError('mic_device must be "" (auto) or a device number such as "2"')
     if key == "camera_device" and not (isinstance(value, str) and len(value) <= 200 and value.isprintable()):
         raise ValueError('camera_device must be "" (auto) or a camera name')
@@ -126,7 +128,7 @@ def update_settings(settings: Settings, changes: Mapping[str, Any]) -> Settings:
 
 def load_settings(path: Path) -> Settings:
     try:
-        raw = json.loads(Path(path).read_text())
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return Settings()
     if not isinstance(raw, dict):

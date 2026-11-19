@@ -17,14 +17,18 @@ using UnityEngine;
 internal static class GazeVoiceBridge
 {
     internal const int Port = 9878;
-    internal const string Version = "0.3.3";
+    internal const string Version = "0.3.4";
     const int MaxLine = 1024 * 1024;  // scripts and C# snippets arrive as one line
     const int MaxConsoleLines = 300;
     const int ShotWidth = 1280, ShotHeight = 720;
     const int ToolWaitSeconds = 300;  // execute_csharp can run this long; everything else answers at once
     const int RequestWaitSeconds = 5;
     const int VoiceOnSeconds = 3;  // polled this recently means the app's voice loop is on
+#if UNITY_EDITOR_WIN
+    const string DefaultKey = "Ctrl+Alt+Space";
+#else
     const string DefaultKey = "⌥ Space";
+#endif
     const string UndoGroupKey = "GazeVoice.UndoGroup";
     const string SnippetClass = "GazeVoiceSnippet";
     const string SnippetHeader =
@@ -344,10 +348,11 @@ internal static class GazeVoiceBridge
             cscPath = Directory.GetFiles(contents, "csc.dll", SearchOption.AllDirectories)
                 .OrderByDescending(path => path.Contains("DotNetSdkRoslyn")).FirstOrDefault();
             // Unity 6 keeps these under Resources/Scripting; Unity 2022 keeps them at the top.
+            string runtimeName = Application.platform == RuntimePlatform.WindowsEditor ? "dotnet.exe" : "dotnet";
             dotnetPath = new[] { Path.Combine(contents, "Resources", "Scripting"), contents }
-                .Select(root => Path.Combine(root, "NetCoreRuntime", "dotnet"))
+                .Select(root => Path.Combine(root, "NetCoreRuntime", runtimeName))
                 .FirstOrDefault(path => File.Exists(path))
-                ?? Directory.GetFiles(contents, "dotnet", SearchOption.AllDirectories).FirstOrDefault();
+                ?? Directory.GetFiles(contents, runtimeName, SearchOption.AllDirectories).FirstOrDefault();
             if (cscPath == null || dotnetPath == null)
                 throw new InvalidOperationException("Couldn't find the C# compiler inside this Unity editor. Use write_script instead.");
         }
@@ -788,7 +793,11 @@ internal static class GazeVoiceTalkKey
         EditorApplication.focusChanged += OnFocusChanged;
     }
 
+#if UNITY_EDITOR_WIN
+    [UnityEditor.ShortcutManagement.ClutchShortcut(ShortcutId, KeyCode.Space, UnityEditor.ShortcutManagement.ShortcutModifiers.Alt | UnityEditor.ShortcutManagement.ShortcutModifiers.Control)]
+#else
     [UnityEditor.ShortcutManagement.ClutchShortcut(ShortcutId, KeyCode.Space, UnityEditor.ShortcutManagement.ShortcutModifiers.Alt)]
+#endif
     static void Talk(UnityEditor.ShortcutManagement.ShortcutArguments args)
     {
         if (args.stage == UnityEditor.ShortcutManagement.ShortcutStage.Begin)

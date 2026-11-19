@@ -169,7 +169,7 @@ def handle(request, scene=None, events=None):
 
 class BridgeProtocolTest(unittest.TestCase):
     def test_constants(self):
-        self.assertEqual((protocol.BRIDGE_PORT, protocol.BRIDGE_VERSION), (9877, "0.3.4"))
+        self.assertEqual((protocol.BRIDGE_PORT, protocol.BRIDGE_VERSION), (9877, "0.3.5"))
 
     def test_decode_lines_keeps_partial(self):
         buf = bytearray(b'{"cmd": "ping"}\n{"cmd": "selection"}\n{"cmd": "sta')
@@ -187,7 +187,7 @@ class BridgeProtocolTest(unittest.TestCase):
     def test_ping(self):
         self.assertEqual(
             handle({"cmd": "ping"}, FakeScene()),
-            {"ok": True, "bridge": "0.3.4", "blender": "5.2.2", "key": "⌥ Space"},
+            {"ok": True, "bridge": "0.3.5", "blender": "5.2.2", "key": "⌥ Space"},
         )
 
     def test_selection(self):
@@ -291,7 +291,8 @@ class BridgeProtocolTest(unittest.TestCase):
         self.assertEqual(protocol.undo_name("GazeVoice: grow"), "GazeVoice: grow")
         self.assertLessEqual(len(protocol.undo_name("é" * 80).encode()), 63)
 
-    def test_key_labels(self):
+    @mock.patch.object(protocol, "is_windows", return_value=False)
+    def test_key_labels(self, _platform):
         self.assertEqual(protocol.key_label("SPACE", alt=True), "⌥ Space")
         self.assertEqual(protocol.key_label("F5"), "F5")
         self.assertEqual(protocol.key_label("NUMPAD_0", ctrl=True, shift=True), "⌃⇧ Numpad 0")
@@ -532,7 +533,7 @@ class GazeMarkerProtocolTest(unittest.TestCase):
         self.assertEqual([e["state"] for e in reply["events"]], ["down"])
 
     def test_the_add_on_can_do_everything_the_protocol_asks_of_a_scene(self):
-        tree = ast.parse(ADDON.read_text())
+        tree = ast.parse(ADDON.read_text(encoding="utf-8"))
         scene = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "BpyScene")
         have = {n.name for n in scene.body if isinstance(n, ast.FunctionDef)}
         asked = {name for name, value in vars(protocol.SceneAccess).items()
@@ -1222,7 +1223,7 @@ class GazeCropTest(unittest.TestCase):
 
     def test_the_addon_does_not_need_numpy_to_start(self):
         # A missing numpy must only fail a crop, never the add-on's register(), which would take voice down with it.
-        tree = ast.parse(ADDON.read_text())
+        tree = ast.parse(ADDON.read_text(encoding="utf-8"))
         top_level = [
             name.split(".")[0]
             for node in tree.body
@@ -1240,20 +1241,20 @@ class GazeCropTest(unittest.TestCase):
     def test_the_add_on_uses_no_name_it_never_defines(self):
         # The add-on can't run here (it needs bpy), so a name that is used and never defined, which Python only finds
         # out when that line runs inside Blender, is looked for in the source instead.
-        names = undefined_names(ADDON.read_text())
+        names = undefined_names(ADDON.read_text(encoding="utf-8"))
         self.assertEqual(names, set())
         self.assertEqual(undefined_names("def f():\n    return MARKER_TICK\n"), {("f", "MARKER_TICK")})  # and it can
 
     def test_everything_the_add_on_asks_of_the_protocol_is_there(self):
         # Like a name never defined, a protocol.something that isn't there only shows inside Blender, when that line
         # runs: say, while a picture is being taken.
-        used = {node.attr for node in ast.walk(ast.parse(ADDON.read_text()))
+        used = {node.attr for node in ast.walk(ast.parse(ADDON.read_text(encoding="utf-8")))
                 if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "protocol"}
         self.assertIn("MarkerGlide", used)  # the scan sees the real uses
         self.assertEqual({name for name in used if not hasattr(protocol, name)}, set())
 
     def test_protocol_stays_free_of_blender_and_numpy(self):
-        source = PROTOCOL.read_text()
+        source = PROTOCOL.read_text(encoding="utf-8")
         self.assertIsNone(re.search(r"^\s*(import|from)\s+(bpy|numpy|gpu|PIL)\b", source, re.MULTILINE))
         self.assertFalse(hasattr(protocol, "np") or hasattr(protocol, "numpy") or hasattr(protocol, "bpy"))
 

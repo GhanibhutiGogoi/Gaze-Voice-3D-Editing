@@ -65,6 +65,10 @@ class SpeechServiceTest(unittest.TestCase):
         with self.assertRaises(SpeechError) as caught:
             broken.start(timeout=20)
         self.assertIn("could not load", str(caught.exception))
+        self.assertIsNotNone(broken.proc.poll())
+        self.assertTrue(all(stream.closed for stream in
+                            (broken.proc.stdin, broken.proc.stdout, broken.proc.stderr)))
+        self.assertTrue(all(not thread.is_alive() for thread in broken._threads))
 
 
 if __name__ == "__main__":

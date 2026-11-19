@@ -5,6 +5,8 @@ Pure logic. Blender is reached only through the `pick` and `piece` callables the
 
 from __future__ import annotations
 
+from ..platforms import is_windows
+
 import json
 import math
 import re
@@ -121,6 +123,9 @@ def viewport_area(reply: object, frame_of: Callable[[int, int, int], Sequence[fl
     frame = frame_of(pid, window_width, window_height)
     if frame is None:
         return None
+    if is_windows():
+        from ..windows_desktop import viewport_area as windows_viewport
+        return Area(*windows_viewport(reply, frame))
     left, top, _, frame_height = frame
     bottom = top + frame_height - y / scale
     return Area(left + x / scale, bottom - height / scale, width / scale, height / scale)

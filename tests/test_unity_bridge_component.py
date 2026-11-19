@@ -225,3 +225,13 @@ class McpUnitTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def setUpModule():
+    import importlib
+    from .helpers import macos_adapters
+    global _mac_adapters
+    _mac_adapters = macos_adapters(*(importlib.import_module(name) for name in ['gazevoice.components.unity']))
+
+def tearDownModule():
+    _mac_adapters.close()

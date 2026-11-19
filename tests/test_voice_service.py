@@ -1,3 +1,4 @@
+from .helpers import process_alive
 import base64
 import contextlib
 import io
@@ -727,7 +728,7 @@ class VoiceServiceTest(VoiceTestBase):
         self.assertTrue({"stt", "refine", "edit", "total"} <= set(record["timings"]))
         folder = Path(self.tmp.name) / "commands" / record["id"]
         self.assertTrue((folder / "audio.wav").is_file())
-        self.assertEqual(json.loads((folder / "record.json").read_text())["reply"], "Made Chair twice as tall.")
+        self.assertEqual(json.loads((folder / "record.json").read_text(encoding="utf-8"))["reply"], "Made Chair twice as tall.")
         texts = [text for text, _ in self.bridge.statuses]
         self.assertIn("Listening… release the key to send", texts)
         self.assertIn("✓ Made Chair twice as tall.", texts)
@@ -901,7 +902,7 @@ class VoiceServiceTest(VoiceTestBase):
         self.mic = FakeMic(fail=True)
         with self.assertRaises(VoiceError) as caught:
             self.build().start()
-        self.assertIn("Privacy & Security", str(caught.exception))
+        self.assertIn("privacy & security", str(caught.exception).lower())
         self.assertEqual(self.stt.calls, [])
 
     def test_too_short_press_is_ignored(self):
@@ -1092,7 +1093,7 @@ class StopInTheGapTest(VoiceTestBase):
             self.stop_while_starting(in_the_gap, go_on, lambda: self.service._gaze is None)
         self.assertIsNotNone(self.gaze.proc)  # it really did start, after the stop
         self.assertFalse(self.gaze.alive)
-        self.assertRaises(ProcessLookupError, os.kill, self.gaze.proc.pid, 0)
+        self.assertFalse(process_alive(self.gaze.proc.pid))
         self.assertIsNone(camera.holder)
 
     def late_part(self, base):
@@ -1264,7 +1265,7 @@ class VoiceRobustnessTest(VoiceTestBase):
         with self.assertRaises(VoiceError) as caught:
             self.build().start()
         self.assertIn("pure silence", str(caught.exception))
-        self.assertIn("Privacy & Security", str(caught.exception))
+        self.assertIn("privacy & security", str(caught.exception).lower())
         self.assertFalse(self.mic.started)
 
     def test_a_silent_recording_explains_the_permission(self):
@@ -1537,7 +1538,7 @@ class GazeVoiceTest(VoiceTestBase):
         self.assertEqual(gaze["targets"][0]["candidates"][0]["name"], "Eagle")
         self.assertEqual(gaze["targets"][0]["piece"], WING_PIECE)  # what Blender said about the part, without "ok"
         self.assertIs(gaze["matched_selection"], False)  # it looked at the Eagle, with the Chair selected
-        saved = json.loads((Path(self.tmp.name) / "commands" / record["id"] / "record.json").read_text())
+        saved = json.loads((Path(self.tmp.name) / "commands" / record["id"] / "record.json").read_text(encoding="utf-8"))
         self.assertEqual(saved["gaze"], gaze)
 
     def test_off_mode_never_starts_gaze(self):
@@ -3627,14 +3628,10 @@ class GazePictureRealRouteTest(VoiceTestBase):
         return found
 
     def pid(self):
-        return int(self.pid_file.read_text())
+        return int(self.pid_file.read_text(encoding="utf-8"))
 
     def process_gone(self):
-        try:
-            os.kill(self.pid(), 0)
-        except ProcessLookupError:
-            return True
-        return False
+        return not process_alive(self.pid())
 
     def test_the_sentence_comes_from_a_process_that_has_exited(self):
         record = self.run_it()
@@ -3827,13 +3824,13 @@ def saved_record_text(root, record) -> str:
 
     def written() -> bool:
         try:
-            json.loads(path.read_text())  # whole, not just begun
+            json.loads(path.read_text(encoding="utf-8"))  # whole, not just begun
         except (OSError, ValueError):
             return False
         return True
 
     wait_for(written)
-    return path.read_text()
+    return path.read_text(encoding="utf-8")
 
 
 def wait_until_true(predicate, seconds=3.0):

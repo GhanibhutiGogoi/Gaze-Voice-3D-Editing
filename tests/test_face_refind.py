@@ -158,7 +158,7 @@ class LostFaceComesBackTest(unittest.TestCase):
             [str(GAZE_PYTHON), "-I", "-B", "-c", PROBE, str(Path(gaze_worker.__file__).parent),
              str(default_paths().gaze_model_file), str(PORTRAIT), str(width), str(height),
              str(EPISODES), str(BORDERLINE_FRAMES)],
-            capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, encoding="utf-8", timeout=300, stdin=subprocess.DEVNULL,
         )
         lines = [line for line in done.stdout.splitlines() if line.startswith("RESULT ")]
         if done.returncode != 0 or not lines:

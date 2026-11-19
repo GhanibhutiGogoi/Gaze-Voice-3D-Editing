@@ -100,3 +100,14 @@ class ProviderUnitsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# These fixtures describe macOS; Windows adapters have their own tests.
+def setUpModule():
+    global _mac_adapters
+    import importlib
+    from .helpers import macos_adapters
+    _mac_adapters = macos_adapters(*(importlib.import_module(name) for name in ['gazevoice.providers']))
+
+def tearDownModule():
+    _mac_adapters.close()

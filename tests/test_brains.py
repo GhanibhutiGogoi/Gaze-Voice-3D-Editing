@@ -1,3 +1,4 @@
+from gazevoice.platforms import venv_executable
 import json
 import socket
 import unittest
@@ -153,7 +154,7 @@ class ConnectBlenderTest(unittest.TestCase):
         self.t.cleanup()
 
     def install_server(self):
-        venv_python = self.t.paths.mcp_server_dir / ".venv" / "bin" / "python"
+        venv_python = venv_executable(self.t.paths.mcp_server_dir / ".venv")
         venv_python.parent.mkdir(parents=True)
         venv_python.write_text("")
         (self.t.paths.mcp_server_dir / "pyproject.toml").write_text("")
@@ -166,7 +167,7 @@ class ConnectBlenderTest(unittest.TestCase):
     def test_write_mcp_config(self):
         cmd = {"command": "uv", "args": ["run", "blender-mcp"], "env": {"BLENDER_PATH": "/B"}}
         path = write_mcp_config(self.t.paths, cmd)
-        self.assertEqual(json.loads(path.read_text()), {"mcpServers": {"blender": cmd}})
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"mcpServers": {"blender": cmd}})
 
     def test_not_offered_until_mcp_server_installed(self):
         self.assertFalse(self.claude().check().offers("connect_blender"))
@@ -189,7 +190,7 @@ class ConnectBlenderTest(unittest.TestCase):
         result = component.run_action("connect_blender", make_job("claude", "connect_blender"))
         self.assertEqual(result["reply"], "3")
         self.assertIn(tuple(argv), self.t.runner.calls)
-        self.assertIn("blender", json.loads((self.t.paths.root / "mcp-blender.json").read_text())["mcpServers"])
+        self.assertIn("blender", json.loads((self.t.paths.root / "mcp-blender.json").read_text(encoding="utf-8"))["mcpServers"])
 
     def test_codex_connect_is_marked_experimental(self):
         self.install_server()

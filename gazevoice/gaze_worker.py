@@ -57,6 +57,10 @@ import time
 from pathlib import Path
 from typing import NamedTuple
 
+
+def is_windows():
+    return sys.platform == "win32"
+
 try:
     from . import gaze_model
 except ImportError:  # started as a script by the gaze venv's Python
@@ -116,7 +120,8 @@ def camera_argv(index: str, width: int, height: int, fps: int = 30) -> list[str]
     """
     return [
         "ffmpeg", "-hide_banner", "-loglevel", "level+info", "-nostats",
-        "-f", "avfoundation", "-framerate", str(fps), "-i", f"{index}:none",
+        *(["-f", "dshow", "-i", f"video={index}"] if is_windows() else
+          ["-f", "avfoundation", "-framerate", str(fps), "-i", f"{index}:none"]),
         # Passthrough, because raw video otherwise holds to a steady frame rate by sending some frames twice.
         "-vf", f"scale={width}:{height}", "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
     ]
@@ -725,6 +730,8 @@ def serve(args: argparse.Namespace) -> int:
         return 1
 
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # so the finally below runs and ffmpeg is let go
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, lambda *_: sys.exit(0))
     session = Session(emit, Path(args.readings_file) if args.readings_file else None)
     opening = threading.Lock()  # a stop and the camera opening never overlap: whichever comes second sees the first
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import plistlib
 import re
 import shutil
@@ -15,6 +16,7 @@ from ..jobs import Job, JobError
 from ..paths import tilde
 from ..probes import ProbeCache
 from ..runner import CommandRunner
+from ..platforms import app_data, install_command, is_windows, launch_app, process_running
 from ..settings import save_settings, update_settings
 from ..unity_install import add_bridge, bridge_current
 from .base import ActionSpec, Component, Health
@@ -36,6 +38,12 @@ NO_HOMEBREW = "Install Homebrew (brew.sh) so GazeVoice can set Unity up, or get 
 SIGN_IN = ("Unity needs a license before it can make a project. Sign in to Unity Hub and add the free Personal "
            "license, then press Set up Unity again.")
 PICK_FOLDER = 'POSIX path of (choose folder with prompt "Pick your Unity project")'
+if is_windows():
+    HUB_APP = Path(os.environ.get("UNITY_HUB_PATH", str(Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Unity Hub" / "Unity Hub.exe")))
+    EDITOR_ROOTS = (Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Unity" / "Hub" / "Editor",)
+    HUB_CONFIG = app_data("UnityHub", roaming=True)
+    CLI_FALLBACK = Path("__no_unity_cli__")  # Windows uses Unity Hub's headless commands.
+    NO_HOMEBREW = "Install App Installer (WinGet), or install Unity Hub from unity.com/download."
 _VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d+)([abfp]\d+)")
 _LICENSE_PROBLEM = re.compile(
     r"no valid (?:unity editor )?licen[sc]e|failed to activate|unable to activate"
@@ -49,6 +57,10 @@ class UnityEditor:
 
     @property
     def binary(self) -> Path:
+        if self.app.suffix.lower() == ".exe":
+            return self.app
+        if self.app.name != "Unity.app":
+            return self.app / "Editor" / "Unity.exe"
         return self.app / "Contents" / "MacOS" / "Unity"
 
 
@@ -72,7 +84,8 @@ def _editor_version(app: Path) -> str | None:
             value = plistlib.load(handle).get("CFBundleVersion")
     except (OSError, ValueError, ExpatError):
         value = None
-    for text in (value, app.parent.name):
+    for text in (value, app.parent.parent.name if app.suffix.lower() == ".exe" else app.name,
+                 app.parent.name):
         if isinstance(text, str) and parse_unity_version(text):
             return text
     return None
@@ -83,7 +96,7 @@ def _hub_install_folder(hub_config: Path | None) -> Path | None:
     if hub_config is None:
         return None
     try:
-        value = json.loads((hub_config / "secondaryInstallPath.json").read_text())
+        value = json.loads((hub_config / "secondaryInstallPath.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     return Path(value) if isinstance(value, str) and value else None
@@ -94,11 +107,24 @@ def find_editors(
 ) -> list[UnityEditor]:
     """Every Unity editor in these folders (plus any apps Spotlight found), newest first."""
     folders = [*roots, *filter(None, [_hub_install_folder(hub_config)])]
-    candidates = [app for folder in folders for app in sorted(Path(folder).glob("*/Unity.app"))]
+    candidates = [app for folder in folders for pattern in ("*/Unity.app", "*/Editor/Unity.exe")
+                  for app in sorted(Path(folder).glob(pattern))]
+    if is_windows() and hub_config is not None:
+        try:
+            saved = json.loads((hub_config / "editors-v2.json").read_text(encoding="utf-8"))
+            items = saved.get("data", []) if isinstance(saved, dict) else saved
+            if isinstance(items, list):
+                candidates += [Path(item["location"]) for item in items
+                               if isinstance(item, dict) and isinstance(item.get("location"), str)]
+        except (OSError, ValueError):
+            pass
+    configured = os.environ.get("UNITY_EDITOR_PATH") if is_windows() else None
+    if configured:
+        candidates.append(Path(configured))
     found: dict[str, UnityEditor] = {}
     for app in (*candidates, *apps):
         version = _editor_version(app)
-        if version and version not in found and (app / "Contents" / "MacOS" / "Unity").is_file():
+        if version and version not in found and UnityEditor(version, app).binary.is_file():
             found[version] = UnityEditor(version, app)
     return sorted(found.values(), key=lambda editor: _sort_key(editor.version), reverse=True)
 
@@ -112,7 +138,7 @@ def best_editor(editors: Sequence[UnityEditor]) -> UnityEditor | None:
 
 def project_version(project: Path) -> str | None:
     try:
-        text = (Path(project) / "ProjectSettings" / "ProjectVersion.txt").read_text()
+        text = (Path(project) / "ProjectSettings" / "ProjectVersion.txt").read_text(encoding="utf-8")
     except OSError:
         return None
     match = re.search(r"^m_EditorVersion:\s*(\S+)", text, re.MULTILINE)
@@ -141,10 +167,7 @@ def next_project_path(parent: Path) -> Path:
 
 
 def is_running(runner: CommandRunner, probes: ProbeCache | None = None) -> bool:
-    argv = ["pgrep", "-x", "Unity"]
-    if probes:
-        return probes.run(runner, argv, timeout=5, ttl=3, raise_on_timeout=True).ok
-    return runner.run(argv, timeout=5).ok
+    return process_running(runner, "Unity", probes, windows=is_windows())
 
 
 def project_is_open(project: Path, running: bool) -> bool:
@@ -171,6 +194,8 @@ class _UnityUnit(Component):
 
     def editors(self, fresh: bool = False) -> list[UnityEditor]:
         """`fresh` skips the shared cache, for actions that have just installed something."""
+        if is_windows():
+            return find_editors(self.roots, self.hub_config)
         argv = ["mdfind", SPOTLIGHT_QUERY]
         result = (self.runner.run(argv, timeout=5) if fresh
                   else self.ctx.probes.run(self.runner, argv, timeout=5, ttl=15, raise_on_timeout=True))
@@ -186,6 +211,9 @@ class _UnityUnit(Component):
         save_settings(self.paths.settings_file, self.ctx.settings)
 
     def open_hub(self) -> None:
+        if is_windows():
+            launch_app(self.runner, self.hub_app)
+            return
         result = self.runner.run(["open", "-a", self.hub_app], timeout=30)
         if not result.ok:
             raise JobError(f"Couldn't open Unity Hub: {result.stderr.strip() or result.returncode}")
@@ -203,7 +231,7 @@ class _UnityUnit(Component):
             job.log(f"Made {tilde(project)}")
             return project
         try:
-            text = log.read_text(errors="replace")
+            text = log.read_text(encoding="utf-8", errors="replace")
         except OSError:
             text = result.stderr
         shutil.rmtree(project, ignore_errors=True)  # next_project_path chose a new folder, so this is only ours
@@ -221,6 +249,8 @@ class Unity(_UnityUnit):
     role = "Game engine"
 
     def _can_brew(self, editor: UnityEditor | None) -> bool:
+        if is_windows():
+            return self.hub_app.exists() or bool(self.runner.which("winget"))
         needs_brew = not self.hub_app.exists() or (
             editor is None and find_cli(self.runner, self.cli_fallback) is None)
         return not needs_brew or bool(self.runner.which("brew"))
@@ -229,11 +259,12 @@ class Unity(_UnityUnit):
         """What Set up Unity still has to do, in order, in plain words."""
         steps = []
         if not self.hub_app.exists():
-            steps.append("install Unity Hub with Homebrew")
+            steps.append("install Unity Hub with WinGet" if is_windows() else "install Unity Hub with Homebrew")
         if editor is None:
-            if find_cli(self.runner, self.cli_fallback) is None:
+            if not is_windows() and find_cli(self.runner, self.cli_fallback) is None:
                 steps.append("install the Unity CLI with Homebrew")
-            steps.append("download the latest Unity LTS for Apple silicon (several GB, so this can take a while)")
+            steps.append("download the latest Unity LTS for Windows (several GB)" if is_windows() else
+                         "download the latest Unity LTS for Apple silicon (several GB, so this can take a while)")
         project = self.project
         if project is None or project_problem(project):
             default = self.projects_dir / PROJECT_NAME
@@ -282,6 +313,13 @@ class Unity(_UnityUnit):
 
     # --- one key, every step. Each step is skipped once it's done, so pressing it again carries on. --------
     def _brew_install(self, job: Job, cask: str, name: str) -> None:
+        if is_windows():
+            if not self.runner.which("winget"):
+                raise JobError(NO_HOMEBREW)
+            code = self.runner.stream(install_command(cask, cask=True), job.log, timeout=BREW_SECONDS)
+            if code != 0:
+                raise JobError(f"WinGet couldn't install {name} (exit {code}). See the log above.")
+            return
         if not self.runner.which("brew"):
             raise JobError(NO_HOMEBREW)
         job.log(f"Installing {name} with Homebrew (brew install --cask {cask})…")
@@ -290,6 +328,27 @@ class Unity(_UnityUnit):
             raise JobError(f"Homebrew couldn't install {name} (exit {code}). See the log above.")
 
     def _install_editor(self, job: Job) -> UnityEditor:
+        if is_windows():
+            from urllib.request import urlopen
+            url = ("https://services.api.unity.com/unity/editor/release/v1/releases?"
+                   "limit=1&platform=WINDOWS&architecture=X86_64&stream=LTS&order=RELEASE_DATE_DESC")
+            try:
+                with urlopen(url, timeout=30) as response:
+                    release = json.load(response)["results"][0]
+                version, revision = release["version"], release["shortRevision"]
+                if not parse_unity_version(version) or not re.fullmatch(r"[a-fA-F0-9]{12,40}", revision):
+                    raise ValueError("invalid release metadata")
+            except (OSError, ValueError, KeyError, IndexError) as exc:
+                raise JobError("Could not read Unity's Windows LTS release. Install an LTS editor in Unity Hub and retry.") from exc
+            job.log(f"Installing Unity {version} for Windows through Unity Hub. Sign in and activate a license in the Hub.")
+            code = self.runner.stream([str(self.hub_app), "--", "--headless", "install", "--version", version,
+                                       "--changeset", revision], job.log, timeout=INSTALL_SECONDS)
+            if code != 0:
+                raise JobError(f"Unity Hub install failed (exit {code}). Sign in, install the LTS editor in Hub and retry.")
+            editor = best_editor(self.editors(fresh=True))
+            if editor is None:
+                raise JobError("Unity Hub returned, but the editor is not installed yet. Finish its installation in Hub and retry.")
+            return editor
         cli = find_cli(self.runner, self.cli_fallback)
         if cli is None:
             self._brew_install(job, CLI_CASK, "the Unity CLI")
@@ -325,6 +384,9 @@ class Unity(_UnityUnit):
             job.log(f"{project.name} is already open in Unity.")
             return
         job.log(f"Opening {project.name} in Unity {editor.version}…")
+        if is_windows():
+            launch_app(self.runner, editor.binary, ["-projectPath", str(project)])
+            return
         result = self.runner.run(["open", "-n", "-a", editor.app, "--args", "-projectPath", project], timeout=30)
         if not result.ok:
             raise JobError(f"Couldn't open Unity: {result.stderr.strip() or result.returncode}")
@@ -393,7 +455,15 @@ class UnityProject(_UnityUnit):
 
     def action_choose(self, job: Job) -> dict:
         job.log("Pick your Unity project in the window that just opened…")
-        result = self.runner.run(["osascript", "-e", PICK_FOLDER], timeout=600)
+        if is_windows():
+            script = ("Add-Type -AssemblyName System.Windows.Forms; "
+                      "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog; "
+                      "$dialog.Description = 'Pick your Unity project'; "
+                      "if ($dialog.ShowDialog() -eq 'OK') { [Console]::OutputEncoding = [Text.Encoding]::UTF8; "
+                      "[Console]::WriteLine($dialog.SelectedPath) }; $dialog.Dispose()")
+            result = self.runner.run(["powershell.exe", "-NoProfile", "-STA", "-Command", script], timeout=600)
+        else:
+            result = self.runner.run(["osascript", "-e", PICK_FOLDER], timeout=600)
         if not result.ok or not result.stdout.strip():
             raise JobError("No folder was picked.")
         project = Path(result.stdout.strip())

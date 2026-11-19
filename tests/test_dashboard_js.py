@@ -18,7 +18,7 @@ NODE = shutil.which("node")
 
 def result_line(result: dict) -> str:
     """What the dashboard writes under a succeeded job with this `result`, by running the real resultLine."""
-    source = APP_JS.read_text()
+    source = APP_JS.read_text(encoding="utf-8")
     match = re.search(r"^function resultLine\(job\) \{.*?^\}\n", source, re.DOTALL | re.MULTILINE)
     assert match, "resultLine is not where this test expects it"
     program = (
@@ -26,24 +26,24 @@ def result_line(result: dict) -> str:
         f"{match.group(0)}\n"
         f"console.log(JSON.stringify(resultLine({{ result: {json.dumps(result)} }})));\n"
     )
-    done = subprocess.run([NODE, "-e", program], capture_output=True, text=True, timeout=30)
+    done = subprocess.run([NODE, "-e", program], capture_output=True, text=True, encoding="utf-8", timeout=30)
     assert done.returncode == 0, done.stderr
     return json.loads(done.stdout)
 
 
 def run_function(name: str, call: str, stubs: str = "", script: Path = APP_JS):
     """What the real function `name` in app.js, or `script`, returns for the JavaScript expression `call`."""
-    match = re.search(rf"^function {name}\(.*?^\}}\n", script.read_text(), re.DOTALL | re.MULTILINE)
+    match = re.search(rf"^function {name}\(.*?^\}}\n", script.read_text(encoding="utf-8"), re.DOTALL | re.MULTILINE)
     assert match, f"{name} is not where this test expects it"
     program = f"{stubs}\n{match.group(0)}\nconsole.log(JSON.stringify({call}));\n"
-    done = subprocess.run([NODE, "-e", program], capture_output=True, text=True, timeout=30)
+    done = subprocess.run([NODE, "-e", program], capture_output=True, text=True, encoding="utf-8", timeout=30)
     assert done.returncode == 0, done.stderr
     return json.loads(done.stdout)
 
 
 def constants(script: Path, *names: str) -> str:
     """The `const NAME = …;` lines of `script` that these functions lean on, to put before the function under test."""
-    source = script.read_text()
+    source = script.read_text(encoding="utf-8")
     lines = []
     for name in names:
         match = re.search(rf"^const {name} = .*$", source, re.MULTILINE)
@@ -106,7 +106,7 @@ class CalibratePageTest(unittest.TestCase):
         self.assertEqual(self.area(event, window), {"left": 0, "top": 38, "width": 1710, "height": 1074})
 
     def result(self, job):
-        measured = re.search(r"^const MEASURED = .*$", CALIBRATE_JS.read_text(), re.MULTILINE).group(0)
+        measured = re.search(r"^const MEASURED = .*$", CALIBRATE_JS.read_text(encoding="utf-8"), re.MULTILINE).group(0)
         return run_function("resultText", f"resultText({json.dumps(job)})", measured, CALIBRATE_JS)
 
     def test_a_good_result_gives_the_accuracy_in_plain_words(self):
@@ -156,7 +156,7 @@ class HiddenPageTest(unittest.TestCase):
                  "const post = (path, body) => { sent.push([path, body]); return Promise.resolve(); };\n"
                  f"const document = {{ hidden: {json.dumps(hidden)} }};\n"
                  "const setInterval = (fn, ms) => { timers.push(ms); return 7; };\n")
-        sayalive = re.search(r"^function sayAlive\(.*?^\}\n", CALIBRATE_JS.read_text(), re.DOTALL | re.MULTILINE).group(0)
+        sayalive = re.search(r"^function sayAlive\(.*?^\}\n", CALIBRATE_JS.read_text(encoding="utf-8"), re.DOTALL | re.MULTILINE).group(0)
         return run_function("startBeat", "(startBeat(), { sent, timers, beat: S.beat })", stubs + sayalive, CALIBRATE_JS)
 
     def test_a_page_in_view_says_it_is_there_and_keeps_saying_so(self):
@@ -224,7 +224,7 @@ class GuideRingTest(unittest.TestCase):
     BOX = 0.7 * HEIGHT  # the outline is as tall as 70% of the page
 
     def setUp(self):
-        source = CALIBRATE_JS.read_text()
+        source = CALIBRATE_JS.read_text(encoding="utf-8")
         found = re.findall(r"^const (?:OUTLINE|GUIDE_AT|RING_SCALE) = .*$", source, re.MULTILINE)
         self.assertEqual(len(found), 3, "the constants the ring is drawn from are not where this test expects")
         self.constants = "\n".join(found)
@@ -278,7 +278,7 @@ class GuidePageTest(unittest.TestCase):
     """The parts of the page the ring leans on, held to each other: the drawing in the page, its style and the script."""
 
     def test_the_numbers_the_ring_is_drawn_from_are_those_of_the_outline_in_the_page(self):
-        html, source = CALIBRATE_HTML.read_text(), CALIBRATE_JS.read_text()
+        html, source = CALIBRATE_HTML.read_text(encoding="utf-8"), CALIBRATE_JS.read_text(encoding="utf-8")
         head = re.search(r'<ellipse class="guide-head" cx="(\d+)" cy="(\d+)" rx="(\d+)" ry="(\d+)"', html)
         self.assertTrue(head, "the outline's head is not where this test expects")
         cx, cy, rx, ry = (int(n) for n in head.groups())
@@ -288,36 +288,36 @@ class GuidePageTest(unittest.TestCase):
         self.assertAlmostEqual(outline["eyes"], cy / 100)
         self.assertAlmostEqual(outline["head"]["w"], 2 * rx / 100)
         self.assertAlmostEqual(outline["head"]["h"], 2 * ry / 100)
-        css = CALIBRATE_CSS.read_text()
+        css = CALIBRATE_CSS.read_text(encoding="utf-8")
         self.assertIn(f"min({round(outline['height'] * 100)}vh, {round(outline['maxWidth'] * 100)}vw)", css)
 
     def test_the_target_the_page_centres_on_is_the_servers(self):
         from gazevoice.components.gaze import GUIDE_TARGET
 
-        match = re.search(r"^const GUIDE_AT = \[([\d.]+), ([\d.]+)\];", CALIBRATE_JS.read_text(), re.MULTILINE)
+        match = re.search(r"^const GUIDE_AT = \[([\d.]+), ([\d.]+)\];", CALIBRATE_JS.read_text(encoding="utf-8"), re.MULTILINE)
         self.assertEqual((float(match.group(1)), float(match.group(2))), GUIDE_TARGET[:2])
 
     def test_the_page_says_how_many_dots_the_job_shows(self):
         from gazevoice.components.gaze import DOT_ORDER
 
-        said = re.search(r"look at (\d+) dots", " ".join(CALIBRATE_HTML.read_text().split()))
+        said = re.search(r"look at (\d+) dots", " ".join(CALIBRATE_HTML.read_text(encoding="utf-8").split()))
         self.assertTrue(said, "the page no longer says how many dots there are")
         self.assertEqual(int(said.group(1)), len(DOT_ORDER))
 
     def test_the_page_draws_with_classes_and_never_touches_the_camera(self):
-        html, source = CALIBRATE_HTML.read_text(), CALIBRATE_JS.read_text()
+        html, source = CALIBRATE_HTML.read_text(encoding="utf-8"), CALIBRATE_JS.read_text(encoding="utf-8")
         self.assertNotRegex(html, r"\sstyle\s*=")
         for word in ("getUserMedia", "mediaDevices", "<canvas", "<video", "<img", "ImageCapture"):
             self.assertNotIn(word, html + source, word)
 
     def test_the_ring_glides_and_stops_gliding_for_those_who_ask_for_less_motion(self):
-        css = CALIBRATE_CSS.read_text()
+        css = CALIBRATE_CSS.read_text(encoding="utf-8")
         self.assertRegex(css, r"\.guide-ring\s*\{[^}]*transition:[^;}]*120ms")
         reduced = re.search(r"@media \(prefers-reduced-motion: reduce\)\s*\{(.*?)\n\}", css, re.DOTALL)
         self.assertTrue(reduced and ".guide-ring" in reduced.group(1) and "transition: none" in reduced.group(1))
 
     def test_the_cursor_stays_visible_in_the_guide_so_start_anyway_can_be_clicked(self):
-        css = CALIBRATE_CSS.read_text()
+        css = CALIBRATE_CSS.read_text(encoding="utf-8")
         self.assertNotRegex(css, r'data-stage="guide"\][^{]*\{[^}]*cursor:\s*none')
         self.assertRegex(css, r'body\[data-stage="guide"\]')  # and it is as bright as the dots
 
@@ -352,7 +352,7 @@ class GazeProblemTest(unittest.TestCase):
                 self.assertIsNone(self.problem(voice))
 
     def test_the_voice_panel_shows_it_as_a_warning(self):
-        self.assertRegex(APP_JS.read_text(), r'h\("p", \{ class: "voice-note", "data-tone": "warn", text: gazeProblem\(v\) \}\)')
+        self.assertRegex(APP_JS.read_text(encoding="utf-8"), r'h\("p", \{ class: "voice-note", "data-tone": "warn", text: gazeProblem\(v\) \}\)')
 
 
 def target(word, name, score):
@@ -402,7 +402,7 @@ class GazeLineTest(unittest.TestCase):
                 self.assertIsNone(self.line({"gaze": gaze, "focus": None}))
 
     def test_the_command_row_shows_it(self):
-        self.assertIn('gazeLine(r) ? h("p", { class: "cmd-heard", text: gazeLine(r) }) : null', APP_JS.read_text())
+        self.assertIn('gazeLine(r) ? h("p", { class: "cmd-heard", text: gazeLine(r) }) : null', APP_JS.read_text(encoding="utf-8"))
 
 
 @unittest.skipUnless(NODE, "node isn't installed")
@@ -411,14 +411,14 @@ class ShelfTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        source = APP_JS.read_text()
+        source = APP_JS.read_text(encoding="utf-8")
         blocks = []
         for name, close in (("NAMES", r"\}"), ("GROUPS", r"\]")):
             match = re.search(rf"^const {name} = [\[{{].*?^{close};\n", source, re.DOTALL | re.MULTILINE)
             assert match, f"{name} is not where this test expects it"
             blocks.append(match.group(0))
         program = "\n".join(blocks) + "\nconsole.log(JSON.stringify({ NAMES, GROUPS }));\n"
-        done = subprocess.run([NODE, "-e", program], capture_output=True, text=True, timeout=30)
+        done = subprocess.run([NODE, "-e", program], capture_output=True, text=True, encoding="utf-8", timeout=30)
         assert done.returncode == 0, done.stderr
         cls.names, cls.groups = (lambda data: (data["NAMES"], data["GROUPS"]))(json.loads(done.stdout))
 
@@ -469,7 +469,7 @@ class ResultLineTest(unittest.TestCase):
 @unittest.skipUnless(APP_JS.exists(), "no dashboard script")
 class PicturesRowTest(unittest.TestCase):
     def test_the_pictures_switch_says_what_it_costs_and_the_note_says_how_they_are_kept(self):
-        source = APP_JS.read_text()
+        source = APP_JS.read_text(encoding="utf-8")
         self.assertIn('"Pictures · each unnamed target uses a little of your plan", "gaze_pictures"', source)
         self.assertIn("GazeVoice never saves a picture. Claude Code gets it for one reply, and the check looks for any "
                       "copy left behind. Anthropic keeps what's sent under your account's terms.", source)
@@ -524,14 +524,14 @@ class SentPictureTest(unittest.TestCase):
     """The command row's picture: a small one beside what the AI said about it, which opens full size."""
 
     def run_js(self, names, body, stubs=""):
-        source = APP_JS.read_text()
+        source = APP_JS.read_text(encoding="utf-8")
         parts = []
         for name in ("h", *names):  # h builds every element, so it is always run for real
             match = re.search(rf"^function {name}\(.*?^\}}\n", source, re.DOTALL | re.MULTILINE)
             assert match, f"{name} is not where this test expects it"
             parts.append(match.group(0))
         program = f"{FAKE_PAGE}\n{stubs}\n{chr(10).join(parts)}\n{body}\n"
-        done = subprocess.run([NODE, "-e", program], capture_output=True, text=True, timeout=30)
+        done = subprocess.run([NODE, "-e", program], capture_output=True, text=True, encoding="utf-8", timeout=30)
         assert done.returncode == 0, done.stderr
         return json.loads(done.stdout)
 
@@ -798,32 +798,32 @@ class SentPictureTest(unittest.TestCase):
 
     # --- the page itself -----------------------------------------------------------------------------------------
     def test_the_command_row_puts_the_pictures_after_the_gaze_line(self):
-        source = APP_JS.read_text()
+        source = APP_JS.read_text(encoding="utf-8")
         self.assertIn('gazeLine(r) ? h("p", { class: "cmd-heard", text: gazeLine(r) }) : null,\n      pictureRows(r),', source)
 
     def test_the_list_is_drawn_so_that_unlisted_pictures_are_let_go(self):
-        source = APP_JS.read_text()
+        source = APP_JS.read_text(encoding="utf-8")
         self.assertIn("renderingPictures(() => recent.length", source)  # the whole list branch, the empty one too
         self.assertIn("box.append(commandList(recent,", source)
 
     def test_each_command_row_can_be_given_the_focus_by_its_key(self):
-        source = APP_JS.read_text()
+        source = APP_JS.read_text(encoding="utf-8")
         self.assertIn('"data-focus-key": commandKey(r.id),', source)
         self.assertIn('tabindex: "-1"', source)  # focusable by the script, not a stop on the way round the page
-        rule = re.search(r"^\.cmd:focus-visible \{(.*?)\}", (STATIC / "app.css").read_text(), re.MULTILINE).group(1)
+        rule = re.search(r"^\.cmd:focus-visible \{(.*?)\}", (STATIC / "app.css").read_text(encoding="utf-8"), re.MULTILINE).group(1)
         # The list scrolls and clips what pokes out of it, so the ring is drawn inside the row, not around it.
         self.assertIn("outline-offset: -2px", rule)
 
     def test_the_command_rows_light_is_written_as_it_always_was(self):
-        self.assertIn('const led = { done: "live", failed: "fault", stopped: "off" }[r.stage]', APP_JS.read_text())
+        self.assertIn('const led = { done: "live", failed: "fault", stopped: "off" }[r.stage]', APP_JS.read_text(encoding="utf-8"))
 
     def test_what_the_ai_said_is_only_ever_put_in_as_text(self):
-        source = APP_JS.read_text()
+        source = APP_JS.read_text(encoding="utf-8")
         for unsafe in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"):
             self.assertNotIn(unsafe, source)
 
     def test_the_styles_cover_the_small_picture_the_dialog_and_its_backdrop(self):
-        css = (STATIC / "app.css").read_text()
+        css = (STATIC / "app.css").read_text(encoding="utf-8")
         for selector in (".cmd-picture", ".cmd-thumb", ".cmd-thumb:focus-visible", ".picture-view", ".picture-view::backdrop",
                          ".picture-view-img"):
             self.assertIn(selector, css)
@@ -920,14 +920,14 @@ def block(source: str, name: str) -> str:
 
 def terminal(body: str, stubs: str = ""):
     """Run `body` against the real terminal-panel code in app.js and a small stand-in page. `body` sets `out`."""
-    source = APP_JS.read_text()
+    source = APP_JS.read_text(encoding="utf-8")
     state = re.search(r"^const S = \{.*?^\};\n", source, re.DOTALL | re.MULTILINE)
     assert state, "S is not where this test expects it"
     parts = [state.group(0), *(block(source, name) for name in TERMINAL_CONSTS),
              *(block(source, name) for name in TERMINAL_FUNCTIONS)]
     program = (f"{TERMINAL_PAGE}\n{chr(10).join(parts)}\n{stubs}\nlet out = null;\n"
                f"(async () => {{\n{body}\n}})().then(() => console.log(JSON.stringify(out)));\n")
-    done = subprocess.run([NODE, "-e", program], capture_output=True, text=True, timeout=30)
+    done = subprocess.run([NODE, "-e", program], capture_output=True, text=True, encoding="utf-8", timeout=30)
     assert done.returncode == 0, done.stderr
     return json.loads(done.stdout)
 
@@ -1823,9 +1823,9 @@ class TerminalWiringTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.html = (STATIC / "index.html").read_text()
-        cls.js = APP_JS.read_text()
-        cls.css = (STATIC / "app.css").read_text()
+        cls.html = (STATIC / "index.html").read_text(encoding="utf-8")
+        cls.js = APP_JS.read_text(encoding="utf-8")
+        cls.css = (STATIC / "app.css").read_text(encoding="utf-8")
 
     def tag(self, element_id):
         return re.search(rf"<[a-z0-9]+[^>]*id=\"{element_id}\"[^>]*>", self.html).group(0)

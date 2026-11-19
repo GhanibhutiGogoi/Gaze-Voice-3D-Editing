@@ -330,7 +330,7 @@ function renderHeader() {
   } else if (!S.state) {
     led.dataset.led = "off";
     title.textContent = "Checking your setup…";
-    sub.textContent = "Reading each component on this Mac";
+    sub.textContent = "Reading each component on this computer";
   } else {
     const stages = S.state.workflow;
     const ready = stages.filter((s) => s.health === "ready").length;
@@ -531,7 +531,7 @@ function runningLabel(cid) {
 
 function confirmText(comp, aid) {
   if (aid === "remove") {
-    return `Remove ${comp.name} and delete its key from your Keychain? Steps that use it go back to Auto.`;
+    return `Remove ${comp.name} and delete its key from your system credential store? Steps that use it go back to Auto.`;
   }
   const spec = comp.actions.find((a) => a.id === aid);
   return spec && spec.confirm ? spec.confirm : `Run “${aid}”?`;
@@ -653,7 +653,7 @@ function providerForm(comp) {
     h("button", { class: "key key-primary", type: "submit", "data-focus-key": `${comp.id}-save` }, "Save"),
     h("button", { class: "key", type: "button", "data-focus-key": `${comp.id}-cancel-edit`,
       onclick: () => { S.editing.delete(comp.id); S.forms.delete(comp.id); preservingFocus(renderRack); } }, "Cancel")),
-  h("p", { class: "provider-note", text: "The key goes to your Mac's Keychain and is never shown again." }));
+  h("p", { class: "provider-note", text: "The key goes to your system credential store (Windows Credential Manager or macOS Keychain) and is never shown again." }));
 }
 
 async function saveProvider(comp) {
@@ -782,7 +782,7 @@ function renderVoice() {
     const on = voiceOn(v);
     const startingJob = jobRunning("voice");
     const [led, defaultWord] = VOICE_WORDS[v.state] || VOICE_WORDS.off;
-    const key = v.key || "⌥ Space";
+    const key = v.key || S.state?.platform?.talk_key || "⌥ Space";
     const hostName = v.host === "unity" ? "Unity" : "Blender";
     const word = v.state === "editing" ? `Working in ${hostName}…` : defaultWord;
     $("voice-note").textContent = `In ${hostName}, hold ${key}, say what you want, and let go. Your selection is what “this” means.`;
@@ -1202,8 +1202,10 @@ function renderRouting() {
     return;
   }
   box.append(
+    h("p", { class: "route-note", text: `System: ${S.state?.platform?.name || "Detecting…"} · Speech: ${S.state?.speech_engine?.label || "Detecting…"}` }),
     routeRow("3D host", "voice_host", settings.voice_host, [["blender", "Blender"], ["unity", "Unity"]]),
-    routeRow("Speech engine", "stt_engine", settings.stt_engine, [["parakeet", "Parakeet"], ["whisper", "Whisper"]]),
+    ...(S.state?.speech_engine?.key === "faster-whisper" ? [] :
+      [routeRow("Speech engine", "stt_engine", settings.stt_engine, [["parakeet", "Parakeet"], ["whisper", "Whisper"]])]),
     ...(settings.voice_host === "unity" ? unityMcpRows(settings) : []),
     inputRow(settings.mic_device),
     cameraRow(settings.camera_device), ...gazeRows(settings),
@@ -1390,13 +1392,14 @@ function cameraRow(current) {
   const listed = detail("Cameras");
   const cameras = listed ? listed.split(" | ") : [];
   const using = detail("Using");
-  const autoLabel = current === "" && using ? `Auto · ${using.replace(/ \(auto\)$/, "")}` : "Auto · the Mac's own camera";
+  const autoLabel = current === "" && using ? `Auto · ${using.replace(/ \(auto\)$/, "")}`
+    : (S.state?.platform?.id === "windows" ? "Auto · webcam first" : "Auto · the Mac's own camera");
   return h("label", { class: "route-row" },
     h("span", { class: "route-label", text: "Camera" }),
     h("select", {
       class: "select",
       "data-focus-key": "route-camera",
-      title: "The camera is remembered by name, so plugging in a phone doesn't change it. Auto never uses a phone.",
+      title: "The camera is remembered by name. Auto skips recognized phone and virtual cameras; choose a named device to override.",
       onchange: (e) => saveSetting("camera_device", e.target.value),
     },
       h("option", { value: "", selected: current === "" || null, text: autoLabel }),

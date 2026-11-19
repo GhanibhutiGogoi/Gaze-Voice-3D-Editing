@@ -59,7 +59,7 @@ class ProviderApiTest(unittest.TestCase):
         self.assertEqual(status, 200, body)
         self.assertEqual((body["provider"]["key_hint"], body["provider"]["has_key"]), ("1234", True))
         self.assertNotIn("sk-1234", json.dumps(body))
-        self.assertNotIn("sk-1234", self.t.paths.settings_file.read_text())
+        self.assertNotIn("sk-1234", self.t.paths.settings_file.read_text(encoding="utf-8"))
         sent = [kw["input_text"] for call, kw in zip(self.t.runner.calls, self.t.runner.call_kwargs)
                 if call == ("security", "-i")]
         self.assertIn('-w "sk-1234"', sent[0])
@@ -156,3 +156,14 @@ class ProviderApiTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# These fixtures describe macOS; Windows adapters have their own tests.
+def setUpModule():
+    global _mac_adapters
+    import importlib
+    from .helpers import macos_adapters
+    _mac_adapters = macos_adapters(*(importlib.import_module(name) for name in ['gazevoice.providers']))
+
+def tearDownModule():
+    _mac_adapters.close()

@@ -28,7 +28,7 @@ from typing import Callable
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--engine", choices=["parakeet", "whisper"], required=True)
+    parser.add_argument("--engine", choices=["parakeet", "whisper", "faster-whisper"], required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--audio")
     parser.add_argument("--download-only", action="store_true")
@@ -157,6 +157,28 @@ class WhisperEngine:
         return {"text": result["text"].strip(), "words": words}
 
 
+class FasterWhisperEngine:
+    def __init__(self, model: str):
+        from faster_whisper import WhisperModel
+        self.model = WhisperModel(model, device="cpu", compute_type="int8",
+                                  local_files_only=os.environ.get("HF_HUB_OFFLINE") == "1")
+
+    def transcribe(self, audio: str, prompt: str | None = None) -> dict:
+        segments, _ = self.model.transcribe(audio, initial_prompt=prompt or None, word_timestamps=True)
+        segments = list(segments)
+        return {"text": "".join(s.text for s in segments).strip(),
+                "words": [{"text": w.word.strip(), "start": round(w.start, 3), "end": round(w.end, 3)}
+                          for s in segments for w in s.words or [] if w.word.strip()]}
+
+
+def failure_message(code: int, detail: str = "") -> str:
+    if code & 0xFFFFFFFF == 0xC0000005:
+        return ("Windows speech runtime crashed (0xC0000005: access violation). "
+                "Use Repair speech on the Speech-to-text unit to rebuild its private Python environment.")
+    explanation = " ".join(detail.split())[-300:]
+    return f"Transcription failed: {explanation or f'exit {code}'}"
+
+
 class FakeEngine:
     """Canned results so tests can drive the real protocol without MLX."""
 
@@ -174,12 +196,14 @@ class FakeEngine:
 def load_engine(engine: str, model: str):
     if os.environ.get("GAZEVOICE_FAKE_ENGINE"):
         return FakeEngine(model)
+    if engine == "faster-whisper":
+        return FasterWhisperEngine(model)
     return ParakeetEngine(model) if engine == "parakeet" else WhisperEngine(model)
 
 
 def serve(args: argparse.Namespace) -> int:
     # Our replies own the real stdout; anything a library prints goes to stderr instead.
-    replies = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1)
+    replies = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1, encoding="utf-8")
     sys.stdout = sys.stderr
     started = time.monotonic()
     engine = load_engine(args.engine, args.model)

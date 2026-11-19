@@ -43,6 +43,7 @@ class CountingTraining:
         self.finished = True
 
 
+@unittest.skipUnless(hasattr(signal, "SIGHUP"), "POSIX terminal signals; Windows lifecycle is tested separately")
 class StopSignalTest(unittest.TestCase):
     """Closing the Terminal window (SIGHUP) or `kill` (SIGTERM) must close the control center the way Ctrl+C does,
     so a training run is stopped and its model saved instead of being left holding port 5004."""

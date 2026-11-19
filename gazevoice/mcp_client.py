@@ -5,6 +5,8 @@ Enough to prove a server works: initialize, list tools, call a tool.
 
 from __future__ import annotations
 
+from .platforms import KILL, command_argv, process_options, signal_process_tree, spawn
+
 import collections
 import itertools
 import json
@@ -48,8 +50,8 @@ class StdioMcpClient:
         env = dict(os.environ)
         env.update(self.env or {})
         try:
-            self.proc = subprocess.Popen(
-                self.argv,
+            self.proc = spawn(
+                command_argv(self.argv),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -58,10 +60,12 @@ class StdioMcpClient:
                 bufsize=1,
                 env=env,
                 cwd=self.cwd,
-                start_new_session=True,
+                **process_options(),
             )
         except FileNotFoundError as exc:
             raise McpError(f"{self.argv[0]}: not found") from exc
+        except OSError as exc:
+            raise McpError(f"{self.argv[0]} could not start: {exc}") from exc
         self._stdout_thread = threading.Thread(target=self._read_stdout, daemon=True)
         self._stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
         self._stdout_thread.start()
@@ -81,7 +85,7 @@ class StdioMcpClient:
             proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
+                signal_process_tree(proc, KILL)
             except (ProcessLookupError, PermissionError):
                 proc.kill()
             proc.wait(timeout=2)

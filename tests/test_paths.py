@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest import mock
 
 from gazevoice.paths import AppPaths, default_paths, tilde
+from gazevoice.platforms import app_data
 
 
 class PathsTest(unittest.TestCase):
@@ -21,10 +22,10 @@ class PathsTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("GAZEVOICE_HOME", None)
             paths = default_paths()
-        self.assertEqual(paths.root, Path.home() / "Library" / "Application Support" / "GazeVoice")
+        self.assertEqual(paths.root, app_data("GazeVoice"))
 
     def test_tilde(self):
-        self.assertEqual(tilde(Path.home() / "Library" / "x"), "~/Library/x")
+        self.assertEqual(tilde(Path.home() / "Library" / "x"), "~" + os.sep + "Library" + os.sep + "x")
         self.assertEqual(tilde("/opt/homebrew/bin"), "/opt/homebrew/bin")
         self.assertEqual(tilde(str(Path.home()) + "-other/x"), str(Path.home()) + "-other/x")
 

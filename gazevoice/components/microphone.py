@@ -15,10 +15,13 @@ import wave
 from pathlib import Path
 
 from ..jobs import Job, JobError
+from ..platforms import audio_input, install_command, is_windows
 from ..runner import TIMED_OUT
 from .base import ActionSpec, Component, ComponentState, Health
 
-LIST_DEVICES = ["ffmpeg", "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""]
+LIST_DEVICES = (["ffmpeg", "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"]
+                if is_windows() else
+                ["ffmpeg", "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""])
 TEST_SECONDS = 3
 SILENCE_DBFS = -60.0
 DEVICE_CACHE_SECONDS = 30.0  # listing devices takes ffmpeg ~2.5 s
@@ -36,6 +39,31 @@ _DEVICES_HEADER = re.compile(r"AVFoundation (audio|video) devices")
 # identity check, but accept localized camera words and exclude localized Desk View devices.
 _BUILT_IN_CAMERA = re.compile(r"(?=.*(MacBook|FaceTime))(?=.*(Camera|HD|相机|相機|攝影機))", re.IGNORECASE)
 _NOT_A_FACE_CAMERA = re.compile(r"desk view|桌上视角|桌上視角|capture screen", re.IGNORECASE)
+_PHONE_OR_VIRTUAL_CAMERA = re.compile(r"iphone|ipad|android|phone|droidcam|iriun|epoccam|continuity|obs|virtual|手机|虛擬|虚拟", re.IGNORECASE)
+
+if is_windows():
+    PERMISSION_HELP = ("Allow microphone access for desktop apps in Windows Settings > Privacy & security > Microphone, "
+                       "and check that the input is not muted.")
+
+
+def parse_dshow_devices(listing: str, kind: str) -> list[tuple[str, str]]:
+    """Use DirectShow's unique alternative names; friendly names can be duplicated."""
+    devices = []
+    pending = None
+    for line in listing.splitlines():
+        match = re.search(r'"(.+?)" \((audio|video)\)', line)
+        if match:
+            if pending is not None:
+                devices.append(pending)
+            pending = (match.group(1), match.group(1)) if match.group(2) == kind else None
+        elif pending is not None:
+            alternative = re.search(r'Alternative name "(.+)"', line)
+            if alternative:
+                devices.append((alternative.group(1), pending[1]))
+                pending = None
+    if pending is not None:
+        devices.append(pending)
+    return devices
 
 
 def _devices_listed_under(listing: str, kind: str) -> list[tuple[str, str]]:
@@ -97,6 +125,8 @@ def pick_camera(devices: list[tuple[str, str]], setting: str) -> tuple[str, str]
     usable = face_cameras(devices)
     if setting:
         return next(((index, name) for index, name in usable if name == setting), None)
+    if is_windows():
+        return next(((index, name) for index, name in usable if not _PHONE_OR_VIRTUAL_CAMERA.search(name)), None)
     return next(((index, name) for index, name in usable if _BUILT_IN_CAMERA.search(name)), None)
 
 
@@ -127,7 +157,7 @@ class Microphone(Component):
 
     def _verified(self, index: str) -> dict | None:
         try:
-            data = json.loads(self._verified_file.read_text())
+            data = json.loads(self._verified_file.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return None
         if not isinstance(data, dict) or data.get("device") != index:
@@ -140,19 +170,21 @@ class Microphone(Component):
         else:
             listing = self.runner.run(LIST_DEVICES, timeout=10)
             if listing.returncode == TIMED_OUT:
-                raise JobError("macOS didn't list the microphones and cameras in time. Try again in a moment.")
+                raise JobError("The operating system didn't list the devices in time. Try again in a moment.")
         return listing.stderr + listing.stdout
 
     def devices(self, fresh: bool = False) -> list[tuple[str, str]]:
-        return parse_avfoundation_devices(self._listing(fresh))
+        listing = self._listing(fresh)
+        return parse_dshow_devices(listing, "audio") if is_windows() else parse_avfoundation_devices(listing)
 
     def cameras(self, fresh: bool = False) -> list[tuple[str, str]]:
         """Every video device from the same listing as the microphones, so asking costs no second probe."""
-        return parse_video_devices(self._listing(fresh))
+        listing = self._listing(fresh)
+        return parse_dshow_devices(listing, "video") if is_windows() else parse_video_devices(listing)
 
     def check(self) -> ComponentState:
         if not self.runner.which("ffmpeg"):
-            install = [ActionSpec("install", "Install ffmpeg")] if self.runner.which("brew") else []
+            install = [ActionSpec("install", "Install ffmpeg")] if self.runner.which("winget" if is_windows() else "brew") else []
             return self.state(Health.MISSING, "ffmpeg is needed to hear the microphone.", actions=install)
         devices = self.devices()
         if not devices:
@@ -184,7 +216,7 @@ class Microphone(Component):
         )
 
     def _record_with_ffmpeg(self, device: str, out: Path, seconds: int) -> None:
-        argv = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "avfoundation", "-i", f":{device}",
+        argv = ["ffmpeg", "-hide_banner", "-loglevel", "error", *audio_input(device, windows=is_windows()),
                 "-t", str(seconds), "-ac", "1", "-ar", "16000", "-y", str(out)]
         result = self.runner.run(argv, timeout=seconds + 15)
         if not result.ok:
@@ -192,11 +224,11 @@ class Microphone(Component):
             raise JobError(f"Couldn't record from the microphone ({detail or result.returncode}). {PERMISSION_HELP}")
 
     def action_install(self, job: Job) -> dict:
-        if not self.runner.which("brew"):
-            raise JobError("Homebrew isn't installed. Get it from brew.sh, then install ffmpeg.")
-        code = self.runner.stream(["brew", "install", "ffmpeg"], job.log, timeout=1800)
+        if not self.runner.which("winget" if is_windows() else "brew"):
+            raise JobError("Install ffmpeg and add it to PATH, or install the system package manager (WinGet / Homebrew).")
+        code = self.runner.stream(install_command("ffmpeg"), job.log, timeout=1800)
         if code != 0:
-            raise JobError(f"Homebrew couldn't install ffmpeg (exit {code}).")
+            raise JobError(f"Couldn't install ffmpeg (exit {code}). Restart GazeVoice after installing to refresh PATH.")
         return {"installed": True}
 
     def action_test(self, job: Job) -> dict:

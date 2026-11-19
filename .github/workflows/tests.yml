@@ -1,0 +1,36 @@
+name: Cross-platform tests
+
+on:
+  pull_request:
+  push:
+    branches: [main, 'codex/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Python regression suite (no model downloads)
+        run: python -B -m unittest discover -s tests -t . -q
+      - name: JavaScript syntax
+        run: |
+          node --check gazevoice/server/static/app.js
+          node --check gazevoice/server/static/calibrate.js

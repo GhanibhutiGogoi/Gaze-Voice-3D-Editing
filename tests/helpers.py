@@ -3,6 +3,12 @@
 import plistlib
 import tempfile
 from pathlib import Path
+import ctypes
+import os
+import sys
+import time
+from contextlib import ExitStack
+from unittest.mock import patch
 
 from gazevoice.components.base import Context
 from gazevoice.events import EventBus
@@ -10,6 +16,42 @@ from gazevoice.jobs import Job
 from gazevoice.paths import AppPaths
 from gazevoice.runner import FakeRunner
 from gazevoice.settings import Settings
+
+
+def macos_adapters(*modules):
+    """Exercise the existing macOS adapter contracts on either test host."""
+    stack = ExitStack()
+    for module in modules:
+        if hasattr(module, "is_windows"):
+            stack.enter_context(patch.object(module, "is_windows", return_value=False))
+        if hasattr(module, "is_apple_silicon"):
+            stack.enter_context(patch.object(module, "is_apple_silicon", return_value=True))
+        if hasattr(module, "install_command"):
+            stack.enter_context(patch.object(module, "install_command", side_effect=lambda package, cask=False:
+                ["brew", "install", *(["--cask"] if cask else []), package]))
+    return stack
+
+
+def process_alive(pid):
+    if sys.platform != "win32":
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+    from ctypes import wintypes
+    api = ctypes.WinDLL("kernel32", use_last_error=True)
+    api.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    api.OpenProcess.restype = wintypes.HANDLE
+    api.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    api.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = api.OpenProcess(0x100000, False, pid)
+    if not handle:
+        return ctypes.get_last_error() != 87
+    try:
+        return api.WaitForSingleObject(handle, 0) == 258
+    finally:
+        api.CloseHandle(handle)
 
 
 class TempCtx:

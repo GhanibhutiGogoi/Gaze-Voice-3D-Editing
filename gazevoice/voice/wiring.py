@@ -105,7 +105,7 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
     from ..components.brains import write_mcp_config
     from ..components.gaze import WORKER as GAZE_WORKER, Gaze, camera_gaze_installed, load_calibration
     from ..components.microphone import Microphone, pick_camera, pick_device
-    from ..components.speech import ENGINES, WORKER, Speech
+    from ..components.speech import WORKER, Speech, engine_for
 
     paths, settings = ctx.paths, ctx.settings
     microphone = Microphone(ctx)
@@ -118,7 +118,7 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
         return MicStream(mic_argv(picked[0]))
 
     speech = Speech(ctx)
-    engine = ENGINES[settings.stt_engine]
+    engine = engine_for(settings.stt_engine)
     host = settings.voice_host
     mcp_server = host
     if host == "blender":
@@ -156,7 +156,7 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
         editing = step == "editor"
         return ApiSession(
             ChatClient(config, key), getattr(settings, f"{step}_api_model"),
-            (editor_prompt if editing else refiner_prompt).read_text(), kind=config.kind,
+            (editor_prompt if editing else refiner_prompt).read_text(encoding="utf-8"), kind=config.kind,
             thinking=getattr(settings, f"{step}_api_thinking"),
             mcp_factory=host_mcp(server_cmd, timeout=MCP_SECONDS[host]) if editing else None, provider=config.name,
             max_steps=EDITOR_STEPS if editing else 1, host="Unity" if host == "unity" else "Blender",
@@ -165,7 +165,7 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
     def editor():
         source = sources["editor"]
         if source == "codex":
-            return CodexSession(paths.work, editor_prompt.read_text(), mcp_cmd=server_cmd, mcp_server=mcp_server)
+            return CodexSession(paths.work, editor_prompt.read_text(encoding="utf-8"), mcp_cmd=server_cmd, mcp_server=mcp_server)
         if source == "claude":
             return claude(editor_prompt, settings.editor_model, settings.editor_effort, mcp_config, EDITOR_STEPS,
                           warmup=EDITOR_WARMUP, require_mcp=mcp_server, timeout=150)
@@ -174,7 +174,7 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
     def refiner():
         source = sources["refiner"]
         if source == "codex":
-            return CodexSession(paths.work, refiner_prompt.read_text())
+            return CodexSession(paths.work, refiner_prompt.read_text(encoding="utf-8"))
         if source == "claude":
             return claude(refiner_prompt, settings.refiner_model, settings.refiner_effort, None, 1,
                           warmup=REFINER_WARMUP, timeout=90)

@@ -90,6 +90,12 @@ class CatalogTest(unittest.TestCase):
 
 
 class KeyStoreTest(unittest.TestCase):
+    def setUp(self):
+        # This class tests macOS commands through FakeRunner, never the host credential store.
+        self.platform = mock.patch("gazevoice.providers.is_windows", return_value=False)
+        self.platform.start()
+        self.addCleanup(self.platform.stop)
+
     def test_keystore_keeps_the_key_out_of_argv(self):
         runner = FakeRunner()
         runner.add(["security", "-i"])

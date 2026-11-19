@@ -3,7 +3,7 @@
 Newline-delimited JSON over a local TCP socket. This module never imports bpy,
 so it can be tested outside Blender.
 
-    {"cmd": "ping"}                -> {"ok": true, "bridge": "0.3.4", "blender": "5.2.2", "key": "⌥ Space"}
+    {"cmd": "ping"}                -> {"ok": true, "bridge": "0.3.5", "blender": "5.2.2", "key": "⌥ Space"}
     {"cmd": "selection"}           -> {"ok": true, "active": "Cube", "selected": ["Cube"], "mode": "OBJECT"}
     {"cmd": "status", "text": "…", -> {"ok": true}   (shown in the 3D viewport and sidebar)
      "state": "listening"}
@@ -75,6 +75,8 @@ top left. Nothing here edits the scene.
 
 from __future__ import annotations
 
+import sys
+
 import base64
 import json
 import math
@@ -85,7 +87,7 @@ import zlib
 from typing import Callable, Protocol
 
 BRIDGE_PORT = 9877
-BRIDGE_VERSION = "0.3.4"
+BRIDGE_VERSION = "0.3.5"
 MAX_STATUS = 200
 MAX_NAMES = 300
 MAX_LINE = 64 * 1024
@@ -516,6 +518,8 @@ def key_label(key_type: str, ctrl: bool = False, alt: bool = False, shift: bool 
     """A key binding the way a Mac writes it: "⌥ Space", "⌃⇧ Numpad 0"."""
     mods = "".join(sym for on, sym in ((ctrl, "⌃"), (alt, "⌥"), (shift, "⇧"), (oskey, "⌘")) if on)
     name = _KEY_NAMES.get(key_type) or key_type.replace("_", " ").title()
+    if is_windows():
+        return "+".join([label for on, label in ((ctrl, "Ctrl"), (alt, "Alt"), (shift, "Shift"), (oskey, "Win")) if on] + [name])
     return f"{mods} {name}" if mods else name
 
 
@@ -760,3 +764,7 @@ def _gaze_crop_result(scene: SceneAccess) -> dict:
     if "error" in result:
         return {"ok": False, "error": result["error"]}
     return {"ok": True, "pending": True}
+
+
+def is_windows():
+    return sys.platform == "win32"

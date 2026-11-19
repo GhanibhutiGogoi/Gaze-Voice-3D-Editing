@@ -1,4 +1,4 @@
-"""The check that a picture sent to Claude Code is cleaned up: send a random one, then search this Mac for any copy.
+"""The check that a picture sent to Claude Code is cleaned up: send a random one, then search this computer for any copy.
 
 The picture goes through the same route as a real one (`ask_about_picture`), the process is allowed to finish and exit,
 and then the places a copy could be kept are searched for three fingerprints of it: a stretch of its noise as the
@@ -22,6 +22,16 @@ What the search can and can't see, so a pass is not read as more than it is:
 """
 
 from __future__ import annotations
+
+from ..platforms import app_data, is_windows
+
+# The file-opening boundary follows the actual host even when tests exercise
+# the macOS search-root policy on Windows.
+if is_windows():
+    from ..windows_files import open_regular as _open_regular
+else:
+    def _open_regular(path):
+        return os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
 
 import base64
 import errno
@@ -53,7 +63,7 @@ MAX_LISTED = 5  # copies and trouble spots named in a message; the rest are coun
 _VANISHED = (errno.ENOENT, errno.ELOOP)  # a file that went away, or became a link, while it was being looked at
 
 CHECK_CONFIRM = (
-    "Sends one small random picture to Claude Code, the way a real one is sent, then looks through this Mac for any copy "
+    "Sends one small random picture to Claude Code, the way a real one is sent, then looks through this computer for any copy "
     "it kept. It never touches your scene or your camera. Uses a little of your plan."
 )
 
@@ -89,11 +99,15 @@ def leftover_roots(paths: AppPaths) -> list[Place]:
     places = [Place(Path(configured).expanduser(), strict=True, required=True)] if configured else []
     places.append(Place(home / ".claude", strict=True, required=not configured))
     places += [Place(home / ".claude.json", strict=True), Place(temp, strict=True, required=True),
-               Place(Path("/tmp"), strict=True), Place(paths.root, strict=True, required=True)]
+               Place(paths.root, strict=True, required=True)]
+    if not is_windows():
+        places.append(Place(Path("/tmp"), strict=True))
     if os.environ.get("CLAUDE_CODE_TMPDIR"):
         places.append(Place(Path(os.environ["CLAUDE_CODE_TMPDIR"]), strict=True, required=True))
     wide = [home / ".local", library / "Application Support", library / "Caches", library / "Logs",
             library / "Preferences"]
+    if is_windows():
+        wide = [home / ".local", app_data(), app_data(roaming=True)]
     if temp.name == "T":  # /var/folders/<x>/<y>/T: its parent holds the rest of this user's temp and cache folders
         wide.append(temp.parent)
     places += [Place(path) for path in wide]
@@ -133,7 +147,7 @@ def _could_be_mine(path: str) -> bool:
     """Whether this path belongs to this user. When that can't be told, it might: an unknown is not an "ignore"."""
     try:
         return os.lstat(path).st_uid == os.getuid()
-    except OSError:
+    except (OSError, AttributeError):
         return True
 
 
@@ -182,6 +196,17 @@ def _files_since(root: Path, since: float, shortest: int, scan: Scan, judge: _Ju
     else:
         walk = os.walk(real, onerror=lambda exc: _note(scan, judge, exc.filename or real, exc, since, folder=True))
     for folder, _dirs, names in walk:
+        # os.walk does not follow symlinks, but Windows junctions are also
+        # reparse points and must not lead a scan outside its selected roots.
+        if is_windows():
+            for name in list(_dirs):
+                path = os.path.join(folder, name)
+                try:
+                    if os.lstat(path).st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                        _dirs.remove(name)
+                except OSError as exc:
+                    _dirs.remove(name)
+                    _note(scan, judge, path, exc, since, folder=True)
         for name in names:
             path = os.path.join(folder, name)
             try:
@@ -199,7 +224,7 @@ def _holds(path: str, markers: Sequence[bytes], keep: int) -> bool:
 
     Raises OSError if the file can't be opened or read.
     """
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    fd = _open_regular(path)
     tail = b""
     with os.fdopen(fd, "rb") as handle:
         while True:
@@ -312,7 +337,7 @@ def run_leftover_check(
     roots: Sequence[Place | Path] | None = None,
     clock: Callable[[], float] = time.time,
 ) -> dict:
-    """Send a random picture through the real describer route, then search this Mac for any copy of it.
+    """Send a random picture through the real describer route, then search this computer for any copy of it.
 
     Passes only if the call worked, the process has exited, nothing was found, and every place that must be searched
     could be; then it saves `state/gaze-picture-check.json` for the installed Claude Code version. A failed call, or a
@@ -341,7 +366,7 @@ def run_leftover_check(
     seconds = round(time.monotonic() - began, 1)
     job.log(f"Claude Code answered in {seconds} s: {clean_description(reply) or '(nothing to repeat)'}")
     places = list(roots) if roots is not None else leftover_roots(paths)
-    job.log(f"Looking for a copy of the picture in {len(places)} places on this Mac…")
+    job.log(f"Looking for a copy of the picture in {len(places)} places on this computer…")
     scan = search(picture.markers, since, places)
     if scan.skipped:
         job.log(f"{len(scan.skipped)} files or folders in other users' space or in places macOS keeps private couldn't "

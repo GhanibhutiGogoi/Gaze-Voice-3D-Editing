@@ -13,7 +13,7 @@ commands, and all of them when the control center stops. Anything a model says a
 viewport can show any text, so `clean_description` reduces it to a short plain line before it is used.
 
 Pictures run only while a check has passed for the installed Claude Code (see leftovers.py): it sends a random picture
-through this same route and searches this Mac for any copy Claude Code kept. The flag that keeps nothing has regressed
+through this same route and searches this computer for any copy Claude Code kept. The flag that keeps nothing has regressed
 before, so a new Claude Code version switches pictures off until the check passes again.
 """
 
@@ -226,7 +226,7 @@ def describe_crop(
     seconds or was stopped by `cancelled()`. Nothing is written to disk and nothing about why it failed is kept.
     """
     try:
-        question = PICTURE_PROMPT.read_text().format(
+        question = PICTURE_PROMPT.read_text(encoding="utf-8").format(
             word=one_line(word, WORD_CHARS) or "this",
             object=one_line(object_name, OBJECT_NAME_CHARS) or "a 3D model",
         )
@@ -262,7 +262,7 @@ def read_picture_check(path: Path) -> dict | None:
     or a failure). Either way pictures are off.
     """
     try:
-        data = json.loads(Path(path).read_text())
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     if not isinstance(data, dict) or data.get("passed") is not True:

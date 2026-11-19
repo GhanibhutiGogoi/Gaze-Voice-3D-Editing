@@ -8,6 +8,8 @@ command is one `codex exec` run that resumes the previous thread.
 
 from __future__ import annotations
 
+from ..platforms import KILL, command_argv, process_options, signal_process_tree, spawn
+
 import collections
 import itertools
 import json
@@ -43,11 +45,11 @@ class TurnResult:
 
 def _end_process(proc: subprocess.Popen, grace: float = 2.0) -> None:
     """SIGINT the process group, then SIGKILL it if it's still running `grace` seconds later."""
-    for sig in (signal.SIGINT, signal.SIGKILL):
+    for sig in (signal.SIGINT, KILL):
         if proc.poll() is not None:
             return
         try:
-            os.killpg(proc.pid, sig)
+            signal_process_tree(proc, sig)
         except (ProcessLookupError, PermissionError):
             return
         try:
@@ -119,12 +121,14 @@ class ClaudeSession:
 
     def start(self, warmup: str | None = None, require_mcp: str | None = None, timeout: float = 90.0) -> None:
         try:
-            self.proc = subprocess.Popen(
-                self.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                encoding="utf-8", errors="replace", bufsize=1, cwd=self.cwd, env=self.env, start_new_session=True,
+            self.proc = spawn(
+                command_argv(self.argv), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                encoding="utf-8", errors="replace", bufsize=1, cwd=self.cwd, env=self.env, **process_options(),
             )
         except FileNotFoundError as exc:
             raise BrainError(f"{self.argv[0]} isn't installed.") from exc
+        except OSError as exc:
+            raise BrainError(f"{self.argv[0]} could not start: {exc}") from exc
         self._threads = [
             threading.Thread(target=self._read_stdout, daemon=True, name="brain-out"),
             threading.Thread(target=self._read_stderr, daemon=True, name="brain-err"),
@@ -259,7 +263,7 @@ class ClaudeSession:
         proc = self.proc
         if proc is not None and proc.poll() is None:
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
+                signal_process_tree(proc, KILL)
             except (ProcessLookupError, PermissionError):
                 pass
 
@@ -276,7 +280,7 @@ class ClaudeSession:
             proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
+                signal_process_tree(proc, KILL)
             except (ProcessLookupError, PermissionError):
                 proc.kill()
             proc.wait(timeout=3)
@@ -307,10 +311,10 @@ class ClaudeSession:
         proc = self.proc
         if proc is None:
             return
-        for sig, patience in ((None, wait), (signal.SIGTERM, term_wait), (signal.SIGKILL, 3.0)):
+        for sig, patience in ((None, wait), (signal.SIGTERM, term_wait), (KILL, 3.0)):
             if sig is not None:
                 try:
-                    os.killpg(proc.pid, sig)
+                    signal_process_tree(proc, sig)
                 except (ProcessLookupError, PermissionError):
                     proc.kill()
             try:
@@ -373,12 +377,14 @@ class CodexSession:
         began = time.monotonic()
         self._interrupted = self._timed_out = False
         try:
-            self.proc = subprocess.Popen(
-                argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                encoding="utf-8", errors="replace", cwd=self.cwd, env=self.env, start_new_session=True,
+            self.proc = spawn(
+                command_argv(argv), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                encoding="utf-8", errors="replace", cwd=self.cwd, env=self.env, **process_options(),
             )
         except FileNotFoundError as exc:
             raise BrainError("codex isn't installed.") from exc
+        except OSError as exc:
+            raise BrainError(f"codex could not start: {exc}") from exc
         watchdog = threading.Timer(timeout, self._expire)
         watchdog.daemon = True
         watchdog.start()
