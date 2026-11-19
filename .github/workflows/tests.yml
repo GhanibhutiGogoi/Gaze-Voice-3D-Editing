@@ -28,6 +28,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Control-center signal lifecycle
+        run: python -B -u -m unittest tests.test_main_signals -v
       - name: Python regression suite (no model downloads)
         run: python -B -u tests/run_ci.py
       - name: JavaScript syntax

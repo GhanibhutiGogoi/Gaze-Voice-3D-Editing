@@ -69,7 +69,9 @@ class StopSignalTest(unittest.TestCase):
                         out, err = proc.communicate(timeout=5)
                         self.fail(f"Control center exited before {name}: {proc.returncode} {out} {err}")
                     if time.monotonic() >= deadline:
-                        self.fail(f"Control center did not report {name}")
+                        proc.kill()
+                        out, err = proc.communicate(timeout=5)
+                        self.fail(f"Control center did not report {name}: {out} {err}")
                     time.sleep(0.02)
 
             try:

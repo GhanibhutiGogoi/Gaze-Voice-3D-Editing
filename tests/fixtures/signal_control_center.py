@@ -1,11 +1,14 @@
 """Control-center subprocess for POSIX lifecycle integration tests."""
 
+import faulthandler
 import json
 import signal
 import sys
 import time
 from pathlib import Path
 from unittest import mock
+
+faulthandler.dump_traceback_later(15, exit=True)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -42,6 +45,7 @@ def ready():
     path = root / "ready.json"
     if path.exists():
         return
+    faulthandler.cancel_dump_traceback_later()
     payload = {"terminate_handled": callable(signal.getsignal(signal.SIGTERM)),
                "hangup_ignored": signal.getsignal(signal.SIGHUP) == signal.SIG_IGN}
     pending = root / "ready.tmp"
