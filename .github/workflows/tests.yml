@@ -29,7 +29,7 @@ jobs:
         with:
           node-version: '22'
       - name: Python regression suite (no model downloads)
-        run: python -B -m unittest discover -s tests -t . -q
+        run: python -B -u tests/run_ci.py
       - name: JavaScript syntax
         run: |
           node --check gazevoice/server/static/app.js
