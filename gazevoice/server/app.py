@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from socketserver import TCPServer
 from typing import Sequence
 from urllib.parse import parse_qs, unquote, urlsplit
 
@@ -839,6 +840,12 @@ class _Handler(BaseHTTPRequestHandler):
 
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
+
+    def server_bind(self) -> None:
+        # HTTPServer resolves the bound address with getfqdn(), which can block
+        # on a machine's DNS configuration. This local API needs only its address.
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
     def handle_error(self, request, client_address) -> None:
         # A browser closing a tab mid-request is routine; anything else is worth printing.

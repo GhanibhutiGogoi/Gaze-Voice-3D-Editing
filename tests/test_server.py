@@ -91,6 +91,18 @@ class Workflow(Component):
             Workflow.release.wait(5)
 
 
+class ServerStartupTest(unittest.TestCase):
+    def test_local_server_starts_without_reverse_dns(self):
+        center = mock.Mock()
+        with mock.patch.object(socket, "getfqdn", side_effect=AssertionError("Reverse DNS must not run")):
+            server = make_server(center, port=0)
+        self.addCleanup(server.server_close)
+        self.assertEqual(server.server_name, "127.0.0.1")
+        self.assertEqual(server.server_port, server.server_address[1])
+        self.assertGreater(server.server_port, 0)
+        self.assertEqual(center.url, f"http://127.0.0.1:{server.server_port}")
+
+
 class ServerTest(unittest.TestCase):
     def setUp(self):
         self.t = TempCtx()
