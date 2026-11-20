@@ -17,7 +17,7 @@ from ..paths import tilde
 from ..probes import ProbeCache
 from ..runner import CommandRunner
 from ..platforms import app_data, install_command, is_windows, launch_app, process_running
-from ..settings import save_settings, update_settings
+from ..settings import project_key, save_settings, unity_project_of, update_settings
 from ..unity_install import add_bridge, bridge_current
 from .base import ActionSpec, Component, Health
 
@@ -26,6 +26,11 @@ EDITOR_ROOTS = (Path("/Applications/Unity/Hub/Editor"),)
 HUB_CONFIG = Path.home() / "Library" / "Application Support" / "UnityHub"
 PROJECTS_DIR = Path.home() / "Unity"
 PROJECT_NAME = "GazeVoice"
+VR_PROJECT_NAME = "GazeVoice VR"  # Unity VR's project: its own, so the Unity one is never touched
+VR_TEMPLATE = "com.unity.template.vr"  # Unity's VR template: the XR Origin rig with controllers, moving and teleporting
+VR_SETUP = "GazeVoiceVRSetup.Batch"  # unity_package/Editor/VR/GazeVoiceVRSetup.cs
+NO_VR_TEMPLATE = ("Unity's VR template isn't downloaded yet. In Unity Hub, press New project, pick VR and press "
+                  "Download template, then try again.")
 CLI_FALLBACK = Path("/opt/homebrew/bin/unity")  # a GUI-started app may not have Homebrew on its PATH
 HUB_CASK, CLI_CASK = "unity-hub", "unity-cli"
 MIN_UNITY = (2022, 3)  # matches "unity" in unity_package/package.json
@@ -163,14 +168,31 @@ def project_problem(project: Path) -> str | None:
     return None
 
 
-def next_project_path(parent: Path) -> Path:
+def next_project_path(parent: Path, name: str = PROJECT_NAME) -> Path:
     """A folder for a new project. It never exists yet, so a failed attempt can safely be cleaned up."""
     number = 1
     while True:
-        path = Path(parent) / (PROJECT_NAME if number == 1 else f"{PROJECT_NAME}{number}")
+        path = Path(parent) / (name if number == 1 else f"{name}{number}")
         if not path.exists():
             return path
         number += 1
+
+
+def template_folders(hub_config: Path | None, editor: UnityEditor) -> list[Path]:
+    """Where project templates are: the ones Unity Hub downloaded, then the ones that came with the editor."""
+    built_in = (editor.app / "Contents" / "Resources" if editor.app.name == "Unity.app"
+                else editor.binary.parent / "Data" / "Resources")
+    return [*([hub_config / "Templates"] if hub_config else []), built_in / "PackageManager" / "ProjectTemplates"]
+
+
+def find_template(name: str, folders: Iterable[Path]) -> Path | None:
+    """The newest copy of the project template `name` (such as com.unity.template.vr-6.1.1.tgz) in `folders`."""
+    found = []
+    for folder in folders:
+        for path in sorted(folder.glob(f"{name}-*.tgz")) if folder.is_dir() else ():
+            version = tuple(int(part) for part in re.findall(r"\d+", path.name[len(name):]))
+            found.append((version, path))
+    return max(found, key=lambda item: item[0])[1] if found else None
 
 
 def is_running(runner: CommandRunner, probes: ProbeCache | None = None) -> bool:
@@ -196,8 +218,18 @@ class _UnityUnit(Component):
         self.cli_fallback = CLI_FALLBACK
 
     @property
+    def vr(self) -> bool:
+        """Unity VR has a project of its own, made from Unity's VR template."""
+        return self.settings.voice_host == "unity_vr"
+
+    @property
+    def project_name(self) -> str:
+        return VR_PROJECT_NAME if self.vr else PROJECT_NAME
+
+    @property
     def project(self) -> Path | None:
-        return Path(self.settings.unity_project) if self.settings.unity_project else None
+        project = unity_project_of(self.settings)
+        return Path(project) if project else None
 
     def editors(self, fresh: bool = False) -> list[UnityEditor]:
         """`fresh` skips the shared cache, for actions that have just installed something."""
@@ -214,7 +246,7 @@ class _UnityUnit(Component):
         return next((editor for editor in editors if editor.version == version), None)
 
     def remember(self, project: Path) -> None:
-        self.ctx.settings = update_settings(self.ctx.settings, {"unity_project": str(project)})
+        self.ctx.settings = update_settings(self.ctx.settings, {project_key(self.settings.voice_host): str(project)})
         save_settings(self.paths.settings_file, self.ctx.settings)
 
     def open_hub(self) -> None:
@@ -229,15 +261,26 @@ class _UnityUnit(Component):
             raise JobError(f"Couldn't open Unity Hub: {result.stderr.strip() or result.returncode}")
 
     def make_project(self, job: Job, editor: UnityEditor) -> Path:
-        project = next_project_path(self.projects_dir)
+        project = next_project_path(self.projects_dir, self.project_name)
+        argv = [editor.binary, "-batchmode", "-quit", "-createProject", project]
+        if self.vr:
+            template = find_template(VR_TEMPLATE, template_folders(self.hub_config, editor))
+            if template is None:
+                if self.hub_app.exists():
+                    self.open_hub()
+                raise JobError(NO_VR_TEMPLATE)
+            argv += ["-cloneFromTemplate", template]
+            job.log(f"Making a new VR project at {tilde(project)} from Unity's VR template ({template.name}) with "
+                    f"Unity {editor.version}. This takes a few minutes…")
+        else:
+            job.log(f"Making a new project at {tilde(project)} with Unity {editor.version}. This takes a few minutes…")
         project.parent.mkdir(parents=True, exist_ok=True)
-        log = self.paths.logs / "unity-new-project.log"
-        job.log(f"Making a new project at {tilde(project)} with Unity {editor.version}. This takes a few minutes…")
-        result = self.runner.run(
-            [editor.binary, "-batchmode", "-quit", "-createProject", project, "-logFile", log],
-            timeout=CREATE_SECONDS)
+        log = self.paths.logs / ("unity-new-vr-project.log" if self.vr else "unity-new-project.log")
+        result = self.runner.run([*argv, "-logFile", log], timeout=CREATE_SECONDS)
         if result.ok and project_problem(project) is None:
             self.remember(project)
+            if self.vr:
+                self._prepare_vr(job, editor, project)
             job.log(f"Made {tilde(project)}")
             return project
         try:
@@ -251,6 +294,19 @@ class _UnityUnit(Component):
             raise JobError(SIGN_IN)
         tail = " ".join(text.split("\n")[-6:]).strip()
         raise JobError(f"Unity couldn't make the project (exit {result.returncode}). {tail} Full log: {tilde(log)}")
+
+
+    def _prepare_vr(self, job: Job, editor: UnityEditor, project: Path) -> None:
+        """Add the GazeVoice package, then let it build the VR scene: a terrain with the template's XR Origin rig,
+        and OpenXR set up for a Meta Quest Pro with eye gaze."""
+        add_bridge(project)
+        log = self.paths.logs / "unity-vr-setup.log"
+        job.log("Building the VR scene: a terrain to work on, the template's player rig, and eye tracking…")
+        result = self.runner.run([editor.binary, "-batchmode", "-quit", "-projectPath", project,
+                                  "-executeMethod", VR_SETUP, "-logFile", log], timeout=CREATE_SECONDS)
+        if not result.ok:
+            raise JobError(f"Unity made {project.name}, but couldn't build its VR scene (exit {result.returncode}). "
+                           f"Open it in Unity and press Prepare VR scene on the VR headset unit. Full log: {tilde(log)}")
 
 
 class Unity(_UnityUnit):
@@ -277,12 +333,17 @@ class Unity(_UnityUnit):
                          "download the latest Unity LTS for Apple silicon (several GB, so this can take a while)")
         project = self.project
         if project is None or project_problem(project):
-            default = self.projects_dir / PROJECT_NAME
+            default = self.projects_dir / self.project_name
             if project_problem(default) is None:
                 steps.append(f"use the project at {tilde(default)}")
+                steps.append("add the GazeVoice package to it")
+            elif self.vr:
+                steps.append(f"make a new VR project from Unity's VR template at "
+                             f"{tilde(next_project_path(self.projects_dir, self.project_name))}")
+                steps.append("add the GazeVoice package and build its VR scene")
             else:
                 steps.append(f"make a new project at {tilde(next_project_path(self.projects_dir))}")
-            steps.append("add the GazeVoice package to it")
+                steps.append("add the GazeVoice package to it")
         elif not bridge_current(project):
             steps.append(f"add the GazeVoice package to {project.name}")
         return steps
@@ -382,7 +443,7 @@ class Unity(_UnityUnit):
         project = self.project
         if project is not None and project_problem(project) is None:
             return project
-        default = self.projects_dir / PROJECT_NAME
+        default = self.projects_dir / self.project_name
         if project_problem(default) is None:
             self.remember(default)
             job.log(f"Using the project at {tilde(default)}")
@@ -443,7 +504,8 @@ class UnityProject(_UnityUnit):
     def check(self):
         actions = [
             ActionSpec("create", "New project",
-                       confirm=f"Make a new Unity project at {tilde(next_project_path(self.projects_dir))}?"),
+                       confirm=f"Make a new {'Unity VR' if self.vr else 'Unity'} project at "
+                               f"{tilde(next_project_path(self.projects_dir, self.project_name))}?"),
             ActionSpec("choose", "Choose…"),
         ]
         project = self.project

@@ -17,6 +17,8 @@ API_THINKING = tuple(dict.fromkeys(value for values in THINKING.values() for val
 STT_ENGINES = ("parakeet", "whisper")
 GAZE_MODES = ("off", "shadow", "on")  # shadow = watch and record where you looked, but change nothing
 GAZE_SOURCES = ("camera", "mouse")  # the mouse stands in for the camera: no calibration, nearly exact
+# Unity VR is Unity with the person in a headset: Unity plays the scene to it, and a controller talks and points.
+VOICE_HOSTS = ("blender", "unity", "unity_vr")
 # Claude Code models by full name; "default" leaves the choice to Claude Code.
 CLAUDE_MODELS = ("default", "claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5")
 EFFORTS = ("default", "low", "medium", "high", "xhigh", "max")  # how much Claude thinks (`claude --effort`)
@@ -29,6 +31,7 @@ class Settings:
     unity_mcp_command: str = ""
     unity_mcp_args: tuple = ()
     unity_project: str = ""  # "" = none yet; otherwise the absolute path of a Unity project
+    unity_vr_project: str = ""  # Unity VR's own project, made from Unity's VR template; never the Unity one
     stt_engine: str = "parakeet"
     mic_device: str = ""  # "" = auto (prefer the built-in mic); otherwise an AVFoundation index
     camera_device: str = ""  # "" = auto (the Mac's own camera); otherwise the camera's name, since its number moves
@@ -52,6 +55,21 @@ class Settings:
         return asdict(self)
 
 
+def editor_host(voice_host: str) -> str:
+    """The editor that takes the edits: Unity VR edits Unity."""
+    return "unity" if voice_host == "unity_vr" else voice_host
+
+
+def project_key(voice_host: str) -> str:
+    """The setting that holds the Unity project for this host: Unity VR keeps its own."""
+    return "unity_vr_project" if voice_host == "unity_vr" else "unity_project"
+
+
+def unity_project_of(settings: Settings) -> str:
+    """The Unity project the host in use edits, or "" when there is none yet."""
+    return getattr(settings, project_key(settings.voice_host))
+
+
 def provider_ids(settings: Settings) -> set[str]:
     return {p["id"] for p in settings.providers}
 
@@ -66,8 +84,8 @@ def _providers(value: Any) -> tuple:
 
 
 def _check(key: str, value: Any) -> None:
-    if key == "voice_host" and value not in ("blender", "unity"):
-        raise ValueError("voice_host must be blender or unity")
+    if key == "voice_host" and value not in VOICE_HOSTS:
+        raise ValueError("voice_host must be blender, unity or unity_vr")
     if key == "unity_mcp_command" and not (isinstance(value, str) and len(value) <= 500 and value.isprintable()):
         raise ValueError("unity_mcp_command must be a command path")
     if key == "unity_mcp_args" and not (
@@ -75,10 +93,10 @@ def _check(key: str, value: Any) -> None:
         and all(isinstance(item, str) and len(item) <= 1000 and item.isprintable() for item in value)
     ):
         raise ValueError("unity_mcp_args must be a list of command arguments")
-    if key == "unity_project" and not (
+    if key in ("unity_project", "unity_vr_project") and not (
         isinstance(value, str) and len(value) <= 1024 and value.isprintable() and (value == "" or Path(value).is_absolute())
     ):
-        raise ValueError("unity_project must be an absolute folder path")
+        raise ValueError(f"{key} must be an absolute folder path")
     if key in ("editor_source", "refiner_source") and not (isinstance(value, str) and value):
         raise ValueError(f"{key} must be a source name")
     if key in ("editor_api_model", "refiner_api_model") and not (

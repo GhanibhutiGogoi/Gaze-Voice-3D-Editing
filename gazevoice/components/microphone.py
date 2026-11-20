@@ -33,6 +33,7 @@ PERMISSION_HELP = (
     "Check System Settings › Privacy & Security › Microphone and allow the app GazeVoice was started from "
     "(Terminal or your editor), then try again."
 )
+_HEADSET_MIC = re.compile(r"oculus|\bquest\b|meta horizon", re.IGNORECASE)  # "Headset Microphone (Oculus Virtual Audio Device)"
 _DEVICE = re.compile(r"\]\s*\[(\d+)\]\s+(.+?)\s*$")
 _DEVICES_HEADER = re.compile(r"AVFoundation (audio|video) devices")
 # AVFoundation localizes Apple camera names with the system language. Keep the Mac/FaceTime
@@ -93,15 +94,19 @@ def parse_video_devices(listing: str) -> list[tuple[str, str]]:
     return _devices_listed_under(listing, "video")
 
 
-def pick_device(devices: list[tuple[str, str]], setting: str) -> tuple[str, str, bool] | None:
+def pick_device(devices: list[tuple[str, str]], setting: str, headset: bool = False) -> tuple[str, str, bool] | None:
     """(index, name, chosen_automatically) for the setting; "" means auto. None if the index is gone.
 
     Auto prefers the Mac's built-in microphone, then the first input that isn't a
     virtual or meeting-app device (those often come first in AVFoundation's list).
+    With `headset` (Unity VR) it prefers the VR headset's own microphone first, which Link lists as a virtual device.
     """
     names = dict(devices)
     if setting:
         return (setting, names[setting], False) if setting in names else None
+    for index, name in devices if headset else ():
+        if _HEADSET_MIC.search(name):
+            return index, name, True
     for index, name in devices:
         if _BUILT_IN.search(name):
             return index, name, True
@@ -191,7 +196,7 @@ class Microphone(Component):
         if not devices:
             return self.state(Health.ERROR, "No microphones found. Plug one in, then refresh.")
         listing = " | ".join(f"{index}={name}" for index, name in devices)
-        picked = pick_device(devices, self.settings.mic_device)
+        picked = pick_device(devices, self.settings.mic_device, headset=self._for_headset)
         if picked is None:
             return self.state(
                 Health.ERROR,
@@ -217,6 +222,10 @@ class Microphone(Component):
             [test],
         )
 
+    @property
+    def _for_headset(self) -> bool:
+        return self.settings.voice_host == "unity_vr"
+
     def _record_with_ffmpeg(self, device: str, out: Path, seconds: int) -> None:
         argv = ["ffmpeg", "-hide_banner", "-loglevel", "error", *audio_input(device, windows=is_windows()),
                 "-t", str(seconds), "-ac", "1", "-ar", "16000", "-y", str(out)]
@@ -234,7 +243,7 @@ class Microphone(Component):
         return {"installed": True}
 
     def action_test(self, job: Job) -> dict:
-        picked = pick_device(self.devices(fresh=True), self.settings.mic_device)
+        picked = pick_device(self.devices(fresh=True), self.settings.mic_device, headset=self._for_headset)
         if picked is None:
             raise JobError("That microphone isn't connected any more. Pick another in Routing.")
         device, name, _ = picked

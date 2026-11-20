@@ -184,7 +184,11 @@ def _describe_gaze(focus: dict) -> str:
         lead, indent = ("Focus (gaze): ", "  ") if number == 0 else ("  ", "    ")
         if "candidates" not in target:
             point = target.get("point")
-            if point:
+            if point and target.get("plane") == "surface":
+                position = ", ".join(f"{x:.2f}" for x in point)
+                lines.append(f'{lead}"{target["word"]}" at {target["at"]:.1f} s → placement point ({position}) on '
+                             f'{target.get("on") or "the ground"}, where they looked (no object target)')
+            elif point:
                 position = ", ".join(f"{x:.2f}" for x in point)
                 lines.append(f'{lead}"{target["word"]}" at {target["at"]:.1f} s → empty space; '
                              f'placement point ({position}) on {target["plane"]} work plane (no object target)')
@@ -204,6 +208,10 @@ def _describe_gaze(focus: dict) -> str:
     footer = []
     if gaze.get("radius"):
         footer.append(f"gaze is accurate to about {round(gaze['radius'][0] * 100)}% of the viewport")
+    if gaze.get("source") == "head":
+        footer.append("VR gaze from where the head points (no eye tracking), so it is rough")
+    elif gaze.get("source") == "eyes":
+        footer.append("VR gaze from the headset's eye tracking")
     if focus.get("selected") is not None:  # None means Blender couldn't say, which is not the same as nothing
         footer.append(f"selected: {', '.join(focus['selected']) or 'nothing'}")
     if focus.get("mode"):

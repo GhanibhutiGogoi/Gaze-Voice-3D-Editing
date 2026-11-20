@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from typing import Mapping
 
-from ..blender_socket import BridgeClient
+from ..blender_socket import BridgeClient, bridge_request
 from ..components.base import ComponentState, Context, Health
 from ..components.brains import BRAIN_ORDER, brain_pending
 from ..components.mlagents import LIVE_STATES as TRAINING_LIVE
 from ..events import EventBus
 from ..providers import ChatClient, KeyStore
-from ..settings import Settings
+from ..settings import Settings, editor_host
 from .api_brain import ApiSession, host_mcp
 from .audio import MicError, MicStream, mic_argv
 from .brains import BrainError, ClaudeSession, CodexSession, claude_session_argv
@@ -37,6 +37,11 @@ _BLENDER_NEEDED = (
     ("mcp_server", {Health.READY, Health.INSTALLED}, "Blender MCP server"),
     ("bridge", {Health.READY}, "GazeVoice Bridge"),
 )
+
+UNITY_PORT = 9878
+_VR_NEEDED = ("unity_vr", {Health.READY, Health.INSTALLED}, "VR headset")  # installed: Link or Play still to start
+VR_NOTICE = ("VR: the person is wearing the headset while the scene plays, and sees only the scene and the status "
+             "line. Scene edits made now are kept when Play stops.")
 
 
 MCP_SECONDS = {"blender": 180.0, "unity": 330.0}  # how long one tool call may take; Unity's C# can run for 300 s
@@ -73,10 +78,12 @@ def voice_readiness(
     needed = list(_COMMON_NEEDED)
     if settings.voice_host == "blender":
         needed.extend(_BLENDER_NEEDED)
+    elif settings.voice_host == "unity_vr":
+        needed.append(_VR_NEEDED)
     else:
         from ..blender_socket import port_open
 
-        if not port_open("127.0.0.1", 9878):
+        if not port_open("127.0.0.1", UNITY_PORT):
             missing.append("Unity Editor bridge isn't connected. Press Set up Unity in the rack, or open your project in Unity.")
     for cid, good, label in needed:
         state = states.get(cid)
@@ -109,17 +116,18 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
 
     paths, settings = ctx.paths, ctx.settings
     microphone = Microphone(ctx)
+    vr = settings.voice_host == "unity_vr"
 
     def mic() -> MicStream:
         # Picked at each start: plugging in a device can move the one you chose to another number.
-        picked = pick_device(microphone.devices(), settings.mic_device)
+        picked = pick_device(microphone.devices(), settings.mic_device, headset=vr)
         if picked is None:
             raise MicError("That microphone isn't connected. Pick another one in Routing.")
         return MicStream(mic_argv(picked[0]))
 
     speech = Speech(ctx)
     engine = engine_for(settings.stt_engine)
-    host = settings.voice_host
+    host = editor_host(settings.voice_host)
     mcp_server = host
     if host == "blender":
         from ..components.blender import find_blender
@@ -194,9 +202,10 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
     # Both hosts share tracking and grounding. The mouse needs no setup. The camera needs installation and calibration; without those
     # there is no gaze part, and voice uses the selection. A missing camera is found at each start, not here: this
     # service is used again the next time voice starts, and by then the camera may be plugged in.
+    # In VR, Unity follows the eyes (or the head) itself, and voice asks it for each command: there is no gaze part.
     gaze_mode = settings.gaze_mode
     gaze = None
-    if gaze_mode != "off":
+    if gaze_mode != "off" and not vr:
         if settings.gaze_source == "mouse":
             gaze = PointerTracker
         elif camera_gaze_installed(paths):
@@ -220,6 +229,14 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
             return f"Training: {run['run_id']} is waiting for Unity to press Play."
         return f"Training: {run['run_id']} is running, so {PLAY_MODE_SAYING} for it."
 
+    def vr_notice() -> str | None:
+        """While Unity plays, that the person is in the headset. ML-Agents isn't part of Unity VR, so no training line."""
+        try:
+            playing = bridge_request({"cmd": "vr_status"}, port=UNITY_PORT, timeout=1.0).get("playing")
+        except (OSError, ValueError):
+            playing = None
+        return VR_NOTICE if playing else None
+
     factories = Factories(
         bridge=bridge_factory,
         mic=mic,
@@ -229,8 +246,8 @@ def build_voice(ctx: Context, bus: EventBus, sources: Mapping[str, str], keys: K
         editor=editor,
         gaze=gaze,
         pictures=pictures if host == "blender" else None,
-        editor_notice=training_notice if host == "unity" else None,
+        editor_notice=vr_notice if vr else training_notice if host == "unity" else None,
     )
-    return VoiceService(paths.logs, bus, factories, engine=engine.key, brain=sources["editor"], host=host,
+    return VoiceService(paths.logs, bus, factories, engine=engine.key, brain=sources["editor"], host=host, vr=vr,
                         gaze_mode=gaze_mode, gaze_source=settings.gaze_source,
                         camera=ctx.camera if gaze is camera_gaze else None, overlay=ctx.camera)

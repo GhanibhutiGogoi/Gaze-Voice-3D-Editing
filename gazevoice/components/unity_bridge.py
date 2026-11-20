@@ -9,6 +9,7 @@ from ..platforms import app_data, is_windows
 from ..blender_socket import bridge_request, port_open
 from ..jobs import Job, JobError
 from ..mcp_client import McpError, StdioMcpClient
+from ..settings import unity_project_of
 from ..unity_install import PACKAGE_NAME, add_bridge, bridge_current, bridge_installed, remove_bridge
 from ..unity_mcp import TOOLS, server_command
 from .base import ActionSpec, Component, Health
@@ -48,7 +49,8 @@ class UnityBridge(Component):
 
     @property
     def project(self) -> Path | None:
-        return Path(self.settings.unity_project) if self.settings.unity_project else None
+        project = unity_project_of(self.settings)
+        return Path(project) if project else None
 
     def _add_action(self, project: Path, label: str = "Add to project") -> ActionSpec:
         return ActionSpec("install", label, confirm=(

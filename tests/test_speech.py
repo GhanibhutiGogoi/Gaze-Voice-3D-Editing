@@ -256,7 +256,8 @@ class WorkerDownloadTest(unittest.TestCase):
         self.folder = Path(self.tmp.name) / "models--org--m"
         (self.folder / "blobs").mkdir(parents=True)
         self.env = {k: os.environ.get(k) for k in ("HF_HUB_DISABLE_XET", "HF_HUB_DISABLE_PROGRESS_BARS",
-                                                   "HF_HUB_DOWNLOAD_TIMEOUT", "HF_HUB_VERBOSITY")}
+                                                   "HF_HUB_DOWNLOAD_TIMEOUT", "HF_HUB_VERBOSITY",
+                                                   "HF_HUB_DISABLE_IMPLICIT_TOKEN")}
 
     def tearDown(self):
         for key, value in self.env.items():
@@ -287,6 +288,8 @@ class WorkerDownloadTest(unittest.TestCase):
         self.assertEqual(os.environ["HF_HUB_DISABLE_XET"], "1")  # Xet transfers have hung with no timeout
         # The Hub's "set a token for higher rate limits" notice would read like GazeVoice asking for a key.
         self.assertEqual(os.environ["HF_HUB_VERBOSITY"], "error")
+        # The models are public: a saved, expired Hugging Face token would turn the download into a 401.
+        self.assertEqual(os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"], "1")
 
     def test_it_gives_up_after_the_last_attempt(self):
         def fetch(model):

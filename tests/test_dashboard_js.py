@@ -433,6 +433,11 @@ class ShelfTest(unittest.TestCase):
     def test_it_is_called_ml_agents(self):
         self.assertEqual(self.names["mlagents"], "ML-Agents")
 
+    def test_the_headset_has_a_unity_vr_shelf_of_its_own(self):
+        shelves = {group["label"]: group["ids"] for group in self.groups}
+        self.assertEqual(shelves["Unity VR"], ["unity_vr"])
+        self.assertEqual(self.names["unity_vr"], "VR headset")
+
 
 @unittest.skipUnless(NODE, "node isn't installed")
 class ResultLineTest(unittest.TestCase):
@@ -476,6 +481,15 @@ class PicturesRowTest(unittest.TestCase):
         self.assertIn("The dashboard keeps the last 20 pictures in memory so you can see what the AI was shown, and "
                       "drops them when it stops.", source)
         self.assertNotIn("deleted from this Mac", source)
+
+
+@unittest.skipUnless(APP_JS.exists(), "no dashboard script")
+class UnityVrRackTest(unittest.TestCase):
+    def test_unity_vr_leaves_ml_agents_off_the_rack(self):
+        source = APP_JS.read_text(encoding="utf-8")
+        self.assertIn('const offUnits = host === "unity_vr" ? ["mlagents"] : [];', source)
+        self.assertIn("ids.filter((id) => !offUnits.includes(id)).map(component)", source)
+        self.assertIn("flatMap((item) => item.ids), ...offUnits]);", source)
 
 
 FAKE_PAGE = """

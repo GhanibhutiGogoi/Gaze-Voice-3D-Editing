@@ -9,6 +9,7 @@ from .components.brains import BRAIN_ORDER, STEPS as SOURCE_STEPS, resolve_sourc
 from .jobs import Job, JobError
 from .mcp_client import McpError, StdioMcpClient
 from .probes import ProbeTimedOut
+from .settings import editor_host
 
 SEVERITY = {Health.READY: 0, Health.CHECKING: 1, Health.INSTALLED: 2, Health.MISSING: 3, Health.ERROR: 4}
 REFINER, EDITOR = "@refiner", "@editor"  # whatever brain or provider each step uses
@@ -37,9 +38,12 @@ def workflow_stages(
     sources = as_sources(sources)
     marker = {REFINER: "refiner", EDITOR: "editor"}
     parts_by_stage = list(STAGES)
-    if settings is not None and getattr(settings, "voice_host", "blender") == "unity":
+    host = getattr(settings, "voice_host", "blender") if settings is not None else "blender"
+    if editor_host(host) == "unity":
         parts_by_stage[-2] = ("edit", "Editor", (EDITOR, "unity_mcp"))
         parts_by_stage[-1] = ("unity", "Unity", ("unity", "unity_project", "unity_bridge"))
+    if host == "unity_vr":  # the same stage, with the headset as one more part
+        parts_by_stage[-1] = ("unity", "Unity VR", ("unity", "unity_project", "unity_bridge", "unity_vr"))
     stages = []
     for stage_id, label, parts in parts_by_stage:
         resolved = [sources[marker[part]] if part in marker else part for part in parts]
@@ -151,8 +155,11 @@ class WorkflowCheck(Component):
                 raise JobError(f"{component.name} {action.replace('_', ' ')} failed: {exc}") from exc
             job.log(f"✓ {component_id}.{action}: {_brief(result)}")
             passed += 1
-        if self.settings.voice_host == "unity":
+        if editor_host(self.settings.voice_host) == "unity":
             self._check_unity(job)
+            passed += 1
+        if self.settings.voice_host == "unity_vr":
+            self._check_vr(job)
             passed += 1
         job.log("Every stage passed. The workflow is ready.")
         return {"passed": passed}
@@ -184,3 +191,16 @@ class WorkflowCheck(Component):
         except (McpError, OSError) as exc:
             raise JobError(f"Unity MCP test failed: {exc}") from exc
         job.log(f"✓ unity.mcp: {len(tools)} tools")
+
+    def _check_vr(self, job: Job) -> None:
+        """The headset's runtime and the project's XR setup. Unity doesn't have to be in Play mode."""
+        component = self.components.get("unity_vr")
+        if component is None:
+            raise JobError("The VR headset unit isn't part of this setup.")
+        job.log("▶ unity_vr.test")
+        try:
+            result = component.run_action("test", job)
+        except JobError as exc:
+            job.log(f"✗ unity_vr.test: {exc}")
+            raise JobError(f"{component.name} test failed: {exc}") from exc
+        job.log(f"✓ unity_vr.test: {_brief(result)}")

@@ -26,6 +26,7 @@ def _component_classes() -> list[type[Component]]:
     from .speech import Speech
     from .unity import Unity, UnityProject
     from .unity_bridge import UnityBridge, UnityMcp
+    from .unity_vr import UnityVR
 
     return [Microphone, Speech, Gaze, ClaudeCode, Codex, Blender, McpAddon, McpServer, Bridge,
-            Unity, UnityProject, UnityMcp, UnityBridge, MLAgents]
+            Unity, UnityProject, UnityMcp, UnityBridge, UnityVR, MLAgents]

@@ -183,6 +183,37 @@ On an M4 MacBook Air, measured outside Blender:
 
 Real edits take longer with bigger models.
 
+## Talk to Unity in VR
+
+Unity VR is a third host, next to Blender and Unity. Unity plays the scene to a PC VR headset, and you edit it while you're standing in it. It's built for a **Meta Quest Pro over Meta Quest Link on Windows**, and uses the headset's eye tracking for "here" and "this".
+
+Unity VR has **its own project**, `~/Unity/GazeVoice VR`, so your Unity project is never touched.
+
+1. In Routing, choose **Unity VR**. The rack shows the Unity units and a **VR headset** unit.
+2. In Unity Hub, press **New project**, pick **VR** and press **Download template** once.
+3. Press **New project** on the Unity project unit, or **Set up Unity**. GazeVoice:
+   - makes `~/Unity/GazeVoice VR` from that template;
+   - adds the GazeVoice package;
+   - builds the scene `Assets/Scenes/GazeVoice VR.unity`. It has a terrain to build on and the template's XR Origin player, with controllers, moving, turning and teleporting;
+   - turns on OpenXR for Windows with Eye Gaze Interaction and the Quest Pro and Touch controller profiles.
+
+   In a project of your own, **Prepare VR scene** on the VR headset unit does the same. It also clears broken entries out of the VR template's OpenXR settings, which otherwise stop Play with "No OpenXR loader library found".
+4. Open the Meta Horizon Link app and connect the headset. Make Meta Quest Link the active OpenXR runtime.
+5. Start voice and press **Play** in Unity (or **Enter VR** on the headset unit), then put the headset on.
+6. Look where you mean, hold **B** or **Y** on a controller, say "make a sofa here", and let go.
+
+The status line floats in front of you in the headset, and a small dot shows where your gaze is. "Here" and "there" on the ground, or on any surface facing up, place things at the spot you looked at. "This" and "that" are the object you looked at.
+
+**Edits made while playing are kept.** Normally Unity throws away Play mode's changes. In Unity VR, when Play stops, GazeVoice puts each command's changes into the scene and saves it, all as one undo step. That covers new objects, changed objects and deleted objects. Meshes and materials made while playing are saved under `Assets/GazeVoice/VR Edits/`. Only GazeVoice's edits are kept. Where you walked, and what the game did by itself, are not.
+
+**Eye tracking.** Link doesn't pass on the Quest Pro's eye tracking until you turn it on in two places:
+- On the headset: Settings › Movement tracking › Eye tracking.
+- In the Meta Horizon Link app on the PC: Settings › Beta › Developer runtime features, then Eye tracking over Meta Quest Link.
+
+Then press Play again. Without it, gaze follows where your head points, and the VR headset unit says so. The microphone picks the headset's own microphone on Auto.
+
+While playing, the editor doesn't write scripts or add packages, because recompiling would stop VR. Ask for those after you leave Play mode.
+
 ## Train agents with ML-Agents
 
 Unity's [ML-Agents](https://github.com/Unity-Technologies/ml-agents) teaches a game character by trial and error. GazeVoice can run that training for you, so you start, check and stop it by voice. It's for Unity only.

@@ -239,6 +239,7 @@ class ControlCenter:
         snap = voice.snapshot() if voice is not None else {"state": "off", "reason": "", "recent": []}
         if snap.get("state") in ("off", "error"):
             snap["host"] = self.ctx.settings.voice_host
+            snap["vr"] = self.ctx.settings.voice_host == "unity_vr"
         else:
             snap.setdefault("host", self.ctx.settings.voice_host)
         on = snap.get("state") not in ("off", "error")
@@ -275,7 +276,8 @@ class ControlCenter:
                 voice.start()
             except VoiceError as exc:
                 raise JobError(str(exc)) from exc
-            host = "Unity" if getattr(voice, "host", self.ctx.settings.voice_host) == "unity" else "Blender"
+            host = ("Unity VR" if getattr(voice, "vr", False) else
+                    "Unity" if getattr(voice, "host", self.ctx.settings.voice_host) == "unity" else "Blender")
             job.log(f"Voice is on. In {host}, hold {voice.key}, speak, and let go.")
             return {"voice": "on"}
 

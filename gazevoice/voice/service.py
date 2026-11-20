@@ -75,6 +75,7 @@ from .gaze import (
     Target,
     clean_description,
     ground,
+    ground_cast,
     is_clear,
     marker_point,
     area_from,
@@ -109,6 +110,10 @@ EDITOR_WARMUP = "Warm-up, not a command: don't use any tools and don't change an
 READ_ONLY_TOOLS = ("get_", "search_", "render_viewport_to_path")
 POINTER_RADIUS = (0.02, 0.03)  # a mouse is nearly exact: the rays cover this share of the viewport's width and height
 GAZE_LOST = "Gaze lost, using your selection"
+VR_KEY = "B or Y on a controller"  # TalkButtons in unity_package/Editor/VR/GazeVoiceVR.cs
+VR_GAZE_LOST = "Couldn't tell where you looked"
+NO_VR = ("This Unity project can't play to a headset with GazeVoice. Open the Unity VR project (it has OpenXR), "
+         "or update the GazeVoice Bridge on its unit.")
 GAZE_OFF_SCREEN = "Gaze reads off the screen, using your selection. If you were looking at Blender, calibrate gaze again"
 NOT_ON_SCREEN = "Blender isn't on your calibrated screen, using your selection"
 CAMERA_BUSY = "Gaze is using the camera to calibrate or test. Wait for it to finish, then turn voice on."
@@ -247,6 +252,7 @@ class VoiceService:
         gaze_source: str = "camera",
         camera=None,
         overlay=None,
+        vr: bool = False,
     ):
         self.logs_dir = Path(logs_dir)
         self.bus = bus
@@ -254,6 +260,7 @@ class VoiceService:
         self.engine = engine
         self.brain = brain
         self.host = host
+        self.vr = vr  # Unity VR: Unity plays to a headset, and a controller talks and points
         self.gaze_mode = gaze_mode  # "off", "shadow" (record only) or "on" (tell the brains)
         self.gaze_source = gaze_source
         # A CameraClaim shared with gaze calibration, passed only when voice opens the camera: held from start to stop.
@@ -311,6 +318,7 @@ class VoiceService:
                 "brain": self.brain,
                 "engine": self.engine,
                 "host": self.host,
+                "vr": self.vr,
                 "key": self.key,
                 "listening": self._listening,
                 "host_connected": self.host_connected,
@@ -378,6 +386,8 @@ class VoiceService:
 
     def _idle_hint(self) -> str:
         hint = f"Ready · hold {self.key} to talk"
+        if self.vr:
+            return f"{hint} · look where you mean" if self.gaze_mode != "off" else hint
         return f"{hint} · gaze on" if self._camera_on() else hint
 
     def _status(self, text: str, state: str = "working", revert: bool = False) -> None:
@@ -459,7 +469,9 @@ class VoiceService:
                 f"{self.host_label} isn't connected. Open a {self.host_label} project with the GazeVoice Bridge "
                 "installed, then turn voice on."
             ) from exc
-        self.key = hello.get("key") or DEFAULT_KEY
+        if self.vr and not hello.get("vr"):
+            raise VoiceError(NO_VR)
+        self.key = VR_KEY if self.vr else hello.get("key") or DEFAULT_KEY
         self.host_connected = True
         self._step(run, "Opening the microphone…")
         mic = self._attach(run, "_mic", self.factories.mic())
@@ -825,6 +837,7 @@ class VoiceService:
             "_gaze_note": "",  # shown beside the status when gaze didn't help
             "_gaze_view": None,
             "_look": None,  # the gaze for this clip while the command waits its turn; never saved (see _keep_look)
+            "_cast": None,  # in VR, the same: the samples Unity cast into the scene during this clip
             "_notice": None,  # the host's extra line, asked for once when the command starts, for both brains
             "_command": None,  # the command as the host understood it, when it needs neither gaze nor the refiner
             "_t0": 0.0,
@@ -879,7 +892,7 @@ class VoiceService:
 
     def _finish(self, record: dict, stage: str) -> None:
         record["stage"] = stage
-        record["_look"] = None
+        record["_look"] = record["_cast"] = None
         record["_notice"] = None
         record["timings"]["total"] = round(self.clock() - record["created"], 2)
         self._save(record)
@@ -943,6 +956,7 @@ class VoiceService:
         if self.host == "unity":
             request["gaze_mode"], request["gaze_source"] = self.gaze_mode, self.gaze_source
             request["gaze_live"] = self._gaze is not None and bool(self._gaze.alive)
+            request["vr"] = self.vr
         news = self._marker_news()
         if news is not _NO_NEWS:  # the marker rides on this poll: there is no other request or thread for it
             request["marker"] = None if news is None else list(news)
@@ -1172,6 +1186,9 @@ class VoiceService:
         The copy goes in a key that starts with an underscore, so it is never saved or shown, and it is dropped as soon
         as the command is over. Gaze never stops voice: with no copy, the command just has no gaze.
         """
+        if self.vr:
+            self._keep_cast(record)
+            return
         gaze = self._gaze
         clip_start = record["_t0"] - PREROLL  # the clip _transcribe cut starts here
         if gaze is None or not pointing_words(record["words"], clip_start):
@@ -1187,6 +1204,16 @@ class VoiceService:
             record["_look"] = look
         except Exception as exc:  # noqa: BLE001
             print(f"GazeVoice: gaze failed: {exc!r}", file=sys.stderr)
+
+    def _keep_cast(self, record: dict) -> None:
+        """In VR, Unity keeps where the eyes (or head) hit the scene for a couple of minutes: copy this clip's part."""
+        clip_start = record["_t0"] - PREROLL
+        if self.gaze_mode == "off" or not pointing_words(record["words"], clip_start):
+            return
+        reply = self._bridge_call({"cmd": "vr_gaze", "t0": clip_start - BEFORE_WORD,
+                                   "t1": record["_t1"] + TAIL + AFTER_WORD})
+        samples = reply.get("samples") if reply and reply.get("ok") else None
+        record["_cast"] = samples if isinstance(samples, list) else None
 
     def _answer_choice(self, record: dict) -> bool:
         """Give a spoken number to the command waiting for one. False when none is waiting: it's an ordinary command."""
@@ -1597,6 +1624,8 @@ class VoiceService:
         When gaze found nothing because nearly all the readings landed off the screen (a calibration that reads wrong),
         the status line says to calibrate again. The counts for each pointing word go in record["gaze"]["windows"].
         """
+        if self.vr:
+            return self._ground_cast(record)
         gaze = self._gaze  # there is none when gaze is off, can't start, or has no camera part yet
         if gaze is None:
             return True
@@ -1653,6 +1682,34 @@ class VoiceService:
             record["_gaze_note"] = NO_ANSWER
             return True
         # The brains read how long into the command each word was said, not the clock time.
+        targets, misses = ([{**t, "at": t["at"] - clip_start} for t in found[key]] for key in ("targets", "misses"))
+        record["focus"] = {**(record["focus"] or {}), "gaze": {**found, "targets": targets, "misses": misses}}
+        return True
+
+    def _ground_cast(self, record: dict) -> bool:
+        """VR: what the eyes (or head) rested on while each pointing word was said. See ground_cast.
+
+        Nothing is asked and no picture is taken: in the headset, only the status line can be seen.
+        """
+        clip_start = record["_t0"] - PREROLL
+        words = pointing_words(record["words"], clip_start)
+        if self.gaze_mode == "off" or not words:
+            return True
+        samples = record["_cast"]
+        try:
+            found = ground_cast(words, samples or []).to_dict()
+        except Exception as exc:  # noqa: BLE001 - odd data from the host must not stop voice
+            print(f"GazeVoice: gaze failed: {exc!r}", file=sys.stderr)
+            found = {"status": "none", "targets": [], "radius": [], "misses": [], "error": repr(exc)}
+        eyes = [sample.get("eyes") for sample in samples or [] if isinstance(sample, dict)]
+        found["host"], found["source"] = "unity", "eyes" if eyes and sum(map(bool, eyes)) * 2 > len(eyes) else "head"
+        matched = self._matches_selection(found, record["focus"])
+        record["gaze"] = {**found, "matched_selection": matched, "asked": False, "pictures_sent": []}
+        if self.gaze_mode != "on":
+            return True
+        if not found["targets"] and not any(miss.get("point") for miss in found.get("misses", [])):
+            record["_gaze_note"] = VR_GAZE_LOST
+            return True
         targets, misses = ([{**t, "at": t["at"] - clip_start} for t in found[key]] for key in ("targets", "misses"))
         record["focus"] = {**(record["focus"] or {}), "gaze": {**found, "targets": targets, "misses": misses}}
         return True

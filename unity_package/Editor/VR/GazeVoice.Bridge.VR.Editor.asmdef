@@ -1,0 +1,32 @@
+{
+    "name": "GazeVoice.Bridge.VR.Editor",
+    "rootNamespace": "",
+    "references": [
+        "GazeVoice.Bridge.Editor",
+        "Unity.XR.Management",
+        "Unity.XR.Management.Editor",
+        "Unity.XR.OpenXR",
+        "Unity.XR.OpenXR.Editor"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "Newtonsoft.Json.dll"
+    ],
+    "autoReferenced": false,
+    "defineConstraints": [
+        "GAZEVOICE_OPENXR"
+    ],
+    "versionDefines": [
+        {
+            "name": "com.unity.xr.openxr",
+            "expression": "1.6.0",
+            "define": "GAZEVOICE_OPENXR"
+        }
+    ],
+    "noEngineReferences": false
+}

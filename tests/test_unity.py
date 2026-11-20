@@ -9,6 +9,7 @@ from gazevoice.components.unity import (
     MIN_UNITY,
     Unity,
     UnityEditor,
+    NO_VR_TEMPLATE,
     UnityProject,
     best_editor,
     find_editors,
@@ -507,6 +508,79 @@ class ProjectUnitTest(unittest.TestCase):
         self.assertEqual(state.health, Health.ERROR)
         self.assertIn("doesn't exist", state.summary)
         self.assertTrue(state.offers("choose"))
+
+
+class VRProjectTest(unittest.TestCase):
+    """Unity VR has a project of its own, made from Unity Hub's VR template; the Unity one is never touched."""
+
+    def setUp(self):
+        self.env = UnityEnv(self)
+        self.unity = str(fake_unity_project(self.env.projects / "Game"))
+        self.env.ctx.settings = update_settings(self.env.ctx.settings,
+                                                {"voice_host": "unity_vr", "unity_project": self.unity})
+        self.unit = self.env.unit(UnityProject)
+        self.app = fake_unity_editor(self.env.editors)
+        self.templates = self.env.hub_config / "Templates"
+        self.templates.mkdir(parents=True)
+
+    def template(self, name="com.unity.template.vr-6.1.1.tgz"):
+        path = self.templates / name
+        path.write_bytes(b"")
+        return path
+
+    def setup_call(self, project, returncode=0):
+        argv = [self.app / "Contents" / "MacOS" / "Unity", "-batchmode", "-quit", "-projectPath", project,
+                "-executeMethod", "GazeVoiceVRSetup.Batch", "-logFile", self.env.ctx.paths.logs / "unity-vr-setup.log"]
+        self.env.runner.add(argv, returncode=returncode)
+        return tuple(str(arg) for arg in argv)
+
+    def create(self):
+        return self.unit.run_action("create", make_job("unity_project", "create"))
+
+    def test_the_unity_project_isnt_the_vr_one(self):
+        self.assertEqual(self.unit.check().health, Health.MISSING)
+
+    def test_new_clones_the_newest_vr_template_and_builds_the_vr_scene(self):
+        self.template("com.unity.template.vr-6.0.9.tgz")
+        template = self.template()
+        project = self.env.projects / "GazeVoice VR"
+        setup = self.setup_call(project)
+        self.assertEqual(self.create()["project"], str(project))
+        create = next(c for c in self.env.runner.calls if "-createProject" in c)
+        self.assertEqual(create[create.index("-cloneFromTemplate") + 1], str(template))
+        self.assertIn(setup, self.env.runner.calls)
+        self.assertTrue(bridge_current(project))  # the scene is built by the package, so it goes in first
+        self.assertEqual(self.env.ctx.settings.unity_vr_project, str(project))
+        self.assertEqual(self.env.ctx.settings.unity_project, self.unity)
+        self.assertEqual(self.unit.check().health, Health.READY)
+
+    def test_without_the_template_it_says_how_to_get_it_and_makes_nothing(self):
+        with self.assertRaises(JobError) as caught:
+            self.create()
+        self.assertEqual(str(caught.exception), NO_VR_TEMPLATE)
+        self.assertFalse(any("-createProject" in call for call in self.env.runner.calls))
+        self.assertEqual(self.env.ctx.settings.unity_vr_project, "")
+
+    def test_a_scene_that_couldnt_be_built_keeps_the_project_and_says_what_to_press(self):
+        self.template()
+        project = self.env.projects / "GazeVoice VR"
+        self.setup_call(project, returncode=1)
+        with self.assertRaises(JobError) as caught:
+            self.create()
+        self.assertIn("Prepare VR scene", str(caught.exception))
+        self.assertEqual(self.env.ctx.settings.unity_vr_project, str(project))
+
+    def test_new_asks_about_a_vr_project(self):
+        confirm = next(action for action in self.unit.check().actions if action.id == "create").confirm
+        self.assertIn("Unity VR project", confirm)
+        self.assertIn("GazeVoice VR", confirm)
+
+    def test_set_up_uses_the_vr_project_when_there_is_one(self):
+        fake_unity_project(self.env.projects / "GazeVoice VR")
+        steps = self.env.unit(Unity).setup_steps(best_editor(self.unit.editors()))
+        use = next(step for step in steps if "project" in step)
+        self.assertIn("use the project at", use)
+        self.assertIn("GazeVoice VR", use)
 
 
 if __name__ == "__main__":

@@ -13,11 +13,14 @@ using Newtonsoft.Json.Linq;
 using UnityEditor;
 using UnityEngine;
 
+// Unity VR lives in its own assembly (Editor/VR), which only compiles in projects that have OpenXR.
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("GazeVoice.Bridge.VR.Editor")]
+
 [InitializeOnLoad]
 internal static class GazeVoiceBridge
 {
     internal const int Port = 9878;
-    internal const string Version = "0.3.4";
+    internal const string Version = "0.3.5";
     const int MaxLine = 1024 * 1024;  // scripts and C# snippets arrive as one line
     const int MaxConsoleLines = 300;
     const int ShotWidth = 1280, ShotHeight = 720;
@@ -57,6 +60,10 @@ internal static class GazeVoiceBridge
     static DateTime retryListenAt = DateTime.MinValue;
     static DateTime lastPoll = DateTime.MinValue;
     static UnityEditor.PackageManager.Requests.AddRequest packageRequest;
+    static bool voiceVr;
+    // Set by the VR assembly when it loads: it answers the vr_ commands and keeps edits made in Play mode.
+    internal static Func<JObject, object> VrRequest;
+    internal static Action EditBegan, EditEnded;
     static string packageError;
     static string cscPath;
     static string dotnetPath;
@@ -84,6 +91,7 @@ internal static class GazeVoiceBridge
         public string text;
         public string name;
         public JObject arguments;
+        public bool? vr;
     }
 
     static GazeVoiceBridge()
@@ -231,6 +239,11 @@ internal static class GazeVoiceBridge
                         pending.Done.Set();
                     });
                     answerLater = true;
+                }
+                else if (request != null && request.cmd.StartsWith("vr_", StringComparison.Ordinal))
+                {
+                    pending.Reply = JsonConvert.SerializeObject(VrRequest != null ? VrRequest(JObject.Parse(pending.Line))
+                        : request.cmd == "vr_status" ? new { ok = true, xr = false } : (object)new { ok = false, error = "no_xr" });
                 }
                 else
                 {
@@ -461,7 +474,7 @@ internal static class GazeVoiceBridge
         {
             case "ping":
                 return new { ok = true, bridge = Version, unity = Application.unityVersion, key = TalkKey(),
-                    compiling = IsCompiling(), gaze = true };
+                    compiling = IsCompiling(), gaze = true, vr = VrRequest != null };
             case "selection":
                 var selected = Selection.gameObjects.Where(go => go != null).Select(go => go.name).ToArray();
                 return new { ok = true, active = Selection.activeGameObject != null ? Selection.activeGameObject.name : null,
@@ -475,6 +488,7 @@ internal static class GazeVoiceBridge
                 return new { ok = true };
             case "poll":
                 lastPoll = DateTime.UtcNow;
+                voiceVr = request.vr ?? false;
                 var events = new List<Dictionary<string, object>>();
                 if (!request.ack.HasValue)
                 {
@@ -494,6 +508,7 @@ internal static class GazeVoiceBridge
                 undoGroup = Undo.GetCurrentGroup();
                 beforeEdit = SceneSnapshot();
                 editSurvivedReload = false;
+                EditBegan?.Invoke();
                 return new { ok = true };
             case "undo_push":
                 var changed = editSurvivedReload || (beforeEdit != null && !SnapshotsEqual(beforeEdit, SceneSnapshot()));
@@ -508,17 +523,23 @@ internal static class GazeVoiceBridge
                 }
                 beforeEdit = null;
                 editSurvivedReload = false;
+                EditEnded?.Invoke();
                 return new { ok = true, pushed = changed };
             case "end_edit":
                 undoGroup = -1;
                 beforeEdit = null;
                 editSurvivedReload = false;
+                EditEnded?.Invoke();
                 return new { ok = true };
             case "undo":
+                EditBegan?.Invoke();
                 Undo.PerformUndo();
+                EditEnded?.Invoke();
                 return new { ok = true };
             case "redo":
+                EditBegan?.Invoke();
                 Undo.PerformRedo();
+                EditEnded?.Invoke();
                 return new { ok = true };
             default:
                 return new { ok = false, error = "unknown command" };
@@ -720,6 +741,7 @@ internal static class GazeVoiceBridge
     }
 
     internal static bool VoiceIsOn => (DateTime.UtcNow - lastPoll).TotalSeconds < VoiceOnSeconds;
+    internal static bool VoiceInVr => VoiceIsOn && voiceVr;
 
     static string TalkKey()
     {

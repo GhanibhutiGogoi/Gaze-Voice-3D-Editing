@@ -1,7 +1,9 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from gazevoice import unity_install
 from gazevoice.unity_install import (
     PACKAGE_DIR,
     PACKAGE_NAME,
@@ -56,6 +58,31 @@ class InstallTest(unittest.TestCase):
         (self.folder / "Editor" / "Old.cs").write_text("// gone in the new version")
         add_bridge(self.project)
         self.assertFalse((self.folder / "Editor" / "Old.cs").exists())
+
+    def test_when_windows_wont_let_the_folder_be_swapped_it_is_updated_file_by_file(self):
+        add_bridge(self.project)
+        (self.folder / "Editor" / "Old.cs").write_text("// gone in the new version")
+        (self.folder / "Editor" / "GazeVoiceBridge.cs").write_text("// an older version")
+        with patch.object(unity_install, "_swap", return_value=False):
+            add_bridge(self.project)
+        self.assertTrue(bridge_current(self.project))
+        self.assertFalse((self.folder / "Editor" / "Old.cs").exists())
+        self.assertEqual([p.name for p in self.folder.parent.iterdir() if p.name.startswith(".gazevoice")], [])
+
+    def test_a_folder_unity_is_reading_is_swapped_once_it_lets_go(self):
+        add_bridge(self.project)
+        real, refusals = Path.rename, []
+
+        def rename(path, target):
+            if Path(path) == self.folder and len(refusals) < 2:
+                refusals.append(path)
+                raise PermissionError(13, "in use")
+            return real(path, target)
+
+        with patch.object(unity_install, "_WAIT", 0), patch.object(Path, "rename", rename):
+            add_bridge(self.project)
+        self.assertEqual(len(refusals), 2)
+        self.assertTrue(bridge_current(self.project))
 
     def test_no_staging_folder_is_left_behind(self):
         add_bridge(self.project)

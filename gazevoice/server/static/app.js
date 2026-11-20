@@ -17,6 +17,7 @@ const NAMES = {
   unity_project: "Project",
   unity_mcp: "MCP server",
   unity_bridge: "Bridge",
+  unity_vr: "VR headset",
   mlagents: "ML-Agents",
   brain: "no brain logged in",
   workflow: "Workflow check",
@@ -27,6 +28,7 @@ const GROUPS = [
   { label: "Brain", hint: "Cleans up what you said, then edits the scene", ids: ["claude", "codex"], providers: true },
   { label: "Blender", hint: "Where the edits land", ids: ["blender", "mcp_addon", "mcp_server", "bridge"] },
   { label: "Unity", hint: "Where the edits land", ids: ["unity", "unity_project", "unity_mcp", "unity_bridge", "mlagents"] },
+  { label: "Unity VR", hint: "Unity plays the scene to the headset", ids: ["unity_vr"] },
 ];
 
 const HEALTH = {
@@ -47,6 +49,7 @@ const STEP_STAGES = {
   bridge: ["blender"],
   unity_mcp: ["edit"],
   unity_bridge: ["unity"],
+  unity_vr: ["unity"],
 };
 
 // A brain or provider proves the stages of the steps that use it.
@@ -468,15 +471,19 @@ function renderRack() {
     return;
   }
   const placed = new Set();
-  const offShelf = S.state.settings && S.state.settings.voice_host === "unity" ? "Blender" : "Unity";
-  for (const group of GROUPS.filter((item) => item.label !== offShelf)) {
+  const host = S.state.settings ? S.state.settings.voice_host : "blender";
+  // Blender hides Unity and Unity VR; Unity hides Blender and Unity VR; Unity VR hides only Blender.
+  const offShelves = host === "unity_vr" ? ["Blender"] : host === "unity" ? ["Blender", "Unity VR"] : ["Unity", "Unity VR"];
+  // ML-Agents trains in Unity mode only, so Unity VR leaves it off its Unity shelf.
+  const offUnits = host === "unity_vr" ? ["mlagents"] : [];
+  for (const group of GROUPS.filter((item) => !offShelves.includes(item.label))) {
     const ids = group.providers ? [...group.ids, ...components().filter((c) => c.provider).map((c) => c.id)] : group.ids;
-    const units = ids.map(component).filter(Boolean);
+    const units = ids.filter((id) => !offUnits.includes(id)).map(component).filter(Boolean);
     if (!units.length) continue;
     units.forEach((c) => placed.add(c.id));
     rack.append(shelf(group.label, group.hint, units));
   }
-  const hidden = new Set(GROUPS.find((item) => item.label === offShelf).ids);
+  const hidden = new Set([...GROUPS.filter((item) => offShelves.includes(item.label)).flatMap((item) => item.ids), ...offUnits]);
   const others = components().filter((c) => !placed.has(c.id) && c.id !== "workflow" && !hidden.has(c.id));
   if (others.length) rack.append(shelf("Other", "", others));
 }
@@ -783,9 +790,12 @@ function renderVoice() {
     const startingJob = jobRunning("voice");
     const [led, defaultWord] = VOICE_WORDS[v.state] || VOICE_WORDS.off;
     const key = v.key || S.state?.platform?.talk_key || "⌥ Space";
-    const hostName = v.host === "unity" ? "Unity" : "Blender";
+    const vr = v.vr ?? S.state?.settings?.voice_host === "unity_vr";
+    const hostName = vr ? "Unity VR" : v.host === "unity" ? "Unity" : "Blender";
     const word = v.state === "editing" ? `Working in ${hostName}…` : defaultWord;
-    $("voice-note").textContent = `In ${hostName}, hold ${key}, say what you want, and let go. Your selection is what “this” means.`;
+    $("voice-note").textContent = vr
+      ? "Press Play in Unity and put the headset on. Look where you mean, hold B or Y on a controller, say what you want, and let go. Edits made while playing are kept."
+      : `In ${hostName}, hold ${key}, say what you want, and let go. Your selection is what “this” means.`;
     let reason = v.reason;
     if (!reason && v.state === "ready") reason = `Hold ${key} in ${hostName}, speak, and let go.`;
     if (!reason && v.state === "off") reason = `Turn voice on to start talking to ${hostName}.`;
@@ -1048,7 +1058,7 @@ function showPicture(item, openerKey) {
 
 function commandRow(r) {
   const led = { done: "live", failed: "fault", stopped: "off" }[r.stage] || "busy";
-  let understood = (r.kind === "ignore" ? `Not a ${voice().host === "unity" ? "Unity" : "Blender"} command` : KIND_WORDS[r.kind])
+  let understood = (r.kind === "ignore" ? `Not a ${["unity", "unity_vr"].includes(voice().host) ? "Unity" : "Blender"} command` : KIND_WORDS[r.kind])
     || r.refined || r.heard || STAGE_WORDS[r.stage] || "…";
   if (r.kind === "command" && r.refined) understood = r.refined;
   const heard = r.heard ? `${r.source === "typed" ? "Typed" : "Heard"}: “${r.heard}”` : "";
@@ -1203,12 +1213,12 @@ function renderRouting() {
   }
   box.append(
     h("p", { class: "route-note", text: `System: ${S.state?.platform?.name || "Detecting…"} · Speech: ${S.state?.speech_engine?.label || "Detecting…"}` }),
-    routeRow("3D host", "voice_host", settings.voice_host, [["blender", "Blender"], ["unity", "Unity"]]),
+    routeRow("3D host", "voice_host", settings.voice_host, [["blender", "Blender"], ["unity", "Unity"], ["unity_vr", "Unity VR"]]),
     ...(S.state?.speech_engine?.key === "faster-whisper" ? [] :
       [routeRow("Speech engine", "stt_engine", settings.stt_engine, [["parakeet", "Parakeet"], ["whisper", "Whisper"]])]),
-    ...(settings.voice_host === "unity" ? unityMcpRows(settings) : []),
+    ...(settings.voice_host === "unity" || settings.voice_host === "unity_vr" ? unityMcpRows(settings) : []),
     inputRow(settings.mic_device),
-    cameraRow(settings.camera_device), ...gazeRows(settings),
+    ...(settings.voice_host === "unity_vr" ? vrGazeRows(settings) : [cameraRow(settings.camera_device), ...gazeRows(settings)]),
     stepRow("editor", settings),
     stepRow("refiner", settings),
     h("p", { class: "route-note", text: "Auto uses Claude Code when it's logged in, otherwise Codex. More thinking can make big builds better, but each command takes longer." }),
@@ -1223,6 +1233,13 @@ function gazeRows(settings) {
     ...(settings.voice_host === "blender" ? [routeRow("Pictures · each unnamed target uses a little of your plan", "gaze_pictures", settings.gaze_pictures === true,
       [[false, "Off"], [true, "On"]]),
     h("p", { class: "route-note", text: "When gaze is On and you look at a big part of a model that has nothing to name it, a picture of just that spot in Blender's viewport (never your camera) goes to a short-lived Claude Code process, which says in a few words what it shows. Only those words reach the editor. Pictures stay off until you turn them on here and press Check pictures get cleaned up on the Gaze unit; a new Claude Code version needs the check again. GazeVoice never saves a picture. Claude Code gets it for one reply, and the check looks for any copy left behind. Anthropic keeps what's sent under your account's terms. The dashboard keeps the last 20 pictures in memory so you can see what the AI was shown, and drops them when it stops." })] : []),
+  ];
+}
+
+function vrGazeRows(settings) {
+  return [
+    routeRow("Gaze", "gaze_mode", settings.gaze_mode, [["off", "Off"], ["shadow", "Watch only"], ["on", "On"]]),
+    h("p", { class: "route-note", text: "In Unity VR, gaze comes from the headset: the Quest Pro's eye tracking, or where your head points when eye tracking is off. Unity VR has its own project, made from Unity's VR template, so your Unity project is left alone. Auto picks the headset's microphone." }),
   ];
 }
 

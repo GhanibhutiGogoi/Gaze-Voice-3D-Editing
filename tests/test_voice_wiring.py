@@ -19,6 +19,7 @@ from gazevoice.voice.gaze import Area
 from gazevoice.voice.gaze_tracker import GazeError, GazeTracker
 from gazevoice.components.brains import CLAUDE_ISOLATION, codex_mcp_args
 from gazevoice.voice.brains import claude_session_argv
+from gazevoice.voice.commands import in_play_mode
 from gazevoice.voice.picture import PICTURE_MODEL, PICTURE_RULES, Describer
 from gazevoice.voice.service import PointerTracker, VoiceError
 from gazevoice.voice.wiring import build_voice, voice_readiness
@@ -416,6 +417,38 @@ class BuildVoiceTest(unittest.TestCase):
         voice = self.gaze_voice(host="unity", gaze_mode="on", gaze_source="mouse")
         self.assertIsInstance(voice.factories.gaze(), PointerTracker)
         self.assertEqual(voice.gaze_mode, "on")
+
+    def test_unity_vr_keeps_the_gaze_mode_and_needs_no_gaze_part(self):
+        voice = self.gaze_voice(host="unity_vr", gaze_mode="on", gaze_source="mouse")
+        self.assertIsNone(voice.factories.gaze)  # Unity follows the eyes itself
+        self.assertEqual((voice.gaze_mode, voice.host, voice.vr), ("on", "unity", True))
+
+    def test_unity_vr_commands_say_the_person_is_in_the_headset_while_unity_plays(self):
+        voice = self.gaze_voice(host="unity_vr")
+        with patch("gazevoice.voice.wiring.bridge_request", return_value={"ok": True, "playing": True}):
+            notice = voice.factories.editor_notice()
+        self.assertTrue(notice.startswith("VR: "))
+        self.assertFalse(in_play_mode(notice))  # training's "Play mode" line makes undo refuse; VR edits are kept
+        with patch("gazevoice.voice.wiring.bridge_request", return_value={"ok": True, "playing": False}):
+            self.assertIsNone(voice.factories.editor_notice())
+        with patch("gazevoice.voice.wiring.bridge_request", side_effect=OSError("closed")):
+            self.assertIsNone(voice.factories.editor_notice())
+
+    def test_unity_vr_commands_never_carry_a_training_line(self):
+        training = MagicMock()
+        training.status.return_value = {"state": "training", "run_id": "Mover-1"}
+        self.t.ctx.training = training
+        voice = self.gaze_voice(host="unity_vr")
+        with patch("gazevoice.voice.wiring.bridge_request", return_value={"ok": True, "playing": True}):
+            self.assertNotIn("Training", voice.factories.editor_notice())
+        with patch("gazevoice.voice.wiring.bridge_request", return_value={"ok": True, "playing": False}):
+            self.assertIsNone(voice.factories.editor_notice())
+
+    def test_unity_vr_readiness_needs_the_headset_unit(self):
+        settings = update_settings(self.t.ctx.settings, {"voice_host": "unity_vr"})
+        with patch("gazevoice.blender_socket.port_open", return_value=True):
+            missing = voice_readiness({}, {"refiner": None, "editor": None}, settings)
+        self.assertIn("VR headset is missing.", missing)
 
     def test_unity_readiness_uses_unity_requirements_not_blender_units(self):
         settings = update_settings(self.t.ctx.settings, {"voice_host": "unity"})

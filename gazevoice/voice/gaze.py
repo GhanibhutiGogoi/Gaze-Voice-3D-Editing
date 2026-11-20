@@ -32,6 +32,8 @@ OFF_SCREEN_SHARE = 0.8  # this share or more of the readings around a command ze
 MARKER_WINDOW = 0.2  # seconds of gaze the live marker is made from: short, so it follows the eyes
 MARKER_MIN_SAMPLES = 3  # and it needs at least this many good readings in that time to show at all
 MAX_CANDIDATES = 3
+UPWARD = 0.7  # in VR, a surface whose normal points this far up (or more) is somewhere to put things
+_GROUND_NAMES = re.compile(r"terrain|ground|floor|plane|grass", re.IGNORECASE)
 TRACK_SECONDS = 90.0  # gaze kept in memory: more than the longest hold, so all of a clip is still here once it's heard
 PICTURE_MAX_CHARS = 120  # a picture's sentence is cut to this many characters
 
@@ -352,17 +354,23 @@ class Target:
 
 @dataclass
 class Miss:
-    """A pointing word over empty space; a work-plane intersection may supply a placement point."""
+    """A pointing word over empty space; a work-plane intersection may supply a placement point.
+
+    In VR, "here" or "there" on the ground gives a point on the "surface" looked at, and `on` names it.
+    """
 
     word: str
     at: float
     point: list[float] | None = None
     plane: str | None = None
+    on: str | None = None
 
     def to_dict(self) -> dict:
         result = {"word": self.word, "at": self.at}
         if self.point is not None:
             result.update(point=list(self.point), plane=self.plane)
+        if self.on:
+            result["on"] = self.on
         return result
 
 
@@ -485,3 +493,62 @@ def ground(
     if not targets:
         return Grounding("resolved" if any(m.point is not None for m in misses) else "none", [], radius, misses, windows)
     return Grounding("resolved" if all(is_clear(t) for t in targets) else "clarify", targets, radius, misses, windows)
+
+
+def _vec3(value: object) -> list[float] | None:
+    if isinstance(value, (list, tuple)) and len(value) == 3 and all(_number(x) for x in value):
+        return [float(x) for x in value]
+    return None
+
+
+def _middle(points: list[list[float]]) -> list[float]:
+    return [statistics.median(point[axis] for point in points) for axis in range(3)]
+
+
+def _is_ground(samples: list[dict]) -> bool:
+    """Whether most of these hits are on something to stand things on: the terrain, a floor, or a surface facing up."""
+    ground = 0
+    for sample in samples:
+        normal = _vec3(sample.get("normal"))
+        if _GROUND_NAMES.search(str(sample.get("name") or "")) or (normal is not None and normal[1] >= UPWARD):
+            ground += 1
+    return ground * 2 > len(samples)
+
+
+def ground_cast(words: list[PointingWord], samples: Sequence[dict]) -> Grounding:
+    """Work out what each pointing word refers to from gaze the host has already cast into the scene (Unity VR).
+
+    Each sample is `{"t", "uid", "name", "parent", "point", "normal"}`: what the eyes (or head) hit when it was taken,
+    with `uid` None for a miss. The object hit most often in a word's window is its target, scored by its share of
+    the window. "Here" and "there" on the ground (see _is_ground) are a placement point instead: the middle of the
+    points looked at there. Nothing is asked: the person can't see numbers in the headset, and the eyes are steady.
+    """
+    targets, misses, windows = [], [], []
+    for word in words:
+        around = [sample for sample in samples if isinstance(sample, dict) and _number(sample.get("t"))
+                  and word.start - BEFORE_WORD <= sample["t"] <= word.end + AFTER_WORD]
+        hits = [sample for sample in around if sample.get("uid") is not None and _vec3(sample.get("point"))]
+        windows.append(Window(word.text, word.start, len(around), len(hits), 0))
+        if len(around) < MIN_SAMPLES:
+            continue
+        if not hits:
+            misses.append(Miss(word.text, word.start))
+            continue
+        groups: dict[object, list[dict]] = {}
+        for sample in hits:
+            groups.setdefault(sample["uid"], []).append(sample)
+        ranked = sorted(groups.values(), key=len, reverse=True)  # stable: a tie goes to the one looked at first
+        best = ranked[0]
+        if word.text in ("here", "there") and _is_ground(best):
+            misses.append(Miss(word.text, word.start, _middle([_vec3(s["point"]) for s in best]), "surface",
+                               str(best[0].get("name") or "") or None))
+            continue
+        candidates = []
+        for group in ranked[:MAX_CANDIDATES]:
+            name, parent = str(group[0].get("name") or ""), group[0].get("parent")
+            candidates.append(Candidate(uid=group[0]["uid"], name=f"{name} (in {parent})" if parent else name,
+                                        score=len(group) / len(around), faces=0, u=0.0, v=0.0,
+                                        point=_middle([_vec3(s["point"]) for s in group])))
+        targets.append(Target(word.text, word.start, candidates, Fixation(0.0, 0.0, len(hits))))
+    found = bool(targets) or any(miss.point is not None for miss in misses)
+    return Grounding("resolved" if found else "none", targets, (), misses, windows)

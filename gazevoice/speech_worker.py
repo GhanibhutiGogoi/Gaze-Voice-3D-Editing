@@ -85,6 +85,9 @@ def download(
     os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
     # The Hub's "set a token for higher rate limits" notice would read like GazeVoice asking for a key.
     os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+    # The models are public. A token saved by an earlier `hf auth login` would still be sent, and an expired one
+    # makes the Hub refuse even a public model with 401 "Repository Not Found".
+    os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
     if fetch is None:
         from huggingface_hub import constants, snapshot_download
 
