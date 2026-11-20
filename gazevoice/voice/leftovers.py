@@ -219,12 +219,24 @@ def _files_since(root: Path, since: float, shortest: int, scan: Scan, judge: _Ju
                 yield path, (info.st_dev, info.st_ino)
 
 
+def _open_scan_file(path: str) -> int:
+    """Retry short Windows sharing locks; persistent unreadable files still fail closed."""
+    for attempt in range(3):
+        try:
+            return _open_regular(path)
+        except OSError as exc:
+            if not is_windows() or getattr(exc, "winerror", None) not in (32, 33) or attempt == 2:
+                raise
+            time.sleep(0.1 * (attempt + 1))
+    raise AssertionError("unreachable")
+
+
 def _holds(path: str, markers: Sequence[bytes], keep: int) -> bool:
     """Whether the file has any of `markers`, read a chunk at a time, stopping at the first one found.
 
     Raises OSError if the file can't be opened or read.
     """
-    fd = _open_regular(path)
+    fd = _open_scan_file(path)
     tail = b""
     with os.fdopen(fd, "rb") as handle:
         while True:

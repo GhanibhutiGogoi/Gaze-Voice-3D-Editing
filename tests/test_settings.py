@@ -173,7 +173,8 @@ class SettingsTest(unittest.TestCase):
 
 class UnityProjectSettingTest(unittest.TestCase):
     def test_a_project_must_be_an_absolute_folder(self):
-        self.assertEqual(update_settings(Settings(), {"unity_project": "/Users/me/Game"}).unity_project, "/Users/me/Game")
+        project = str(Path(__file__).resolve().parent / "Game")
+        self.assertEqual(update_settings(Settings(), {"unity_project": project}).unity_project, project)
         self.assertEqual(update_settings(Settings(), {"unity_project": ""}).unity_project, "")
         for bad in ("Game", "~/Game", 7, "/bad\npath"):
             with self.assertRaises(ValueError):

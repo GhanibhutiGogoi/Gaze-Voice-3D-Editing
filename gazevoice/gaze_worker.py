@@ -63,8 +63,10 @@ def is_windows():
 
 try:
     from . import gaze_model
+    from .platforms import command_argv
 except ImportError:  # started as a script by the gaze venv's Python
     import gaze_model
+    from platforms import command_argv
 
 # 16:9, as gaze_model.CAMERA_ASPECT says. Not bigger, on purpose. MediaPipe follows a face it has already found, but
 # to find one again after losing it (a hand, a turn of the head) it shrinks the whole frame to a small square and
@@ -342,7 +344,8 @@ class FrameSource:
         self._closed = False
         try:
             self.proc = subprocess.Popen(
-                argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=self.frame_bytes
+                command_argv(argv), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                bufsize=self.frame_bytes
             )  # same process group as ours, so killing the group ends it
         except OSError as exc:
             raise CameraError(f"Couldn't start {Path(argv[0]).name}: {exc}") from exc

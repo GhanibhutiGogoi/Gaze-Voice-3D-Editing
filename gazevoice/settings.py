@@ -6,7 +6,7 @@ import json
 import os
 import tempfile
 from dataclasses import asdict, dataclass, fields, replace
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path
 from typing import Any, Mapping
 
 from .providers import THINKING, ProviderConfig
@@ -76,7 +76,7 @@ def _check(key: str, value: Any) -> None:
     ):
         raise ValueError("unity_mcp_args must be a list of command arguments")
     if key == "unity_project" and not (
-        isinstance(value, str) and len(value) <= 1024 and value.isprintable() and (value == "" or PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute())
+        isinstance(value, str) and len(value) <= 1024 and value.isprintable() and (value == "" or Path(value).is_absolute())
     ):
         raise ValueError("unity_project must be an absolute folder path")
     if key in ("editor_source", "refiner_source") and not (isinstance(value, str) and value):
@@ -97,7 +97,7 @@ def _check(key: str, value: Any) -> None:
         raise ValueError("gaze_pictures must be true or false")
     if key == "mic_device" and not (isinstance(value, str) and len(value) <= 1024 and
                                    (value == "" or value.isdigit() or (is_windows() and value.isprintable()))):
-        raise ValueError('mic_device must be "" (auto) or a device number such as "2"')
+        raise ValueError('mic_device must be "" (auto) or a valid device identifier from Routing')
     if key == "camera_device" and not (isinstance(value, str) and len(value) <= 200 and value.isprintable()):
         raise ValueError('camera_device must be "" (auto) or a camera name')
     if key in ("editor_model", "refiner_model") and value not in CLAUDE_MODELS:

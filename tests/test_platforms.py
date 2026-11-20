@@ -39,7 +39,8 @@ class PlatformContractTest(unittest.TestCase):
             with mock.patch.object(t.runner, "stream", return_value=0) as stream:
                 unit.action_install(make_job())
             create, install, download = [call.args[0] for call in stream.call_args_list]
-        self.assertIn("--managed-python", create)
+        self.assertNotIn("--managed-python", create)
+        self.assertEqual(stream.call_args_list[0].kwargs["env"]["UV_PYTHON_PREFERENCE"], "only-managed")
         self.assertIn("faster-whisper==1.2.1", install)
         self.assertIn("av>=11,<19", install)
         self.assertIn("--download-only", download)

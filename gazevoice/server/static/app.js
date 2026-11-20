@@ -1383,7 +1383,8 @@ function inputRow(current) {
       onchange: (e) => saveSetting("mic_device", e.target.value),
     },
       h("option", { value: "", selected: current === "" || null, text: autoLabel }),
-      devices.map(([index, name]) => h("option", { value: index, selected: index === current || null, text: `${index} · ${name}` }))));
+      devices.map(([index, name]) => h("option", { value: index, selected: index === current || null,
+        text: S.state?.platform?.id === "windows" ? name : `${index} · ${name}` }))));
 }
 
 function cameraRow(current) {

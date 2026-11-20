@@ -114,8 +114,15 @@ def find_editors(
             saved = json.loads((hub_config / "editors-v2.json").read_text(encoding="utf-8"))
             items = saved.get("data", []) if isinstance(saved, dict) else saved
             if isinstance(items, list):
-                candidates += [Path(item["location"]) for item in items
-                               if isinstance(item, dict) and isinstance(item.get("location"), str)]
+                for item in items:
+                    locations = item.get("location", []) if isinstance(item, dict) else []
+                    if isinstance(locations, str):
+                        locations = [locations]
+                    if isinstance(locations, list):
+                        for location in locations:
+                            if isinstance(location, str) and location:
+                                app = Path(location)
+                                candidates.append(app / "Unity.exe" if app.name.lower() == "editor" else app)
         except (OSError, ValueError):
             pass
     configured = os.environ.get("UNITY_EDITOR_PATH") if is_windows() else None
@@ -212,7 +219,10 @@ class _UnityUnit(Component):
 
     def open_hub(self) -> None:
         if is_windows():
-            launch_app(self.runner, self.hub_app)
+            try:
+                launch_app(self.runner, self.hub_app)
+            except OSError as exc:
+                raise JobError(f"Couldn't open Unity Hub: {exc}") from exc
             return
         result = self.runner.run(["open", "-a", self.hub_app], timeout=30)
         if not result.ok:
@@ -385,7 +395,10 @@ class Unity(_UnityUnit):
             return
         job.log(f"Opening {project.name} in Unity {editor.version}…")
         if is_windows():
-            launch_app(self.runner, editor.binary, ["-projectPath", str(project)])
+            try:
+                launch_app(self.runner, editor.binary, ["-projectPath", str(project)])
+            except OSError as exc:
+                raise JobError(f"Couldn't open Unity: {exc}") from exc
             return
         result = self.runner.run(["open", "-n", "-a", editor.app, "--args", "-projectPath", project], timeout=30)
         if not result.ok:

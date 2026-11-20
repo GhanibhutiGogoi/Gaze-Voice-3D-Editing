@@ -11,11 +11,11 @@ _install_lock = threading.Lock()
 
 
 def find_uv(runner, paths) -> str | None:
-    if runner.which("uv"):
-        return "uv"
     folder = paths.root / "tools" / "uv"
     binary = venv_executable(folder, "uv")
-    return str(binary) if binary.is_file() and (folder / ".gazevoice-ready").is_file() else None
+    if binary.is_file() and (folder / ".gazevoice-ready").is_file():
+        return str(binary)
+    return "uv" if runner.which("uv") else None
 
 
 def ensure_uv(runner, paths, job) -> str:

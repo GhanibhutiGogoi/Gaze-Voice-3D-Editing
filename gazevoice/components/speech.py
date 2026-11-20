@@ -83,9 +83,9 @@ class Speech(Component):
         )
 
     def _repair_action(self) -> ActionSpec:
-        return ActionSpec("install", "Repair speech", confirm=
+        return ActionSpec("repair", "Repair speech", confirm=
                           "Repair speech-to-text's private Python environment and packages? "
-                          "Windows uses an independent Python runtime. Cached models are reused.")
+                          "This rebuilds the environment and downloads fresh model files (a few GB).")
 
     def _uses_conda(self) -> bool:
         if not is_windows():
@@ -98,7 +98,9 @@ class Speech(Component):
             key, _, value = line.partition("=")
             if key.strip() == "home":
                 home = Path(value.strip())
-                return "conda" in str(home).lower() or (home / "conda-meta").is_dir()
+                conda_names = {"conda", "miniconda", "miniconda3", "anaconda", "anaconda3",
+                               "miniforge", "miniforge3", "mambaforge"}
+                return any(part.lower() in conda_names for part in home.parts) or (home / "conda-meta").is_dir()
         return False
 
     def check(self) -> ComponentState:
@@ -127,7 +129,8 @@ class Speech(Component):
                 [self._install_action()],
             )
         if not self.probe([str(self.python), "-c", f"import {engine.module}"], timeout=20, ttl=60).ok:
-            return self.state(Health.MISSING, f"{engine.label} isn't installed yet.", details, [self._install_action()])
+            return self.state(Health.MISSING, f"{engine.label}'s packages could not load. Press Repair speech.",
+                              details, [self._repair_action()])
         if not hf_cached(engine.model, self.hf_home):
             return self.state(
                 Health.INSTALLED,
@@ -149,31 +152,41 @@ class Speech(Component):
         return self.state(Health.READY, f"{engine.label} ready", details, [ActionSpec("test", "Test")])
 
     def action_install(self, job: Job) -> dict:
+        return self._install(job)
+
+    def action_repair(self, job: Job) -> dict:
+        return self._install(job, repair=True)
+
+    def _install(self, job: Job, *, repair: bool = False) -> dict:
         engine = self.engine
         uv = ensure_uv(self.runner, self.paths, job)
         steps = []
         repair_conda = self._uses_conda()
-        if not self.python.exists() or repair_conda:
+        if repair or not self.python.exists() or repair_conda:
             if self.venv.exists():  # a folder whose Python is gone (an uninstalled Anaconda, say); it holds only packages
                 # uv's --clear deletes whatever folder it is given, so only an environment or an empty folder is cleared.
                 if not ((self.venv / "pyvenv.cfg").is_file() or (self.venv.is_dir() and not any(self.venv.iterdir()))):
                     raise JobError(f"{self.venv} isn't a Python environment, so it's left alone. "
                                    "Move or delete that folder, then press Install again.")
-                job.log("Replacing the Conda-based speech environment with an independent Python runtime." if repair_conda
+                job.log("Rebuilding the speech environment and downloading fresh model files." if repair else
+                        "Replacing the Conda-based speech environment with an independent Python runtime." if repair_conda
                         else "The Python environment from before has no working Python, so it's being made again.")
             steps.append(("Creating a Python 3.12 environment…",
-                          [uv, "venv", "--clear", *(["--managed-python"] if is_windows() else []),
+                          [uv, "venv", "--clear",
                            "--python", VENV_PYTHON, str(self.venv)], 3600))
         packages = PORTABLE_PACKAGES if engine.key == "faster-whisper" else (engine.package,)
         steps.append((f"Installing {engine.package}…",
                       [uv, "pip", "install", "--python", str(self.python), *packages], 3600))
         # The worker resumes a stalled download itself and prints progress; on a slow line a few GB takes hours.
         steps.append((f"Downloading {engine.model}…",
-                      [str(self.python), str(WORKER), "--engine", engine.key, "--model", engine.model, "--download-only"],
+                      [str(self.python), str(WORKER), "--engine", engine.key, "--model", engine.model,
+                       "--download-only", *(["--force-download"] if repair else [])],
                       6 * 3600))
         for message, argv, timeout in steps:
             job.log(message)
-            code = self.runner.stream(argv, job.log, timeout=timeout)
+            # This environment setting also works with uv releases predating --managed-python.
+            options = {"env": {"UV_PYTHON_PREFERENCE": "only-managed"}} if is_windows() else {}
+            code = self.runner.stream(argv, job.log, timeout=timeout, **options)
             if code != 0:
                 raise JobError(f"{message.rstrip('…')} failed (exit {code}). See the log above.")
         return {"installed": True}

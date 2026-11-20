@@ -10,7 +10,7 @@ an output pipe open, and nothing ever sits waiting for keyboard input.
 
 from __future__ import annotations
 
-from .platforms import KILL, command_argv, process_options, signal_process_tree, spawn
+from .platforms import KILL, command_argv, find_executable, process_options, signal_process_tree, spawn
 
 import os
 import shutil
@@ -64,7 +64,7 @@ class CommandRunner:
     """Runs real commands. Tests use FakeRunner instead."""
 
     def which(self, name: str) -> str | None:
-        return shutil.which(name)
+        return find_executable(name)
 
     def run(
         self,

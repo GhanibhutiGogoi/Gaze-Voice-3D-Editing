@@ -51,11 +51,12 @@ def parse_dshow_devices(listing: str, kind: str) -> list[tuple[str, str]]:
     devices = []
     pending = None
     for line in listing.splitlines():
-        match = re.search(r'"(.+?)" \((audio|video)\)', line)
+        match = re.search(r'"(.+?)" \(([^)]+)\)', line)
         if match:
             if pending is not None:
                 devices.append(pending)
-            pending = (match.group(1), match.group(1)) if match.group(2) == kind else None
+            kinds = {value.strip() for value in match.group(2).split(",")}
+            pending = (match.group(1), match.group(1)) if kind in kinds else None
         elif pending is not None:
             alternative = re.search(r'Alternative name "(.+)"', line)
             if alternative:
@@ -194,7 +195,8 @@ class Microphone(Component):
         if picked is None:
             return self.state(
                 Health.ERROR,
-                f"Input {self.settings.mic_device} isn't connected. Pick another microphone in Routing.",
+                ("The selected microphone isn't connected. Pick another microphone in Routing." if is_windows() else
+                 f"Input {self.settings.mic_device} isn't connected. Pick another microphone in Routing."),
                 [("Devices", listing)],
             )
         index, name, auto = picked

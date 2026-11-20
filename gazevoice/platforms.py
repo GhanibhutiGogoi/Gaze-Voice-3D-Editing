@@ -16,7 +16,16 @@ def is_windows() -> bool:
 
 
 def is_apple_silicon() -> bool:
-    return sys.platform == "darwin" and platform.machine().lower() in ("arm64", "aarch64")
+    if sys.platform != "darwin":
+        return False
+    if platform.machine().lower() in ("arm64", "aarch64"):
+        return True
+    try:
+        result = subprocess.run(["/usr/sbin/sysctl", "-n", "hw.optional.arm64"],
+                                capture_output=True, text=True, timeout=3)
+        return result.returncode == 0 and result.stdout.strip() == "1"
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 def system_info() -> dict:
@@ -71,7 +80,7 @@ def spawn(argv, **kwargs):
 def command_argv(argv) -> list[str]:
     args = [str(item) for item in argv]
     if is_windows() and args:
-        resolved = shutil.which(args[0]) or args[0]
+        resolved = find_executable(args[0]) or args[0]
         if Path(resolved).suffix.lower() in (".cmd", ".bat"):
             # npm CLIs ship a JS entry point next to their Windows shim. Avoid cmd.exe quoting.
             prefix = Path(resolved).parent / "node_modules"
@@ -85,6 +94,15 @@ def command_argv(argv) -> list[str]:
     return args
 
 
+def find_executable(name: str) -> str | None:
+    """Resolve installs made after this process inherited its PATH."""
+    found = shutil.which(name)
+    if found or not is_windows() or Path(name).name != name:
+        return found
+    links = app_data("Microsoft", "WinGet", "Links")
+    return shutil.which(name, path=str(links))
+
+
 KILL = getattr(signal, "SIGKILL", 9)
 
 
@@ -92,8 +110,13 @@ def signal_process_tree(proc: subprocess.Popen, sig: int) -> None:
     try:
         if is_windows():
             if sig == signal.SIGINT:
-                proc.send_signal(signal.CTRL_BREAK_EVENT)
-            elif hasattr(proc, "close_tree"):
+                if proc.poll() is None:
+                    try:
+                        proc.send_signal(signal.CTRL_BREAK_EVENT)
+                        return
+                    except OSError:
+                        pass  # No console is attached; still reclaim the owned job.
+            if hasattr(proc, "close_tree"):
                 proc.close_tree()
             else:
                 subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
@@ -130,11 +153,9 @@ def install_command(package: str, *, cask: bool = False) -> list[str]:
 
 def launch_app(runner, binary: Path, args=()) -> None:
     if is_windows():
-        proc = subprocess.Popen(command_argv([binary, *args]), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, **process_options())
-        # Do not wait for the lifetime of a GUI application.
-        if proc.poll() not in (None, 0):
-            raise OSError(f"Could not open {binary}")
+        subprocess.Popen(command_argv([binary, *args]), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL,
+                         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS)
     else:
         result = runner.run(["open", "-a", binary, *(["--args", *args] if args else [])], timeout=30)
         if not result.ok:

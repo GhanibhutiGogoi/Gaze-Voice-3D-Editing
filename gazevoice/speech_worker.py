@@ -32,6 +32,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model", required=True)
     parser.add_argument("--audio")
     parser.add_argument("--download-only", action="store_true")
+    parser.add_argument("--force-download", action="store_true")
     parser.add_argument("--serve", action="store_true")
     args = parser.parse_args(argv)
     if not (args.download_only or args.serve or args.audio):
@@ -66,12 +67,13 @@ def _blob_bytes(folder: Path) -> int:
 
 def download(
     model: str,
-    fetch: Callable[[str], str] | None = None,
+    fetch: Callable[..., str] | None = None,
     folder: Path | None = None,
     total: int | None = None,
     attempts: int = 4,
     every: float = 5.0,
     pause: float = 5.0,
+    force: bool = False,
 ) -> str:
     """Fetch a model into the Hugging Face cache, printing progress, and resume if it breaks off.
 
@@ -108,7 +110,7 @@ def download(
     try:
         for attempt in range(1, attempts + 1):
             try:
-                path = fetch(model)
+                path = fetch(model, force_download=True) if force else fetch(model)
                 break
             except Exception as exc:  # noqa: BLE001 - network errors come in many types
                 if attempt == attempts:
@@ -231,7 +233,7 @@ def serve(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.download_only:
-        print(json.dumps({"downloaded": download(args.model)}))
+        print(json.dumps({"downloaded": download(args.model, force=True) if args.force_download else download(args.model)}))
         return 0
     if args.serve:
         return serve(args)

@@ -44,13 +44,19 @@ def find_blender(
     if is_windows():
         if candidates is None:
             configured = os.environ.get("BLENDER_PATH")
+            if configured and binary_in(Path(configured)).is_file():
+                return binary_in(Path(configured))
             path_binary = runner.which("blender")
             roots = [Path(os.environ.get(key, default)) / "Blender Foundation" for key, default in
                      (("ProgramFiles", r"C:\Program Files"), ("ProgramFiles(x86)", r"C:\Program Files (x86)"))]
             candidates = [*(Path(p) for p in (configured, path_binary) if p),
                           *(p for root in roots for p in sorted(root.glob("Blender*"), reverse=True)),
                           *sorted(app_data("Programs", "Blender Foundation").glob("Blender*"), reverse=True)]
-        return next((binary_in(Path(app)) for app in candidates if binary_in(Path(app)).is_file()), None)
+        binaries = list(dict.fromkeys(binary_in(Path(app)) for app in candidates if binary_in(Path(app)).is_file()))
+        if len(binaries) < 2:
+            return next(iter(binaries), None)
+        versions = [(blender_version(runner, binary, probes) or (0, 0, 0), binary) for binary in binaries]
+        return max(versions, key=lambda item: item[0])[1]
     for app in candidates if candidates is not None else APP_CANDIDATES:
         if binary_in(Path(app)).is_file():
             return binary_in(Path(app))
@@ -205,7 +211,10 @@ class Blender(Component):
         if binary is None:
             raise JobError("Blender isn't installed.")
         if is_windows():
-            launch_app(self.runner, binary, ["--online-mode"])
+            try:
+                launch_app(self.runner, binary, ["--online-mode"])
+            except OSError as exc:
+                raise JobError(f"Couldn't launch Blender: {exc}") from exc
             return {"launched": str(binary)}
         app = str(app_path(binary))
         job.log("Launching Blender with online access on, so the MCP add-on can start…")
