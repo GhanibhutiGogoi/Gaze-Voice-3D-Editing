@@ -1,3 +1,4 @@
+from .helpers import process_alive
 import base64
 import contextlib
 import io
@@ -727,7 +728,7 @@ class VoiceServiceTest(VoiceTestBase):
         self.assertTrue({"stt", "refine", "edit", "total"} <= set(record["timings"]))
         folder = Path(self.tmp.name) / "commands" / record["id"]
         self.assertTrue((folder / "audio.wav").is_file())
-        self.assertEqual(json.loads((folder / "record.json").read_text())["reply"], "Made Chair twice as tall.")
+        self.assertEqual(json.loads((folder / "record.json").read_text(encoding="utf-8"))["reply"], "Made Chair twice as tall.")
         texts = [text for text, _ in self.bridge.statuses]
         self.assertIn("Listening… release the key to send", texts)
         self.assertIn("✓ Made Chair twice as tall.", texts)
@@ -901,7 +902,7 @@ class VoiceServiceTest(VoiceTestBase):
         self.mic = FakeMic(fail=True)
         with self.assertRaises(VoiceError) as caught:
             self.build().start()
-        self.assertIn("Privacy & Security", str(caught.exception))
+        self.assertIn("privacy & security", str(caught.exception).lower())
         self.assertEqual(self.stt.calls, [])
 
     def test_too_short_press_is_ignored(self):
@@ -1092,7 +1093,7 @@ class StopInTheGapTest(VoiceTestBase):
             self.stop_while_starting(in_the_gap, go_on, lambda: self.service._gaze is None)
         self.assertIsNotNone(self.gaze.proc)  # it really did start, after the stop
         self.assertFalse(self.gaze.alive)
-        self.assertRaises(ProcessLookupError, os.kill, self.gaze.proc.pid, 0)
+        self.assertFalse(process_alive(self.gaze.proc.pid))
         self.assertIsNone(camera.holder)
 
     def late_part(self, base):
@@ -1264,7 +1265,7 @@ class VoiceRobustnessTest(VoiceTestBase):
         with self.assertRaises(VoiceError) as caught:
             self.build().start()
         self.assertIn("pure silence", str(caught.exception))
-        self.assertIn("Privacy & Security", str(caught.exception))
+        self.assertIn("privacy & security", str(caught.exception).lower())
         self.assertFalse(self.mic.started)
 
     def test_a_silent_recording_explains_the_permission(self):
@@ -1537,7 +1538,7 @@ class GazeVoiceTest(VoiceTestBase):
         self.assertEqual(gaze["targets"][0]["candidates"][0]["name"], "Eagle")
         self.assertEqual(gaze["targets"][0]["piece"], WING_PIECE)  # what Blender said about the part, without "ok"
         self.assertIs(gaze["matched_selection"], False)  # it looked at the Eagle, with the Chair selected
-        saved = json.loads((Path(self.tmp.name) / "commands" / record["id"] / "record.json").read_text())
+        saved = json.loads((Path(self.tmp.name) / "commands" / record["id"] / "record.json").read_text(encoding="utf-8"))
         self.assertEqual(saved["gaze"], gaze)
 
     def test_off_mode_never_starts_gaze(self):
@@ -2360,10 +2361,19 @@ class GazeMarkerTest(VoiceTestBase):
     # --- finding Blender on the screen -----------------------------------------------------------
     def test_where_blender_is_asked_at_most_once_a_second(self):
         self.assertEqual(voice_service.MARKER_PLACE_SECONDS, 1.0)
-        self.start()
-        wait_for(lambda: [0.25, 0.5] in self.markers())
-        self.settle(10)  # half a second or more of polling
-        self.assertEqual(self.bridge.calls.count("gaze_view"), 1)
+        # Patch only the service's clock: polling and test deadlines still use real time.
+        with patch.object(voice_service, "time", wraps=time) as timer:
+            timer.monotonic.return_value = 10.0
+            self.start()
+            wait_for(lambda: [0.25, 0.5] in self.markers())
+            timer.monotonic.return_value = 10.999
+            self.settle(10)
+            self.assertEqual(self.bridge.calls.count("gaze_view"), 1)
+            timer.monotonic.return_value = 11.0
+            wait_for(lambda: self.bridge.calls.count("gaze_view") == 2)
+            self.settle(4)
+            self.assertEqual(self.bridge.calls.count("gaze_view"), 2)
+            self.service.stop()
 
     def test_it_is_asked_again_to_notice_a_window_that_moved(self):
         self.gaze = FakeGaze(screen=Area(0, 0, 1840, 550))
@@ -2442,12 +2452,16 @@ class GazeMarkerTest(VoiceTestBase):
             return real(cmd, req)
 
         self.bridge.gaze = gaze
-        with patch.object(voice_service, "MARKER_PLACE_SECONDS", 0.5):  # so it is stale after 1 s, not before
+        with patch.object(voice_service, "time", wraps=time) as timer:
+            timer.monotonic.return_value = 10.0
             self.start()
             wait_for(lambda: [0.25, 0.5] in self.markers())
+            timer.monotonic.return_value = 11.0
             wait_for(lambda: len(asked) >= 2)
-            self.settle(4)  # a fifth of a second: well before the answer it already has is too old to use
+            timer.monotonic.return_value = 11.999
+            self.settle(4)  # the last good answer is still less than two seconds old
             self.assertEqual(self.markers(), [None, [0.25, 0.5]])
+            self.service.stop()
 
     def test_a_viewport_not_heard_about_for_two_seconds_is_not_used_any_longer(self):
         real = self.bridge.gaze
@@ -3627,14 +3641,10 @@ class GazePictureRealRouteTest(VoiceTestBase):
         return found
 
     def pid(self):
-        return int(self.pid_file.read_text())
+        return int(self.pid_file.read_text(encoding="utf-8"))
 
     def process_gone(self):
-        try:
-            os.kill(self.pid(), 0)
-        except ProcessLookupError:
-            return True
-        return False
+        return not process_alive(self.pid())
 
     def test_the_sentence_comes_from_a_process_that_has_exited(self):
         record = self.run_it()
@@ -3827,13 +3837,13 @@ def saved_record_text(root, record) -> str:
 
     def written() -> bool:
         try:
-            json.loads(path.read_text())  # whole, not just begun
+            json.loads(path.read_text(encoding="utf-8"))  # whole, not just begun
         except (OSError, ValueError):
             return False
         return True
 
     wait_for(written)
-    return path.read_text()
+    return path.read_text(encoding="utf-8")
 
 
 def wait_until_true(predicate, seconds=3.0):

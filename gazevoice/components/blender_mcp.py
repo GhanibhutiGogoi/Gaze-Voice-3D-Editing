@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ..platforms import venv_executable
+
 import shutil
 import zipfile
 from pathlib import Path
@@ -12,6 +14,8 @@ from ..download import download
 from ..jobs import Job, JobError
 from ..mcp_client import McpError, StdioMcpClient
 from ..paths import AppPaths, tilde
+from ..python_tools import ensure_uv, find_uv
+from ..runner import CommandRunner
 from .base import ActionSpec, Component, ComponentState, Health
 from .blender import MIN_BLENDER, blender_version, extensions_dir, find_blender, install_extension
 
@@ -27,13 +31,14 @@ UV_PYTHON = "3.12"
 def server_installed(paths: AppPaths) -> bool:
     """Unpacked *and* synced. An unpacked bundle whose `uv sync` failed must still offer Install."""
     folder = paths.mcp_server_dir
-    return (folder / "pyproject.toml").is_file() and (folder / ".venv" / "bin" / "python").exists()
+    return (folder / "pyproject.toml").is_file() and (venv_executable(folder / ".venv")).exists()
 
 
 def server_command(paths: AppPaths, blender_binary: Path | None) -> dict:
     """How an MCP client (the brain, or our test) launches the official server."""
     env = {"BLENDER_PATH": str(blender_binary)} if blender_binary else {}
-    return {"command": "uv", "args": ["run", "--directory", str(paths.mcp_server_dir), "blender-mcp"], "env": env}
+    return {"command": find_uv(CommandRunner(), paths) or "uv",
+            "args": ["run", "--directory", str(paths.mcp_server_dir), "blender-mcp"], "env": env}
 
 
 def _safe_extract(archive: zipfile.ZipFile, target: Path) -> None:
@@ -114,20 +119,22 @@ class McpServer(Component):
     def installed(self) -> bool:
         return server_installed(self.paths)
 
+    def _install_action(self) -> ActionSpec:
+        return ActionSpec("install", "Install server",
+                          confirm=f"Download Blender Lab's MCP server v{RELEASE} and install its Python packages? "
+                                  "If needed, uv is installed in GazeVoice's own tools folder first.")
+
     def check(self) -> ComponentState:
-        if not self.runner.which("uv"):
-            return self.state(Health.ERROR, "uv is needed to run the MCP server. Install uv (astral.sh/uv), then refresh.")
+        if not find_uv(self.runner, self.paths):
+            return self.state(Health.MISSING, "Press Install to set up the MCP server, including uv and its Python packages.",
+                              actions=[self._install_action()])
         details = [("Release", f"{RELEASE} · Blender Lab"), ("Location", tilde(self.folder))]
         if not self.installed():
             return self.state(
                 Health.MISSING,
                 f"Not installed. Install downloads Blender Lab's official server (v{RELEASE}) and its Python packages.",
                 details,
-                [ActionSpec(
-                    "install",
-                    "Install server",
-                    confirm=f"Download Blender Lab's MCP server v{RELEASE} and install its Python packages with uv?",
-                )],
+                [self._install_action()],
             )
         test = [ActionSpec("test", "Test")]
         if port_open("127.0.0.1", self.addon_port):
@@ -135,8 +142,7 @@ class McpServer(Component):
         return self.state(Health.INSTALLED, "Installed. Waiting for Blender's MCP add-on to start listening.", details, test)
 
     def action_install(self, job: Job) -> dict:
-        if not self.runner.which("uv"):
-            raise JobError("uv isn't installed. Install it from astral.sh/uv, then try again.")
+        uv = ensure_uv(self.runner, self.paths, job)
         bundle = self.download(SERVER_MCPB_URL, self.paths.downloads / f"blender-{RELEASE}.mcpb", job)
         staging = self.folder.with_name(self.folder.name + ".new")
         shutil.rmtree(staging, ignore_errors=True)
@@ -162,7 +168,7 @@ class McpServer(Component):
         job.log(f"Unpacked to {self.folder}")
         job.log("Installing the server's Python packages with uv…")
         code = self.runner.stream(
-            ["uv", "sync", "--python", UV_PYTHON, "--directory", str(self.folder)], job.log, timeout=900
+            [uv, "sync", "--python", UV_PYTHON, "--directory", str(self.folder)], job.log, timeout=900
         )
         if code != 0:
             raise JobError(f"uv couldn't install the server's packages (exit {code}). See the log above.")

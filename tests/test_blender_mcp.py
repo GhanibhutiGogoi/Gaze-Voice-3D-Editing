@@ -1,3 +1,4 @@
+from gazevoice.platforms import venv_executable
 import socket
 import sys
 import unittest
@@ -129,7 +130,8 @@ class McpServerTest(unittest.TestCase):
     def test_needs_uv(self):
         self.t.runner.set_which("uv", None)
         state = self.server.check()
-        self.assertEqual((state.health, state.actions), (Health.ERROR, ()))
+        self.assertEqual(state.health, Health.MISSING)
+        self.assertTrue(state.offers("install"))
         self.assertIn("uv", state.summary)
 
     def test_not_installed_offers_install_with_consent(self):
@@ -143,8 +145,8 @@ class McpServerTest(unittest.TestCase):
         folder.mkdir(parents=True, exist_ok=True)
         (folder / "pyproject.toml").write_text("[project]\nname='blender-mcp'\n")
         if synced:
-            (folder / ".venv" / "bin").mkdir(parents=True)
-            (folder / ".venv" / "bin" / "python").write_text("")
+            venv_executable(folder / ".venv").parent.mkdir(parents=True)
+            venv_executable(folder / ".venv").write_text("")
 
     def test_installed_waiting_for_addon(self):
         self.mark_installed()
@@ -226,7 +228,7 @@ class McpServerTest(unittest.TestCase):
         cmd = server_command(self.t.paths, Path("/Applications/Blender.app/Contents/MacOS/Blender"))
         self.assertEqual(cmd["command"], "uv")
         self.assertEqual(cmd["args"], ["run", "--directory", str(self.t.paths.mcp_server_dir), "blender-mcp"])
-        self.assertEqual(cmd["env"], {"BLENDER_PATH": "/Applications/Blender.app/Contents/MacOS/Blender"})
+        self.assertEqual(cmd["env"], {"BLENDER_PATH": str(Path("/Applications/Blender.app/Contents/MacOS/Blender"))})
         self.assertEqual(server_command(self.t.paths, None)["env"], {})
 
 

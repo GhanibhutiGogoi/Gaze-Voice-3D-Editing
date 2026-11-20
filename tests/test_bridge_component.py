@@ -26,10 +26,13 @@ class FakeBridge:
 
         class Handler(socketserver.StreamRequestHandler):
             def handle(self):
-                for line in self.rfile:
-                    for request in protocol.decode_lines(bytearray(line)):
-                        time.sleep(delay)
-                        self.wfile.write(protocol.encode(protocol.handle(request, scene, events)))
+                try:
+                    for line in self.rfile:
+                        for request in protocol.decode_lines(bytearray(line)):
+                            time.sleep(delay)
+                            self.wfile.write(protocol.encode(protocol.handle(request, scene, events)))
+                except ConnectionError:
+                    pass  # timeout and port-probe clients deliberately disconnect
 
         self.server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
         self.server.daemon_threads = True
@@ -208,7 +211,7 @@ class BridgeComponentTest(unittest.TestCase):
 
 class ManifestTest(unittest.TestCase):
     def test_manifest_fields(self):
-        text = (BRIDGE_SRC / "blender_manifest.toml").read_text()
+        text = (BRIDGE_SRC / "blender_manifest.toml").read_text(encoding="utf-8")
         for needle in ('id = "gazevoice_bridge"', f'version = "{BRIDGE_VERSION}"', 'blender_version_min = "5.1.0"', "network ="):
             self.assertIn(needle, text)
         json.dumps(text)  # plain text, no surprises
@@ -220,3 +223,13 @@ class ManifestTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def setUpModule():
+    import importlib
+    from .helpers import macos_adapters
+    global _mac_adapters
+    _mac_adapters = macos_adapters(*(importlib.import_module(name) for name in ['gazevoice.components.blender']))
+
+def tearDownModule():
+    _mac_adapters.close()

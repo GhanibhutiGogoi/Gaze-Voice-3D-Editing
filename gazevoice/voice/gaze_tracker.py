@@ -7,6 +7,8 @@ on, `.place` holds where the worker last saw the head, which the calibration pag
 
 from __future__ import annotations
 
+from ..platforms import KILL, command_argv, process_options, signal_process_tree, spawn
+
 import collections
 import json
 import math
@@ -112,9 +114,9 @@ class GazeTracker:
     def start(self, timeout: float = START_SECONDS) -> float:
         """Start the worker and wait for its first picture from the camera. Returns the start-up time in seconds."""
         try:
-            self.proc = subprocess.Popen(
-                self.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                encoding="utf-8", errors="replace", bufsize=1, env=self.env, start_new_session=True,
+            self.proc = spawn(
+                command_argv(self.argv), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                encoding="utf-8", errors="replace", bufsize=1, env=self.env, **process_options(),
             )
         except OSError as exc:
             raise GazeError("Gaze tracking isn't installed. Install it on the Gaze unit.") from exc
@@ -279,7 +281,7 @@ class GazeTracker:
     @staticmethod
     def _kill_group(proc: subprocess.Popen) -> None:
         try:
-            os.killpg(proc.pid, signal.SIGKILL)  # the worker leads its own group, and ffmpeg is in it
+            signal_process_tree(proc, KILL)  # the worker leads its own group, and ffmpeg is in it
         except (ProcessLookupError, PermissionError):
             proc.kill()
 

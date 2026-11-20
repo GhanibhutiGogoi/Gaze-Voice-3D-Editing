@@ -46,15 +46,20 @@ def main(argv: list[str] | None = None) -> int:
         # Once is enough. A second hangup or terminate must not raise inside center.shutdown() and cut short the wait
         # for a training run to save its model.
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        if hasattr(signal, "SIGBREAK"):
+            signal.signal(signal.SIGBREAK, signal.SIG_IGN)
+        if hasattr(signal, "SIGHUP"):
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
         raise KeyboardInterrupt
 
-    signal.signal(signal.SIGTERM, _terminate)
-    # Closing the Terminal window: a training run must still be stopped and saved. Unless the program was started with
-    # `nohup`, which means SIGHUP is meant to be ignored.
-    if signal.getsignal(signal.SIGHUP) != signal.SIG_IGN:
-        signal.signal(signal.SIGHUP, _terminate)
     try:
+        # A signal can arrive as soon as its handler is installed, before serving starts.
+        signal.signal(signal.SIGTERM, _terminate)
+        if hasattr(signal, "SIGBREAK"):
+            signal.signal(signal.SIGBREAK, _terminate)
+        # Respect `nohup`, which deliberately starts with SIGHUP ignored.
+        if hasattr(signal, "SIGHUP") and signal.getsignal(signal.SIGHUP) != signal.SIG_IGN:
+            signal.signal(signal.SIGHUP, _terminate)
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopping…", flush=True)

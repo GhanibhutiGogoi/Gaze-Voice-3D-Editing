@@ -7,6 +7,8 @@ keeps holding port 5004. Whatever the helpers do, a run that has ended leaves no
 
 from __future__ import annotations
 
+from .platforms import KILL, command_argv, is_windows, process_options, signal_process_tree, spawn
+
 import collections
 import os
 import re
@@ -111,7 +113,7 @@ def parse_line(line: str) -> dict | None:
 
 def _signal_group(proc: subprocess.Popen, sig: int) -> None:
     try:
-        os.killpg(proc.pid, sig)
+        signal_process_tree(proc, sig)
     except (ProcessLookupError, PermissionError):
         pass
 
@@ -290,7 +292,9 @@ class Training:
             if not (resume or overwrite) and _exists(project / RESULTS_DIR / run_id):
                 raise TrainingError(_previous_run_sentence(run_id))  # before the config or the log is touched
 
-            argv = [exe]
+            argv = [sys.executable, exe] if Path(exe).suffix == ".py" else [exe]
+            if is_windows() and Path(exe).name.lower() == "mlagents-learn.exe":
+                argv = [str(Path(exe).with_name("python.exe")), str(Path(__file__).with_name("trainer_worker.py"))]
             if config_yaml:
                 config = project / CONFIGS_DIR / f"{run_id}.yaml"
                 try:
@@ -306,7 +310,7 @@ class Training:
             elif overwrite:
                 argv.append("--force")
 
-            if signal.getsignal(signal.SIGINT) == signal.SIG_IGN:
+            if not is_windows() and signal.getsignal(signal.SIGINT) == signal.SIG_IGN:
                 argv = [sys.executable, "-I", "-c", _RESTORE_SIGINT, *argv]
 
             log_path = self._logs / f"mlagents-{run_id}.log"
@@ -317,10 +321,10 @@ class Training:
                 raise TrainingError(f"Couldn't write the training log at {log_path}: {exc.strerror or exc}.") from exc
             env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")  # lines arrive as they happen
             try:
-                proc = subprocess.Popen(
-                    argv, cwd=project, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                proc = spawn(
+                    command_argv(argv), cwd=project, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1,
-                    start_new_session=True,
+                    **process_options(),
                 )
             except OSError as exc:
                 log.close()
@@ -421,7 +425,7 @@ class Training:
             pump.join(_DRAIN_SECONDS)
             # Nothing it started may outlive it: not a helper that still holds the pipe, nor one that let go of it,
             # and with it port 5004.
-            _signal_group(run.proc, signal.SIGKILL)
+            _signal_group(run.proc, KILL)
             if pump.is_alive():
                 pump.join(_DRAIN_SECONDS)
         finally:
@@ -452,7 +456,7 @@ class Training:
         if asked:
             self._notify()
             if not run.exited.wait(timeout):
-                _signal_group(run.proc, signal.SIGKILL)
+                _signal_group(run.proc, KILL)
                 run.exited.wait(5.0)
         run.done.wait(_DRAIN_SECONDS * 2 + 5.0)
         return self.status()

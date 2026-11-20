@@ -25,7 +25,8 @@ from gazevoice.voice.picture import PICTURE_MODEL, PICTURE_RULES, pictures_allow
 from .helpers import make_job
 from .test_picture import FAKE_CLAUDE, LOGGED_OUT, DescribeCropBase, claude_runner, gone, tree
 
-NOT_ROOT = unittest.skipIf(os.geteuid() == 0, "root can read a file nobody can")
+NOT_ROOT = unittest.skipIf(os.name == "nt" or getattr(os, "geteuid", lambda: -1)() == 0,
+                           "requires POSIX permissions for a non-root user")
 
 
 class FindLeftoversTest(unittest.TestCase):
@@ -69,13 +70,14 @@ class FindLeftoversTest(unittest.TestCase):
         since = time.time()
         fresh = self.plant("fresh.log")
         opened = []
-        real_open = os.open
+        from gazevoice.voice.leftovers import _open_regular
+        real_open = _open_regular
 
         def spying_open(path, *args, **kwargs):
             opened.append(Path(path))
             return real_open(path, *args, **kwargs)
 
-        with patch("gazevoice.voice.leftovers.os.open", spying_open):
+        with patch("gazevoice.voice.leftovers._open_regular", spying_open):
             found = find_leftovers(self.marker, since, [self.scan])
         self.assertEqual(found, [fresh])
         self.assertNotIn(old, opened)
@@ -88,9 +90,10 @@ class FindLeftoversTest(unittest.TestCase):
     def test_a_file_shorter_than_the_marker_is_not_opened(self):
         tiny = self.scan / "tiny.txt"
         tiny.write_bytes(self.marker[:10])
-        with patch("gazevoice.voice.leftovers.os.open", side_effect=AssertionError("opened")):
+        with patch("gazevoice.voice.leftovers._open_regular", side_effect=AssertionError("opened")):
             self.assertEqual(find_leftovers(self.marker, self.since, [self.scan]), [])
 
+    @unittest.skipIf(os.name == "nt", "requires symlink privileges; Windows junctions tested separately")
     def test_symlinks_are_not_followed_out_of_the_root(self):
         outside = self.root / "outside"
         outside.mkdir()
@@ -101,6 +104,7 @@ class FindLeftoversTest(unittest.TestCase):
         inside = self.plant("real.txt")
         self.assertEqual(find_leftovers(self.marker, self.since, [self.scan]), [inside])
 
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "POSIX FIFO")
     def test_things_that_are_not_files_are_skipped_without_hanging(self):
         os.mkfifo(self.scan / "pipe")
         (self.scan / "folder.txt").mkdir()
@@ -191,7 +195,7 @@ class SearchTroubleTest(unittest.TestCase):
 
     def test_a_file_macos_refuses_to_open_that_changed_since_is_a_failure(self):
         self.locked_file().chmod(0o600)
-        with patch("gazevoice.voice.leftovers.os.open", side_effect=PermissionError(errno.EPERM, "Operation not permitted")):
+        with patch("gazevoice.voice.leftovers._open_regular", side_effect=PermissionError(errno.EPERM, "Operation not permitted")):
             scan = self.search(Place(self.scan, strict=True))
         self.assertEqual(list(scan.failed), [str(self.scan / "locked.bin")])
 
@@ -276,7 +280,7 @@ class SearchTroubleTest(unittest.TestCase):
             return real_lstat(path, *args, **kwargs)
 
         with patch("gazevoice.voice.leftovers.os.lstat", lstat), \
-                patch("gazevoice.voice.leftovers.os.open", side_effect=PermissionError(errno.EACCES, "Permission denied")):
+                patch("gazevoice.voice.leftovers._open_regular", side_effect=PermissionError(errno.EACCES, "Permission denied")):
             scan = self.search(Place(self.scan, strict=True))
         self.assertEqual(list(scan.failed), [str(target)])  # an unknown owner might be this user
 
@@ -325,8 +329,8 @@ class SearchTroubleTest(unittest.TestCase):
 
     def test_a_file_that_vanishes_while_it_is_looked_at_is_no_trouble(self):
         self.locked_file().chmod(0o600)
-        for error in (FileNotFoundError(2, "No such file or directory"), OSError(62, "Too many levels of symbolic links")):
-            with patch("gazevoice.voice.leftovers.os.open", side_effect=error):
+        for error in (FileNotFoundError(2, "No such file or directory"), OSError(errno.ELOOP, "Too many levels of symbolic links")):
+            with patch("gazevoice.voice.leftovers._open_regular", side_effect=error):
                 scan = self.search(Place(self.scan, strict=True))
             self.assertEqual((scan.failed, scan.skipped), ({}, set()), error)
 
@@ -415,7 +419,7 @@ class LeftoverCheckTest(DescribeCropBase):
     def test_a_clean_run_records_a_pass_for_this_version(self):
         result = self.run_check()
         self.assertTrue(result["passed"])
-        saved = json.loads(self.paths.gaze_picture_check.read_text())
+        saved = json.loads(self.paths.gaze_picture_check.read_text(encoding="utf-8"))
         self.assertEqual(set(saved), {"claude", "passed", "when"})
         self.assertEqual((saved["claude"], saved["passed"]), ("2.1.303", True))
         self.assertTrue(pictures_allowed(self.paths, "2.1.303"))
@@ -423,9 +427,9 @@ class LeftoverCheckTest(DescribeCropBase):
 
     def test_the_check_goes_through_the_same_route_as_a_real_picture(self):
         self.run_check()
-        argv = json.loads(self.argv_file.read_text())
+        argv = json.loads(self.argv_file.read_text(encoding="utf-8"))
         self.assertEqual(argv, claude_session_argv(PICTURE_RULES, PICTURE_MODEL, None, max_turns=1)[1:])
-        sent = json.loads(self.stdin_file.read_text())
+        sent = json.loads(self.stdin_file.read_text(encoding="utf-8"))
         self.assertEqual(sent["types"], ["image", "text"])
         self.assertEqual(sent["text"], CHECK_QUESTION)  # one line, no picture.md template
         self.assertEqual(sent["media_type"], "image/png")
@@ -443,9 +447,9 @@ class LeftoverCheckTest(DescribeCropBase):
 
     def test_it_sends_a_new_random_picture_each_time(self):
         self.run_check()
-        first = json.loads(self.stdin_file.read_text())["sha256"]
+        first = json.loads(self.stdin_file.read_text(encoding="utf-8"))["sha256"]
         self.run_check()
-        self.assertNotEqual(first, json.loads(self.stdin_file.read_text())["sha256"])
+        self.assertNotEqual(first, json.loads(self.stdin_file.read_text(encoding="utf-8"))["sha256"])
 
     def test_a_failed_call_records_no_pass(self):
         with self.assertRaises(JobError) as caught:
@@ -654,3 +658,14 @@ class NoisePictureTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# These fixtures describe macOS; Windows adapters have their own tests.
+def setUpModule():
+    global _mac_adapters
+    import importlib
+    from .helpers import macos_adapters
+    _mac_adapters = macos_adapters(*(importlib.import_module(name) for name in ['gazevoice.voice.leftovers']))
+
+def tearDownModule():
+    _mac_adapters.close()

@@ -7,6 +7,8 @@ but the provider's own Authorization header.
 
 from __future__ import annotations
 
+from .platforms import is_windows
+
 import http.client
 import json
 import re
@@ -176,6 +178,13 @@ class KeyStore:
 
     def set(self, pid: str, key: str) -> None:
         account, key = self._account(pid), clean_key(key)
+        if is_windows():
+            from . import windows_credentials
+            try:
+                windows_credentials.write(account, key)
+            except (OSError, ValueError) as exc:
+                raise ProviderError("Windows Credential Manager could not save the key.") from exc
+            return
         # `security -i` reads the command from stdin, so the key never shows up in a process listing.
         command = f'add-generic-password -U -s {KEYCHAIN_SERVICE} -a {account} -w "{key}"\n'
         self.runner.run(["security", "-i"], input_text=command, timeout=15)
@@ -183,14 +192,29 @@ class KeyStore:
             raise ProviderError("macOS Keychain didn't save the key. Try again, and allow access if macOS asks.")
 
     def get(self, pid: str) -> str | None:
+        if is_windows():
+            from . import windows_credentials
+            try:
+                return windows_credentials.read(self._account(pid))
+            except OSError as exc:
+                raise ProviderError("Windows Credential Manager could not read the key.") from exc
         result = self._find(pid, secret=True)
         key = result.stdout.strip() if result.returncode == 0 else ""
         return key or None
 
     def has(self, pid: str) -> bool:
+        if is_windows():
+            return self.get(pid) is not None
         return self._find(pid, secret=False).returncode == 0
 
     def delete(self, pid: str) -> None:
+        if is_windows():
+            from . import windows_credentials
+            try:
+                windows_credentials.delete(self._account(pid))
+            except OSError as exc:
+                raise ProviderError("Windows Credential Manager could not delete the key.") from exc
+            return
         self.runner.run(["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", self._account(pid)],
                         timeout=15)
 
@@ -242,7 +266,7 @@ class ChatClient:
                     raise ProviderError(self._scrub(self._explain(exc.code, detail, model, path))) from None
             except TimeoutError:
                 raise ProviderError(f"{self.config.name} took too long to answer.") from None
-            except ConnectionResetError:
+            except (ConnectionResetError, ConnectionAbortedError):
                 raise ProviderError(f"Lost the connection to {self.config.name} mid-answer. Try again.") from None
             except (urllib.error.URLError, OSError) as exc:
                 reason = getattr(exc, "reason", exc)

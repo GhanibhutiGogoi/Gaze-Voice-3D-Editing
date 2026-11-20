@@ -33,6 +33,10 @@ import sys
 import time
 from pathlib import Path
 
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, lambda *_: signal.getsignal(signal.SIGINT)(signal.SIGINT, None)
+                  if callable(signal.getsignal(signal.SIGINT)) else None)
+
 LIFETIME = 30.0
 
 BANNER = [
@@ -113,6 +117,9 @@ RESTART_LINES = [  # what Unity stopping answering mid-run leaves, as printed on
 
 HELPER_CODE = r"""
 import os, signal, sys, time
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, lambda *_: signal.getsignal(signal.SIGINT)(signal.SIGINT, None)
+                  if callable(signal.getsignal(signal.SIGINT)) else None)
 mode, marker, pid_file = sys.argv[1:4]
 if mode in ("deaf", "quiet"):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -126,7 +133,9 @@ else:
         os._exit(0)
     signal.signal(signal.SIGINT, on_interrupt)
 open(pid_file, "w").write(str(os.getpid()))
-time.sleep(30)
+until = time.monotonic() + 30
+while time.monotonic() < until:
+    time.sleep(0.02)
 """
 
 

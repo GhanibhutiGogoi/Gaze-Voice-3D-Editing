@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import os
 import threading
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -11,6 +12,7 @@ from ..jobs import Job, JobError
 from ..paths import tilde
 from ..probes import ProbeCache
 from ..runner import CommandRunner
+from ..platforms import app_data, install_command, is_windows, launch_app, process_running
 from .base import ActionSpec, Component, ComponentState, Health
 
 MIN_BLENDER = (5, 1)
@@ -24,17 +26,37 @@ _version_lock = threading.Lock()
 
 
 def binary_in(app: Path) -> Path:
+    if app.suffix.lower() == ".exe":
+        return app
+    if is_windows() and app.suffix != ".app":
+        return app / "blender.exe"
     return app / "Contents" / "MacOS" / "Blender"
 
 
 def app_path(binary: Path) -> Path:
-    return binary.parents[2]
+    return binary.parent if binary.suffix.lower() == ".exe" else binary.parents[2]
 
 
 def find_blender(
     runner: CommandRunner, candidates: Iterable[Path] | None = None, probes: ProbeCache | None = None
 ) -> Path | None:
     """Path to the Blender binary, or None. Checks pass `probes` to share one Spotlight query."""
+    if is_windows():
+        if candidates is None:
+            configured = os.environ.get("BLENDER_PATH")
+            if configured and binary_in(Path(configured)).is_file():
+                return binary_in(Path(configured))
+            path_binary = runner.which("blender")
+            roots = [Path(os.environ.get(key, default)) / "Blender Foundation" for key, default in
+                     (("ProgramFiles", r"C:\Program Files"), ("ProgramFiles(x86)", r"C:\Program Files (x86)"))]
+            candidates = [*(Path(p) for p in (configured, path_binary) if p),
+                          *(p for root in roots for p in sorted(root.glob("Blender*"), reverse=True)),
+                          *sorted(app_data("Programs", "Blender Foundation").glob("Blender*"), reverse=True)]
+        binaries = list(dict.fromkeys(binary_in(Path(app)) for app in candidates if binary_in(Path(app)).is_file()))
+        if len(binaries) < 2:
+            return next(iter(binaries), None)
+        versions = [(blender_version(runner, binary, probes) or (0, 0, 0), binary) for binary in binaries]
+        return max(versions, key=lambda item: item[0])[1]
     for app in candidates if candidates is not None else APP_CANDIDATES:
         if binary_in(Path(app)).is_file():
             return binary_in(Path(app))
@@ -85,6 +107,9 @@ def format_version(version: Sequence[int]) -> str:
 
 
 def extensions_dir(version: Sequence[int], home: Path | None = None) -> Path:
+    if is_windows():
+        base = (home / "AppData" / "Roaming") if home is not None else app_data(roaming=True)
+        return base / "Blender Foundation" / "Blender" / f"{version[0]}.{version[1]}" / "extensions" / EXTENSION_REPO
     home = home if home is not None else Path.home()
     return (
         home / "Library" / "Application Support" / "Blender"
@@ -102,10 +127,7 @@ def install_extension(runner: CommandRunner, binary: Path, zip_path: Path, job: 
 
 
 def is_running(runner: CommandRunner, probes: ProbeCache | None = None) -> bool:
-    argv = ["pgrep", "-x", "Blender"]
-    if probes:
-        return probes.run(runner, argv, timeout=5, ttl=3, raise_on_timeout=True).ok
-    return runner.run(argv, timeout=5).ok
+    return process_running(runner, "Blender", probes, windows=is_windows())
 
 
 class Blender(Component):
@@ -126,6 +148,11 @@ class Blender(Component):
     def check(self) -> ComponentState:
         binary, version = self.locate()
         if binary is None:
+            if is_windows():
+                actions = [ActionSpec("install", "Install Blender", confirm="Download and install Blender with WinGet?")] if self.runner.which("winget") else []
+                return self.state(Health.MISSING,
+                                  "Blender not found. Install with WinGet, or install from blender.org and set BLENDER_PATH for a portable installation.",
+                                  actions=actions)
             if not self.runner.which("brew"):
                 return self.state(
                     Health.MISSING,
@@ -164,6 +191,13 @@ class Blender(Component):
         )
 
     def action_install(self, job: Job) -> dict:
+        if is_windows():
+            if not self.runner.which("winget"):
+                raise JobError("WinGet is missing. Install App Installer from Microsoft Store, or download Blender from blender.org.")
+            code = self.runner.stream(install_command("blender"), job.log, timeout=1800)
+            if code != 0:
+                raise JobError(f"WinGet couldn't install Blender (exit {code}). See the log above.")
+            return {"installed": True}
         if not self.runner.which("brew"):
             raise JobError("Homebrew isn't installed. Get it from brew.sh, or install Blender from blender.org.")
         job.log("Installing Blender with Homebrew (brew install --cask blender)…")
@@ -176,6 +210,12 @@ class Blender(Component):
         binary = find_blender(self.runner, self.candidates)
         if binary is None:
             raise JobError("Blender isn't installed.")
+        if is_windows():
+            try:
+                launch_app(self.runner, binary, ["--online-mode"])
+            except OSError as exc:
+                raise JobError(f"Couldn't launch Blender: {exc}") from exc
+            return {"launched": str(binary)}
         app = str(app_path(binary))
         job.log("Launching Blender with online access on, so the MCP add-on can start…")
         result = self.runner.run(["open", "-a", app, "--args", "--online-mode"], timeout=30)

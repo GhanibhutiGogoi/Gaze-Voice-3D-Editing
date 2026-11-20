@@ -18,10 +18,13 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from socketserver import TCPServer
 from typing import Sequence
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .. import __version__
+from ..platforms import system_info
+from ..components.speech import engine_for
 from ..components.base import Component, ComponentState, Context, Health
 from ..components.brains import resolve_sources, sources_pending
 from ..components.gaze import camera_gaze_installed
@@ -206,6 +209,8 @@ class ControlCenter:
         sources = self.sources(states)
         return {
             "version": __version__,
+            "platform": system_info(),
+            "speech_engine": engine_for(self.ctx.settings.stt_engine).__dict__,
             "components": [states[cid].to_dict() for cid in self.order if cid in states],
             "brain": sources["editor"],
             "sources": sources,
@@ -569,12 +574,35 @@ class _Handler(BaseHTTPRequestHandler):
     def _error(self, status: int, message: str, **extra) -> None:
         self._json(status, {"error": message, **extra})
 
+    def _reject_write(self) -> None:
+        # Closing a Windows socket with unread input can reset it before the 403
+        # reaches the browser. Discard only a bounded body, with a short deadline.
+        self.close_connection = True
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if 0 < length <= _MAX_BODY:
+            previous = self.connection.gettimeout()
+            try:
+                self.connection.settimeout(0.5)
+                self.rfile.read(length)
+            except OSError:
+                pass
+            finally:
+                self.connection.settimeout(previous)
+        self._error(403, "Forbidden")
+
     def _read_body(self) -> bytes | None:
         """The request body, or None after answering 400/413 and closing the connection
         (an unread body would otherwise be parsed as the next keep-alive request)."""
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
+            self.close_connection = True
+            self._error(400, "Bad Content-Length")
+            return None
+        if length < 0:
             self.close_connection = True
             self._error(400, "Bad Content-Length")
             return None
@@ -743,8 +771,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         if not self._host_ok() or not self._write_ok():
-            self.close_connection = True
-            return self._error(403, "Forbidden")
+            return self._reject_write()
         raw = self._read_body()
         if raw is None:  # answered already (bad or oversized body)
             return None
@@ -796,8 +823,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_PUT(self) -> None:  # noqa: N802
         if not self._host_ok() or not self._write_ok():
-            self.close_connection = True
-            return self._error(403, "Forbidden")
+            return self._reject_write()
         raw = self._read_body()
         if raw is None:
             return None
@@ -814,6 +840,12 @@ class _Handler(BaseHTTPRequestHandler):
 
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
+
+    def server_bind(self) -> None:
+        # HTTPServer resolves the bound address with getfqdn(), which can block
+        # on a machine's DNS configuration. This local API needs only its address.
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
     def handle_error(self, request, client_address) -> None:
         # A browser closing a tab mid-request is routine; anything else is worth printing.

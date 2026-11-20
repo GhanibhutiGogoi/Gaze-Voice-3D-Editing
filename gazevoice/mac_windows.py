@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ctypes
 import math
+from .platforms import is_windows
 from typing import Sequence
 
 MAX_TITLE_BAR = 64  # points: how much taller than its content a window's frame can be
@@ -136,6 +137,10 @@ def page_width_cm(left: float, top: float, width: float, height: float) -> float
     from the display itself, so a display that doesn't report one has none, and a page that would come out narrower or
     wider than PAGE_WIDTH_CM means the size was wrong.
     """
+    if is_windows():
+        # Windows often reports a synthetic 96-DPI physical size. Do not invent
+        # centimetres: calibration remains usable without head-turn compensation.
+        return None
     try:
         size = _screen_size(left + width / 2, top + height / 2)
         per_point = None if size is None else cm_per_point(*size)
@@ -150,6 +155,9 @@ def page_width_cm(left: float, top: float, width: float, height: float) -> float
 def window_frame(pid: int, width: int, height: int) -> tuple[float, float, float, float] | None:
     """Where that window is now, or None if macOS can't say."""
     try:
+        if is_windows():
+            from .windows_desktop import frame
+            return frame(pid, width, height)
         return pick_window(list_windows(), pid, width, height)
     except Exception:  # noqa: BLE001 - no window server, or a macOS that has changed its names, or anything else:
         return None  # the caller is mid-command, and no window means "use the selection"

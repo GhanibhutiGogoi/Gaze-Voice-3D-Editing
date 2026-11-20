@@ -152,7 +152,7 @@ class SettingsTest(unittest.TestCase):
         s = update_settings(Settings(), {"providers": [DEEPSEEK, BOX], "refiner_source": "custom_box"})
         save_settings(self.path, s)
         self.assertEqual(load_settings(self.path), s)
-        raw = json.loads(self.path.read_text())
+        raw = json.loads(self.path.read_text(encoding="utf-8"))
         raw["providers"].append({"id": "x", "kind": "gpt", "name": "X"})
         self.path.write_text(json.dumps(raw))
         self.assertEqual(provider_ids(load_settings(self.path)), {"deepseek", "custom_box"})
@@ -173,7 +173,8 @@ class SettingsTest(unittest.TestCase):
 
 class UnityProjectSettingTest(unittest.TestCase):
     def test_a_project_must_be_an_absolute_folder(self):
-        self.assertEqual(update_settings(Settings(), {"unity_project": "/Users/me/Game"}).unity_project, "/Users/me/Game")
+        project = str(Path(__file__).resolve().parent / "Game")
+        self.assertEqual(update_settings(Settings(), {"unity_project": project}).unity_project, project)
         self.assertEqual(update_settings(Settings(), {"unity_project": ""}).unity_project, "")
         for bad in ("Game", "~/Game", 7, "/bad\npath"):
             with self.assertRaises(ValueError):
@@ -182,3 +183,14 @@ class UnityProjectSettingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# These fixtures describe macOS; Windows adapters have their own tests.
+def setUpModule():
+    global _mac_adapters
+    import importlib
+    from .helpers import macos_adapters
+    _mac_adapters = macos_adapters(*(importlib.import_module(name) for name in ['gazevoice.settings']))
+
+def tearDownModule():
+    _mac_adapters.close()

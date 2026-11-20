@@ -65,7 +65,8 @@ class WavTest(unittest.TestCase):
 
 
 class MicStreamTest(unittest.TestCase):
-    def test_mic_argv(self):
+    @__import__("unittest.mock", fromlist=["patch"]).patch("gazevoice.voice.audio.is_windows", return_value=False)
+    def test_mic_argv(self, _platform):
         self.assertEqual(
             mic_argv("2"),
             ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "avfoundation", "-i", ":2",
@@ -110,7 +111,7 @@ class MicStreamTest(unittest.TestCase):
         finally:
             silent.stop()
             tone.stop()
-        self.assertIn("Privacy & Security", SILENCE_HELP)
+        self.assertIn("privacy & security", SILENCE_HELP.lower())
 
     def test_silence_check(self):
         self.assertTrue(is_digital_silence(b"\x00" * 3200))
@@ -121,7 +122,7 @@ class MicStreamTest(unittest.TestCase):
         argv = [sys.executable, "-c", "import sys; sys.stderr.write('Error opening input: Operation not permitted\\n'); sys.exit(1)"]
         with self.assertRaises(MicError) as caught:
             MicStream(argv).start(wait_seconds=3)
-        self.assertIn("Privacy & Security", str(caught.exception))
+        self.assertIn("privacy & security", str(caught.exception).lower())
         self.assertIn("Operation not permitted", str(caught.exception))
 
 

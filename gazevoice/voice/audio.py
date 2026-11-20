@@ -8,6 +8,8 @@ written to disk unless you spoke a command.
 
 from __future__ import annotations
 
+from ..platforms import KILL, audio_input, command_argv, is_windows, process_options, signal_process_tree, spawn
+
 import collections
 import os
 import signal
@@ -24,8 +26,10 @@ PERMISSION_HELP = (
     "Check System Settings › Privacy & Security › Microphone and allow the app GazeVoice "
     "was started from (Terminal or your editor)."
 )
+if is_windows():
+    PERMISSION_HELP = "Allow desktop apps in Windows Settings > Privacy & security > Microphone, and check that the input is not muted."
 SILENCE_HELP = (
-    "The microphone is sending pure silence. That's what macOS sends an app that isn't allowed to use the "
+    "The microphone is sending pure silence. Check access to the "
     f"mic (or the mic is muted). {PERMISSION_HELP} Then stop and start voice."
 )
 
@@ -40,7 +44,7 @@ class MicError(Exception):
 
 
 def mic_argv(device_index: str) -> list[str]:
-    return ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "avfoundation", "-i", f":{device_index}",
+    return ["ffmpeg", "-hide_banner", "-loglevel", "error", *audio_input(device_index, windows=is_windows()),
             "-ac", "1", "-ar", str(RATE), "-f", "s16le", "-"]
 
 
@@ -125,12 +129,14 @@ class MicStream:
 
     def start(self, wait_seconds: float = 5.0) -> None:
         try:
-            self.proc = subprocess.Popen(
-                self.argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                start_new_session=True,
+            self.proc = spawn(
+                command_argv(self.argv), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                **process_options(),
             )
         except FileNotFoundError as exc:
             raise MicError(f"{self.argv[0]} isn't installed, so the microphone can't be heard.") from exc
+        except OSError as exc:
+            raise MicError(f"The microphone process could not start: {exc}") from exc
         self._threads = [
             threading.Thread(target=self._read_audio, daemon=True, name="mic-audio"),
             threading.Thread(target=self._read_errors, daemon=True, name="mic-errors"),
@@ -169,7 +175,7 @@ class MicStream:
             return
         if proc.poll() is None:
             try:
-                os.killpg(proc.pid, signal.SIGTERM)
+                signal_process_tree(proc, signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
                 proc.terminate()
             try:

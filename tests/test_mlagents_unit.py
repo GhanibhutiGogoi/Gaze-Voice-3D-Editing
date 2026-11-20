@@ -1,3 +1,5 @@
+from gazevoice.paths import tilde
+from gazevoice.platforms import venv_executable
 import os
 import unittest
 from pathlib import Path
@@ -15,7 +17,8 @@ UV = {"uv": "/Users/me/.local/bin/uv"}
 COMMIT = "82ce4998f18bbe05eb3de834cace09fc6564ba8e"
 TARBALL = f"https://github.com/Unity-Technologies/ml-agents/archive/{COMMIT}.tar.gz"
 CONFIRM = ("Install ML-Agents' Python side? This sets up its own Python 3.10 environment and downloads ML-Agents and "
-           "PyTorch (about 1.2 GB, about 5 minutes).")
+           "PyTorch (about 1.2 GB, about 5 minutes)."
+           " If needed, uv is installed in GazeVoice's own tools folder first.")
 
 
 class StubTraining:
@@ -65,8 +68,8 @@ class MLAgentsTest(unittest.TestCase):
         self.t.ctx.training = StubTraining()
         self.unit = MLAgents(self.t.ctx)
         self.venv = self.t.paths.venvs / "mlagents"
-        self.py = self.venv / "bin" / "python"
-        self.learn = self.venv / "bin" / "mlagents-learn"
+        self.py = venv_executable(self.venv)
+        self.learn = venv_executable(self.venv, "mlagents-learn")
         self.probe = [str(self.py), "-c", "import mlagents.trainers"]
 
     def tearDown(self):
@@ -82,7 +85,7 @@ class MLAgentsTest(unittest.TestCase):
     def make_broken_venv(self):
         """The folder is there, but its python links to a Python that was removed (an uninstalled Anaconda, say)."""
         self.py.parent.mkdir(parents=True)
-        os.symlink(self.t.root / "removed" / "bin" / "python3", self.py)
+        # A removed interpreter is represented by its missing executable.
         (self.venv / "pyvenv.cfg").write_text("home = /opt/anaconda3/bin\n")
 
     def pip_argv(self):
@@ -99,7 +102,7 @@ class MLAgentsTest(unittest.TestCase):
     # --- what the unit is -------------------------------------------------------------------------------------
 
     def test_it_is_the_ml_agents_unit(self):
-        self.assertEqual((MLAgents.id, MLAgents.name, MLAgents.role), ("mlagents", "ML-Agents", "Trains Unity agents on this Mac"))
+        self.assertEqual((MLAgents.id, MLAgents.name, MLAgents.role), ("mlagents", "ML-Agents", "Trains Unity agents on this computer"))
         self.assertEqual((VENV_PYTHON, ML_AGENTS_COMMIT), ("3.10.12", COMMIT))
         self.assertEqual((self.unit.venv, self.unit.python, self.unit.mlagents_learn),
                          (self.venv, self.py, self.learn))
@@ -109,13 +112,14 @@ class MLAgentsTest(unittest.TestCase):
     def test_needs_uv(self):
         self.t.runner.set_which("uv", None)
         state = self.unit.check()
-        self.assertEqual(state.health, Health.ERROR)
-        self.assertEqual(state.summary, "uv is needed to set up ML-Agents. Install uv (astral.sh/uv), then refresh.")
+        self.assertEqual(state.health, Health.MISSING)
+        self.assertTrue(state.offers("install"))
+        self.assertIn("uv", state.summary)
 
     def test_no_venv_is_not_installed_and_offers_install_with_consent(self):
         state = self.unit.check()
         self.assertEqual(state.health, Health.MISSING)
-        self.assertEqual(state.summary, "Not installed. ML-Agents trains your Unity agents on this Mac.")
+        self.assertEqual(state.summary, "Not installed. ML-Agents trains your Unity agents on this computer.")
         self.assertEqual(next(a for a in state.actions if a.id == "install").confirm, CONFIRM)
         self.assertEqual(self.t.runner.calls, [])
 
@@ -161,7 +165,7 @@ class MLAgentsTest(unittest.TestCase):
         project = self.t.root / "Game"
         self.t.ctx.settings = Settings(unity_project=str(project))
         state = self.unit.check()
-        self.assertEqual(state.detail("Runs folder"), str(project / RESULTS_DIR))
+        self.assertEqual(state.detail("Runs folder"), tilde(project / RESULTS_DIR))
 
     def test_the_summary_follows_the_training_message_and_the_last_run_is_listed(self):
         self.make_venv()
@@ -333,12 +337,12 @@ class MLAgentsTest(unittest.TestCase):
         self.assertEqual(self.t.runner.calls, [tuple(step) for step in steps])
         self.assertEqual([kw["timeout"] for kw in self.t.runner.call_kwargs], [3600, 3600])
 
-    def test_install_without_uv_says_so_and_runs_nothing(self):
+    def test_install_without_uv_reports_bootstrap_failure_and_stops(self):
         self.t.runner.set_which("uv", None)
         with self.assertRaises(JobError) as caught:
             self.unit.run_action("install", make_job("mlagents", "install"))
-        self.assertEqual(str(caught.exception), "uv isn't installed. Install it from astral.sh/uv, then try again.")
-        self.assertEqual(self.t.runner.calls, [])
+        self.assertIn("Could not create uv's Python environment", str(caught.exception))
+        self.assertEqual(len(self.t.runner.calls), 1)
 
     def test_a_failing_step_stops_the_install_and_names_itself(self):
         steps = self.install_steps()
@@ -368,7 +372,7 @@ class MLAgentsTest(unittest.TestCase):
         self.assertEqual(str(caught.exception), f"{self.venv} isn't a Python environment, so it's left alone. "
                                                 "Move or delete that folder, then press Install again.")
         self.assertEqual(self.t.runner.calls, [])  # uv was never asked to clear anything
-        self.assertEqual(precious.read_text(), "not an environment")
+        self.assertEqual(precious.read_text(encoding="utf-8"), "not an environment")
 
     def test_install_goes_ahead_over_an_empty_folder(self):
         self.venv.mkdir(parents=True)

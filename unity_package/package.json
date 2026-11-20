@@ -1,6 +1,6 @@
 {
   "name": "com.gazevoice.bridge",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "displayName": "GazeVoice Bridge",
   "description": "Local voice command bridge for Unity Editor scenes.",
   "unity": "2022.3",

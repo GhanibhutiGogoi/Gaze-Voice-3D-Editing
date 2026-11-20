@@ -1,3 +1,4 @@
+from gazevoice.platforms import venv_executable
 import hashlib
 import json
 import math
@@ -285,7 +286,7 @@ class GazeCase(unittest.TestCase):
         self.tracker = None  # the one the unit built, if it did
         self.reply = fit_reply()
         self.venv = self.t.paths.venvs / "gaze"
-        self.py = self.venv / "bin" / "python"
+        self.py = venv_executable(self.venv)
 
     def tearDown(self):
         self.t.cleanup()
@@ -323,7 +324,7 @@ class GazeUnitTest(GazeCase):
 
     # --- what the unit says --------------------------------------------------------------------------
     def test_it_is_a_unit_on_the_input_shelf_after_speech(self):
-        self.assertEqual((Gaze.id, Gaze.name, Gaze.role), ("gaze", "Gaze", "Sees where you're looking, on this Mac"))
+        self.assertEqual((Gaze.id, Gaze.name, Gaze.role), ("gaze", "Gaze", "Sees where you're looking, on this computer"))
         ids = [c.id for c in build_components(self.t.ctx)]
         self.assertEqual(ids[ids.index("speech") + 1], "gaze")
 
@@ -340,7 +341,8 @@ class GazeUnitTest(GazeCase):
     def test_needs_uv(self):
         self.t.runner.set_which("uv", None)
         state = self.gaze.check()
-        self.assertEqual(state.health, Health.ERROR)
+        self.assertEqual(state.health, Health.MISSING)
+        self.assertTrue(state.offers("install"))
         self.assertIn("uv", state.summary)
 
     def test_not_installed_offers_install(self):
@@ -352,7 +354,7 @@ class GazeUnitTest(GazeCase):
     def make_broken_venv(self):
         """The folder is there, but its python links to a Python that was removed (an uninstalled Anaconda, say)."""
         self.py.parent.mkdir(parents=True)
-        os.symlink(self.t.root / "removed" / "bin" / "python3", self.py)
+        # A removed interpreter is represented by its missing executable.
         (self.venv / "pyvenv.cfg").write_text("home = /opt/anaconda3/bin\n")  # a real environment has this file
 
     def test_an_environment_whose_python_was_removed_says_so_and_offers_install(self):
@@ -366,7 +368,7 @@ class GazeUnitTest(GazeCase):
     def test_with_no_environment_folder_it_is_not_installed_as_before(self):
         state = self.gaze.check()
         self.assertEqual(state.health, Health.MISSING)
-        self.assertEqual(state.summary, "Not installed. Gaze tracking runs on this Mac with your camera. "
+        self.assertEqual(state.summary, "Not installed. Gaze tracking runs on this computer with your camera. "
                                         "No picture of you is ever saved or sent.")
 
     def test_mediapipe_that_wont_import_is_not_installed(self):
@@ -634,7 +636,7 @@ class GazeUnitTest(GazeCase):
         self.assertEqual(str(caught.exception), f"{self.venv} isn't a Python environment, so it's left alone. "
                                                 "Move or delete that folder, then press Install again.")
         self.assertEqual(self.t.runner.calls, [])  # uv was never asked to clear anything
-        self.assertEqual(precious.read_text(), "not an environment")
+        self.assertEqual(precious.read_text(encoding="utf-8"), "not an environment")
 
     def test_install_goes_ahead_over_an_empty_folder(self):
         self.venv.mkdir(parents=True)
@@ -748,7 +750,7 @@ DOTS = [dot for dot, _ in DOT_ORDER]  # in the order they are shown
 
 class WhatTheInstallSaysTest(unittest.TestCase):
     def test_the_install_promises_only_what_is_true(self):
-        self.assertIn("No picture from your camera ever leaves this Mac.", INSTALL_CONFIRM)
+        self.assertIn("No picture from your camera ever leaves this computer.", INSTALL_CONFIRM)
         self.assertNotIn("Nothing you look at", INSTALL_CONFIRM)
 
 
@@ -764,7 +766,7 @@ class CalibrateTest(GazeCase):
         return self.gaze.run_action("calibrate", self.job(area))
 
     def saved(self):
-        return json.loads(self.t.paths.gaze_calibration.read_text())
+        return json.loads(self.t.paths.gaze_calibration.read_text(encoding="utf-8"))
 
     def test_time_follows_neither_axis_of_the_dots(self):
         # A head creeps steadily, so its drift goes with time. If time followed an axis, the drift would read as the eyes
@@ -1805,3 +1807,14 @@ class WithTheRealWorkerTest(GazeCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# These fixtures describe macOS; Windows adapters have their own tests.
+def setUpModule():
+    global _mac_adapters
+    import importlib
+    from .helpers import macos_adapters
+    _mac_adapters = macos_adapters(*(importlib.import_module(name) for name in ['gazevoice.components.microphone', 'gazevoice.voice.gaze']))
+
+def tearDownModule():
+    _mac_adapters.close()

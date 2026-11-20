@@ -1,3 +1,4 @@
+from gazevoice.platforms import venv_executable
 import dataclasses
 import json
 import shutil
@@ -104,11 +105,11 @@ class BuildVoiceTest(unittest.TestCase):
         self.assertEqual(bridge.port, 9878)
         self.assertIn("mcp__unity", editor.argv)
         config_path = Path(editor.argv[editor.argv.index("--mcp-config") + 1])
-        config = json.loads(config_path.read_text())
+        config = json.loads(config_path.read_text(encoding="utf-8"))
         self.assertEqual(config["mcpServers"]["unity"], {
             "command": "/opt/unity-mcp", "args": ["--stdio"]
         })
-        prompt = Path(editor.argv[editor.argv.index("--system-prompt-file") + 1]).read_text()
+        prompt = Path(editor.argv[editor.argv.index("--system-prompt-file") + 1]).read_text(encoding="utf-8")
         self.assertIn("Unity MCP tools", prompt)
 
     def test_unity_api_editor_gets_dynamic_mcp_tool_factory(self):
@@ -217,7 +218,7 @@ class BuildVoiceTest(unittest.TestCase):
         """What the Gaze unit leaves behind: its venv, the face model, and a saved calibration."""
         paths = self.t.paths
         if venv:
-            python = paths.venvs / "gaze" / "bin" / "python"
+            python = venv_executable(paths.venvs / "gaze")
             python.parent.mkdir(parents=True, exist_ok=True)
             python.write_text("")
         paths.gaze_model_file.parent.mkdir(parents=True, exist_ok=True)
@@ -240,7 +241,7 @@ class BuildVoiceTest(unittest.TestCase):
             tracker = voice.factories.gaze()
             self.assertIsInstance(tracker, GazeTracker)
             self.assertEqual((voice.gaze_mode, voice.gaze_source), (mode, "camera"))
-        gaze_python = self.t.paths.venvs / "gaze" / "bin" / "python"
+        gaze_python = venv_executable(self.t.paths.venvs / "gaze")
         self.assertEqual(tracker.argv, [str(gaze_python), str(GAZE_WORKER), "--serve", "--camera", "0",
                                         "--model-file", str(self.t.paths.gaze_model_file)])
         self.assertEqual(tracker.calibration, a_calibration())
@@ -326,7 +327,7 @@ class BuildVoiceTest(unittest.TestCase):
         self.fake_parts(voice)
         voice.start()
         self.assertEqual(voice.state, "ready")
-        self.assertIn("cameras in time", voice.snapshot()["gaze"]["problem"])
+        self.assertIn("devices in time", voice.snapshot()["gaze"]["problem"])
 
     def test_the_screen_a_camera_was_calibrated_on_goes_with_the_gaze_part(self):
         self.set_up_gaze({**a_calibration(), "when": 1.0})
@@ -428,7 +429,7 @@ class BuildVoiceTest(unittest.TestCase):
         voice = build_voice(self.t.ctx, EventBus(), {"refiner": "claude", "editor": "claude"})
         editor = voice.factories.editor()
         config_path = Path(editor.argv[editor.argv.index("--mcp-config") + 1])
-        server = json.loads(config_path.read_text())["mcpServers"]["unity"]
+        server = json.loads(config_path.read_text(encoding="utf-8"))["mcpServers"]["unity"]
         self.assertEqual(server["args"], ["-m", "gazevoice.unity_mcp"])
         self.assertIn("PYTHONPATH", server["env"])
 
@@ -441,7 +442,7 @@ class BuildVoiceTest(unittest.TestCase):
     def test_claude_gets_the_dashboards_address_in_the_unity_servers_environment(self):
         editor = self.unity_editor("claude")
         config_path = Path(editor.argv[editor.argv.index("--mcp-config") + 1])
-        server = json.loads(config_path.read_text())["mcpServers"]["unity"]
+        server = json.loads(config_path.read_text(encoding="utf-8"))["mcpServers"]["unity"]
         self.assertEqual(server["env"]["GAZEVOICE_URL"], "http://127.0.0.1:8977")
         self.assertIn("PYTHONPATH", server["env"])
 
@@ -464,13 +465,13 @@ class BuildVoiceTest(unittest.TestCase):
     def test_without_an_address_the_unity_server_gets_none(self):
         editor = self.unity_editor("claude", control_url=None)
         config_path = Path(editor.argv[editor.argv.index("--mcp-config") + 1])
-        server = json.loads(config_path.read_text())["mcpServers"]["unity"]
+        server = json.loads(config_path.read_text(encoding="utf-8"))["mcpServers"]["unity"]
         self.assertNotIn("GAZEVOICE_URL", server["env"])
 
     def test_your_own_unity_server_is_not_given_the_address(self):
         editor = self.unity_editor("claude", settings={"unity_mcp_command": "/opt/unity-mcp", "unity_mcp_args": ["--stdio"]})
         config_path = Path(editor.argv[editor.argv.index("--mcp-config") + 1])
-        server = json.loads(config_path.read_text())["mcpServers"]["unity"]
+        server = json.loads(config_path.read_text(encoding="utf-8"))["mcpServers"]["unity"]
         self.assertEqual(server, {"command": "/opt/unity-mcp", "args": ["--stdio"]})
 
     def test_blender_ignores_the_address(self):
@@ -478,7 +479,7 @@ class BuildVoiceTest(unittest.TestCase):
                             control_url="http://127.0.0.1:8977")
         editor = voice.factories.editor()
         config_path = Path(editor.argv[editor.argv.index("--mcp-config") + 1])
-        self.assertNotIn("GAZEVOICE_URL", config_path.read_text())
+        self.assertNotIn("GAZEVOICE_URL", config_path.read_text(encoding="utf-8"))
 
     def training_that(self, state, run_id="run1"):
         training = MagicMock()
@@ -547,3 +548,14 @@ class BuildVoiceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# These fixtures describe macOS; Windows adapters have their own tests.
+def setUpModule():
+    global _mac_adapters
+    import importlib
+    from .helpers import macos_adapters
+    _mac_adapters = macos_adapters(*(importlib.import_module(name) for name in ['gazevoice.components.microphone', 'gazevoice.components.speech', 'gazevoice.providers', 'gazevoice.voice.audio']))
+
+def tearDownModule():
+    _mac_adapters.close()

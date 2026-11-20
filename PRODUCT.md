@@ -2,13 +2,13 @@
 
 <!-- impeccable:product-schema 1 -->
 
-Written 2026-10-18 from the planning conversation with the user. Items marked *(inferred)* weren't stated outright. Updated 2026-11-07 to cover gaze in Blender, and 2026-11-11 to cover ML-Agents training in Unity.
+Written 2026-10-18 from the planning conversation with the user. Items marked *(inferred)* weren't stated outright. Updated 2026-11-07 to cover gaze in Blender, 2026-11-11 to cover ML-Agents training in Unity, and 2026-11-19 for automatic macOS/Windows support.
 
 ## Platform
 
 web
 
-The control center is a local web page. GazeVoice as a whole also includes a Blender add-on and background services on macOS.
+The control center is a local web page. GazeVoice as a whole also includes a Blender add-on and background services on macOS and Windows, selected automatically.
 
 ## Users
 
@@ -26,7 +26,7 @@ LLM 3D editing today works from the prompt alone. GazeVoice also passes focus co
 
 ## Operating Context
 
-- **Hardware:** macOS on Apple Silicon (M4, 16 GB).
+- **Hardware:** macOS on Apple Silicon (original M4, 16 GB setup) and Windows 10/11 x64; Python 3.12+.
 - **Screen:** Blender 5.2 LTS fills the main screen. The control center is a browser tab opened to set things up, check status, or fix something.
 - **Background:** the voice pipeline runs in the background.
 - **Network:** everything is local, on 127.0.0.1.
@@ -40,14 +40,14 @@ LLM 3D editing today works from the prompt alone. GazeVoice also passes focus co
   - Blender Lab MCP add-on v1.0.3, on port 9876
   - Blender Lab MCP server
   - GazeVoice Bridge add-on, on port 9877
-  - Speech-to-text: Parakeet or Whisper, via MLX
+  - Speech-to-text: Parakeet / Whisper via MLX on Apple silicon; faster-whisper small CPU int8 on Windows
   - Microphone, via ffmpeg
-  - Gaze (optional, Blender only): the Mac's camera via ffmpeg, and MediaPipe's face model in its own Python environment
-  - ML-Agents (optional, Unity only): its Python side in its own environment (about 1.2 GB to download, about 600 MB on disk, about 5 minutes), installed only by its unit's Install button. It trains Unity agents on this Mac when asked by voice, and stops, saving the model, when the dashboard is stopped normally. The tools are on GazeVoice's built-in Unity MCP server only.
+  - Gaze (optional, Blender and Unity): a webcam via ffmpeg (AVFoundation on macOS, DirectShow on Windows), and MediaPipe's face model in its own Python environment
+  - ML-Agents (optional, Unity only): its Python side in its own environment (about 1.2 GB to download, about 600 MB on disk, about 5 minutes), installed only by its unit's Install button. It trains Unity agents on this computer when asked by voice, and stops, saving the model, when the dashboard is stopped normally. The tools are on GazeVoice's built-in Unity MCP server only.
 - **Consent:**
   - Installs, downloads, mic recordings, camera use and model calls only happen when the user clicks.
   - Actions marked "uses your plan" spend Claude or Codex usage.
-- **Camera:** it's open only while voice is on with gaze turned on, and during a Calibrate you start on its page or a confirmed Test. Frames are processed on the Mac and aren't saved or sent.
+- **Camera:** it's open only while voice is on with gaze turned on, and during a Calibrate you start on its page or a confirmed Test. Frames are processed locally and aren't saved or sent.
 - **Pictures:** off by default. A picture of the Blender viewport (never the camera) goes only to Claude Code, and only after a check that it gets cleaned up has passed for the installed Claude Code version. The dashboard keeps the last 20 in memory to show you what the AI saw, never on disk.
 - **Gaze is rough:** we expect it to tell objects and big parts apart, not small details. When it isn't sure it numbers its guesses, and when it can't help the command uses the selection.
 - **No key prompts:** it never asks for an API key.
@@ -66,7 +66,7 @@ There are no logos, screenshots or brand assets. Don't invent users, metrics, te
 ## Product Principles
 
 1. **The 3D work stays center stage.** No chat window. The tool recedes behind Blender.
-2. **Show only what's true.** Every status is checked live on this Mac, and nothing claims to be ready unless it was verified.
+2. **Show only what's true.** Every status is checked live on this computer, and nothing claims to be ready unless it was verified.
 3. **Nothing happens without consent.** Installs, recordings, camera use and model calls are explicit, and the cost is labeled.
 4. **Context beats prompts.** The system knows what the user is focused on.
 5. **Gaze is an extra.** It fills the focus slot when it can. When it can't, the command uses the selection.

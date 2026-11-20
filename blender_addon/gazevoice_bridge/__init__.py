@@ -22,6 +22,8 @@ scene access happens on Blender's main thread.
 
 from __future__ import annotations
 
+import sys
+
 import math
 import os
 import socket
@@ -43,7 +45,7 @@ MAX_HOLD_SECONDS = 60.0
 # Seconds between mouse reports while the key is held. A little over 1/MAX_POINTER_RATE, so none is dropped.
 POINTER_TICK = 0.06
 FRESH_STATUS_SECONDS = 6.0  # a status set this recently shows even while voice is off (the Test key's)
-DEFAULT_KEY = "⌥ Space"
+DEFAULT_KEY = "Ctrl+Alt+Space" if sys.platform == "win32" else "⌥ Space"
 VOICE_OFF = "Voice is off. Turn it on in the GazeVoice dashboard."
 # Modal operators that edit data; undoing under one of them can crash Blender. Navigation and
 # add-ons that keep a modal running all the time don't count.
@@ -831,7 +833,8 @@ def _register_keymap() -> None:
     if keyconfig is None:
         return
     keymap = keyconfig.keymaps.new(name="Window", space_type="EMPTY", region_type="WINDOW")
-    item = keymap.keymap_items.new(GAZEVOICE_OT_push_to_talk.bl_idname, type="SPACE", value="PRESS", alt=True)
+    item = keymap.keymap_items.new(GAZEVOICE_OT_push_to_talk.bl_idname, type="SPACE", value="PRESS", alt=True,
+                                  ctrl=sys.platform == "win32")
     _addon_keymaps.append((keymap, item))
 
 

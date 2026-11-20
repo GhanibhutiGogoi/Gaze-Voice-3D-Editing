@@ -5,7 +5,7 @@ model writes, the way Blender's MCP server runs Python, so nothing in the Editor
 of reach. All Unity API calls run on the Editor main thread through the Unity bridge.
 
 The ML-Agents tools (LOCAL_TOOLS) are different: Unity never sees them. They are answered
-here by asking the GazeVoice dashboard, which runs the training on this Mac.
+here by asking the GazeVoice dashboard, which runs the training on this computer.
 """
 
 from __future__ import annotations
@@ -83,7 +83,7 @@ LOCAL_TOOLS = [
                     "message. runs lists earlier runs that have a model, newest first. Changes nothing.",
      "inputSchema": {**OBJECT, "properties": {}}},
     {"name": "mlagents_train",
-     "description": "Start training the project's agents on this Mac with mlagents-learn, in the Unity project picked "
+     "description": "Start training the project's agents on this computer with mlagents-learn, in the Unity project picked "
                     "in the dashboard. It installs nothing: if ML-Agents isn't installed it refuses, and the person "
                     "presses Install on the dashboard's ML-Agents unit. Use a new run_id each time (an old run's "
                     "folder is kept). This waits up to 45 seconds for ML-Agents to start listening for Unity. Training "
@@ -213,7 +213,7 @@ def call_dashboard(name: str, arguments: dict) -> dict:
     request = urllib.request.Request(
         address + path, method=method, data=json.dumps(arguments).encode() if method == "POST" else None,
         headers={"X-GazeVoice": "1", "Content-Type": "application/json"})
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # this Mac's own address never goes through a proxy
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # this computer's own address never goes through a proxy
     try:
         with opener.open(request, timeout=DASHBOARD_SECONDS.get(name, DASHBOARD_DEFAULT_SECONDS)) as response:
             body, refused = response.read(), False

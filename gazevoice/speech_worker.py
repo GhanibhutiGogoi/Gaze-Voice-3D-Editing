@@ -28,10 +28,11 @@ from typing import Callable
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--engine", choices=["parakeet", "whisper"], required=True)
+    parser.add_argument("--engine", choices=["parakeet", "whisper", "faster-whisper"], required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--audio")
     parser.add_argument("--download-only", action="store_true")
+    parser.add_argument("--force-download", action="store_true")
     parser.add_argument("--serve", action="store_true")
     args = parser.parse_args(argv)
     if not (args.download_only or args.serve or args.audio):
@@ -66,12 +67,13 @@ def _blob_bytes(folder: Path) -> int:
 
 def download(
     model: str,
-    fetch: Callable[[str], str] | None = None,
+    fetch: Callable[..., str] | None = None,
     folder: Path | None = None,
     total: int | None = None,
     attempts: int = 4,
     every: float = 5.0,
     pause: float = 5.0,
+    force: bool = False,
 ) -> str:
     """Fetch a model into the Hugging Face cache, printing progress, and resume if it breaks off.
 
@@ -108,7 +110,7 @@ def download(
     try:
         for attempt in range(1, attempts + 1):
             try:
-                path = fetch(model)
+                path = fetch(model, force_download=True) if force else fetch(model)
                 break
             except Exception as exc:  # noqa: BLE001 - network errors come in many types
                 if attempt == attempts:
@@ -157,6 +159,28 @@ class WhisperEngine:
         return {"text": result["text"].strip(), "words": words}
 
 
+class FasterWhisperEngine:
+    def __init__(self, model: str):
+        from faster_whisper import WhisperModel
+        self.model = WhisperModel(model, device="cpu", compute_type="int8",
+                                  local_files_only=os.environ.get("HF_HUB_OFFLINE") == "1")
+
+    def transcribe(self, audio: str, prompt: str | None = None) -> dict:
+        segments, _ = self.model.transcribe(audio, initial_prompt=prompt or None, word_timestamps=True)
+        segments = list(segments)
+        return {"text": "".join(s.text for s in segments).strip(),
+                "words": [{"text": w.word.strip(), "start": round(w.start, 3), "end": round(w.end, 3)}
+                          for s in segments for w in s.words or [] if w.word.strip()]}
+
+
+def failure_message(code: int, detail: str = "") -> str:
+    if code & 0xFFFFFFFF == 0xC0000005:
+        return ("Windows speech runtime crashed (0xC0000005: access violation). "
+                "Use Repair speech on the Speech-to-text unit to rebuild its private Python environment.")
+    explanation = " ".join(detail.split())[-300:]
+    return f"Transcription failed: {explanation or f'exit {code}'}"
+
+
 class FakeEngine:
     """Canned results so tests can drive the real protocol without MLX."""
 
@@ -174,12 +198,14 @@ class FakeEngine:
 def load_engine(engine: str, model: str):
     if os.environ.get("GAZEVOICE_FAKE_ENGINE"):
         return FakeEngine(model)
+    if engine == "faster-whisper":
+        return FasterWhisperEngine(model)
     return ParakeetEngine(model) if engine == "parakeet" else WhisperEngine(model)
 
 
 def serve(args: argparse.Namespace) -> int:
     # Our replies own the real stdout; anything a library prints goes to stderr instead.
-    replies = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1)
+    replies = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1, encoding="utf-8")
     sys.stdout = sys.stderr
     started = time.monotonic()
     engine = load_engine(args.engine, args.model)
@@ -207,7 +233,7 @@ def serve(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.download_only:
-        print(json.dumps({"downloaded": download(args.model)}))
+        print(json.dumps({"downloaded": download(args.model, force=True) if args.force_download else download(args.model)}))
         return 0
     if args.serve:
         return serve(args)

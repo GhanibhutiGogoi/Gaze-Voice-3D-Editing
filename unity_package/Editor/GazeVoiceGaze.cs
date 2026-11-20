@@ -295,7 +295,11 @@ internal static class GazeVoiceGaze
     static List<Geometry> SceneGeometry()
     {
         var result = new List<Geometry>();
+#if UNITY_6000_6_OR_NEWER
+        foreach (var renderer in UnityEngine.Object.FindObjectsByType<Renderer>())
+#else
         foreach (var renderer in UnityEngine.Object.FindObjectsByType<Renderer>(FindObjectsSortMode.None))
+#endif
         {
             var go = renderer.gameObject;
             if (!go.scene.IsValid() || !renderer.enabled || !go.activeInHierarchy || renderer.forceRenderingOff

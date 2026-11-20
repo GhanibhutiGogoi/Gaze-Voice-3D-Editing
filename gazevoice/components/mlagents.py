@@ -1,9 +1,12 @@
-"""Unity ML-Agents' Python side on this Mac: the program that trains agents, in its own Python environment.
+"""Unity ML-Agents' Python side on this computer: the program that trains agents, in its own Python environment.
 
 Only the Install button sets it up. The training itself (starting, following and stopping a run) is gazevoice/mlagents.py.
 """
 
 from __future__ import annotations
+
+from ..platforms import venv_executable
+from ..python_tools import ensure_uv, find_uv
 
 from pathlib import Path
 
@@ -31,7 +34,7 @@ CHECK_SECONDS = 60  # the first import of PyTorch can take a while
 class MLAgents(Component):
     id = "mlagents"
     name = "ML-Agents"
-    role = "Trains Unity agents on this Mac"
+    role = "Trains Unity agents on this computer"
     reports_run = True  # the dashboard's terminal panel follows the run through its state
 
     @property
@@ -40,11 +43,11 @@ class MLAgents(Component):
 
     @property
     def python(self) -> Path:
-        return self.venv / "bin" / "python"
+        return venv_executable(self.venv)
 
     @property
     def mlagents_learn(self) -> Path:
-        return self.venv / "bin" / "mlagents-learn"
+        return venv_executable(self.venv, "mlagents-learn")
 
     def _imports(self) -> bool:
         """Whether ML-Agents imports. Shared and cached briefly; raises ProbeTimedOut if the Mac is too busy to say."""
@@ -66,7 +69,8 @@ class MLAgents(Component):
             "install",
             "Install",
             confirm="Install ML-Agents' Python side? This sets up its own Python 3.10 environment and downloads "
-                    "ML-Agents and PyTorch (about 1.2 GB, about 5 minutes).",
+                    "ML-Agents and PyTorch (about 1.2 GB, about 5 minutes)."
+                    " If needed, uv is installed in GazeVoice's own tools folder first.",
         )
 
     def check(self) -> ComponentState:
@@ -75,8 +79,9 @@ class MLAgents(Component):
             # The run is the proof. Asking Python to import PyTorch now could time out under training's load, and
             # "Still checking…" would take Stop away in the middle of a run.
             return self._ready(run)
-        if not self.runner.which("uv"):
-            return self.state(Health.ERROR, "uv is needed to set up ML-Agents. Install uv (astral.sh/uv), then refresh.")
+        if not find_uv(self.runner, self.paths):
+            return self.state(Health.MISSING, "Press Install to set up ML-Agents, including uv and its Python environment.",
+                              actions=[self._install_action()])
         if not self.python.exists() and self.venv.exists():
             return self.state(
                 Health.MISSING,
@@ -87,7 +92,7 @@ class MLAgents(Component):
         if not self.python.exists():
             return self.state(
                 Health.MISSING,
-                "Not installed. ML-Agents trains your Unity agents on this Mac.",
+                "Not installed. ML-Agents trains your Unity agents on this computer.",
                 actions=[self._install_action()],
             )
         if not self.mlagents_learn.is_file() or not self._imports():
@@ -108,8 +113,7 @@ class MLAgents(Component):
         return self.state(Health.READY, summary, details, actions, run=current)
 
     def action_install(self, job: Job) -> dict:
-        if not self.runner.which("uv"):
-            raise JobError("uv isn't installed. Install it from astral.sh/uv, then try again.")
+        uv = ensure_uv(self.runner, self.paths, job)
         steps = []
         if not self.python.exists():
             if self.venv.exists():  # a folder whose Python is gone (an uninstalled Anaconda, say); it holds only packages
@@ -119,9 +123,9 @@ class MLAgents(Component):
                                    "Move or delete that folder, then press Install again.")
                 job.log("The Python environment from before has no working Python, so it's being made again.")
             steps.append(("Creating a Python 3.10 environment…",
-                          ["uv", "venv", "--clear", "--python", VENV_PYTHON, str(self.venv)]))
+                          [uv, "venv", "--clear", "--python", VENV_PYTHON, str(self.venv)]))
         steps.append(("Installing ML-Agents and PyTorch…",
-                      ["uv", "pip", "install", "--python", str(self.python), *PACKAGES]))
+                      [uv, "pip", "install", "--python", str(self.python), *PACKAGES]))
         for message, argv in steps:
             job.log(message)
             code = self.runner.stream(argv, job.log, timeout=INSTALL_SECONDS)

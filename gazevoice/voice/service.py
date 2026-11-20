@@ -99,7 +99,7 @@ IDLE_AFTER = 5.0  # seconds a result stays on the status line
 JOIN_SECONDS = 10.0  # how long stop() waits for each loop (and for an interrupted start) to finish
 BUSY_WAIT = 10.0  # how long an undo operation waits for the host to finish an edit
 UNITY_BUSY_WAIT = 60.0  # Unity may have to finish compiling, then reload
-DEFAULT_KEY = "⌥ Space"
+DEFAULT_KEY = "Ctrl+Alt+Space" if sys.platform == "win32" else "⌥ Space"
 STATUS_CHARS = 200  # the most of a status that is sent to the host
 UNDO_NAME_BYTES = 63  # Blender keeps 64 bytes of an undo step's name, the closing NUL included
 EDIT_SECONDS = 600.0  # a detailed build can take minutes; "stop" still ends it at once

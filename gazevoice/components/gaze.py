@@ -1,4 +1,4 @@
-"""Gaze on this Mac: the camera, MediaPipe's face model and a calibration, in their own Python environment.
+"""Gaze on this computer: the camera, MediaPipe's face model and a calibration, in their own Python environment.
 Its card also holds the check that pictures of the viewport get cleaned up (see voice/picture.py).
 
 The unit never opens the camera to check on it. It lists the cameras through the Microphone unit's cached
@@ -14,6 +14,9 @@ dots: the camera stays with the worker, and the page is sent numbers, never a pi
 """
 
 from __future__ import annotations
+
+from ..platforms import venv_executable
+from ..python_tools import ensure_uv, find_uv
 
 import contextlib
 import dataclasses
@@ -52,7 +55,7 @@ MODEL_SIZE = 3_758_596
 MODEL_SHA256 = "64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff"
 INSTALL_CONFIRM = (
     "Install gaze tracking? This sets up its own Python environment and downloads about 340 MB "
-    "(MediaPipe and its face model). No picture from your camera ever leaves this Mac."
+    "(MediaPipe and its face model). No picture from your camera ever leaves this computer."
 )
 TEST_CONFIRM = "Opens the camera for about 15 seconds. A ring in Blender follows where you look."
 
@@ -124,7 +127,7 @@ def load_calibration(path: Path) -> dict | None:
     say which part of the screen it was made on (so it would give wrong positions). The file holds numbers only.
     """
     try:
-        data = json.loads(Path(path).read_text())
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
         gaze_model.validate(data["model"])
     except (OSError, ValueError, KeyError, TypeError):
         return None
@@ -150,8 +153,8 @@ def save_calibration(path: Path, calibration: dict) -> None:
 
 
 def camera_gaze_installed(paths: AppPaths) -> bool:
-    """Whether everything camera gaze needs from this Mac is in place: its environment, the model and a calibration."""
-    return ((paths.venvs / "gaze" / "bin" / "python").exists()
+    """Whether everything camera gaze needs from this computer is in place: its environment, the model and a calibration."""
+    return ((venv_executable(paths.venvs / "gaze")).exists()
             and paths.gaze_model_file.is_file() and paths.gaze_calibration.is_file())
 
 
@@ -284,7 +287,7 @@ class DotPage:
 class Gaze(Component):
     id = "gaze"
     name = "Gaze"
-    role = "Sees where you're looking, on this Mac"
+    role = "Sees where you're looking, on this computer"
 
     def __init__(self, ctx):
         super().__init__(ctx)
@@ -305,7 +308,7 @@ class Gaze(Component):
 
     @property
     def python(self) -> Path:
-        return self.venv / "bin" / "python"
+        return venv_executable(self.venv)
 
     @property
     def model_file(self) -> Path:
@@ -326,7 +329,8 @@ class Gaze(Component):
         return len(data) == MODEL_SIZE and hashlib.sha256(data).hexdigest() == MODEL_SHA256
 
     def _install_action(self) -> ActionSpec:
-        return ActionSpec("install", "Install gaze", confirm=INSTALL_CONFIRM)
+        return ActionSpec("install", "Install gaze", confirm=INSTALL_CONFIRM +
+                          " If needed, uv is installed in GazeVoice's own tools folder first.")
 
     @staticmethod
     def _calibrate_action(again: bool = False) -> ActionSpec:
@@ -356,8 +360,9 @@ class Gaze(Component):
         return dataclasses.replace(state, details=(*state.details, ("Pictures", where)), actions=(*state.actions, action))
 
     def _check_camera(self) -> ComponentState:
-        if not self.runner.which("uv"):
-            return self.state(Health.ERROR, "uv is needed to set up gaze tracking. Install uv (astral.sh/uv), then refresh.")
+        if not find_uv(self.runner, self.paths):
+            return self.state(Health.MISSING, "Press Install to set up gaze tracking, including uv and its Python environment.",
+                              actions=[self._install_action()])
         microphone = Microphone(self.ctx)  # its listing is cached, and shared with the Microphone unit
         have_ffmpeg = bool(self.runner.which("ffmpeg"))
         cameras = face_cameras(microphone.cameras()) if have_ffmpeg else []
@@ -373,7 +378,7 @@ class Gaze(Component):
         if not self.python.exists() or not self.probe([str(self.python), "-c", "import mediapipe"], timeout=20, ttl=60).ok:
             return self.state(
                 Health.MISSING,
-                "Not installed. Gaze tracking runs on this Mac with your camera. No picture of you is ever saved or sent.",
+                "Not installed. Gaze tracking runs on this computer with your camera. No picture of you is ever saved or sent.",
                 details,
                 [self._install_action()],
             )
@@ -409,8 +414,7 @@ class Gaze(Component):
         return self.state(Health.READY, f"{picked[1]} · calibrated", details, actions)
 
     def action_install(self, job: Job) -> dict:
-        if not self.runner.which("uv"):
-            raise JobError("uv isn't installed. Install it from astral.sh/uv, then try again.")
+        uv = ensure_uv(self.runner, self.paths, job)
         steps = []
         if not self.python.exists():
             if self.venv.exists():  # a folder whose Python is gone (an uninstalled Anaconda, say); it holds only packages
@@ -420,9 +424,9 @@ class Gaze(Component):
                                    "Move or delete that folder, then press Install again.")
                 job.log("The Python environment from before has no working Python, so it's being made again.")
             steps.append(("Creating a Python 3.12 environment…",
-                          ["uv", "venv", "--clear", "--python", VENV_PYTHON, str(self.venv)], 3600))
+                          [uv, "venv", "--clear", "--python", VENV_PYTHON, str(self.venv)], 3600))
         steps.append((f"Installing {MEDIAPIPE}…",
-                      ["uv", "pip", "install", "--python", str(self.python), MEDIAPIPE], 3600))
+                      [uv, "pip", "install", "--python", str(self.python), MEDIAPIPE], 3600))
         for message, argv, timeout in steps:
             job.log(message)
             code = self.runner.stream(argv, job.log, timeout=timeout)
@@ -453,7 +457,7 @@ class Gaze(Component):
         job.log("The face model checks out.")
 
     def action_check_pictures(self, job: Job) -> dict:
-        """Send a random picture through the describer and search this Mac for a copy. A pass turns pictures on."""
+        """Send a random picture through the describer and search this computer for a copy. A pass turns pictures on."""
         return run_leftover_check(job, self.paths, runner=self.runner)
 
     # --- calibrating and testing ---------------------------------------------------------------------
@@ -508,7 +512,8 @@ class Gaze(Component):
             raise JobError(f"Blender couldn't say where its 3D viewport is ({reply.get('error') or 'no reason given'}).")
         view = viewport_area(reply, self.window_frame)
         if view is None:
-            raise JobError("macOS couldn't find Blender's window. Bring Blender to the front, then try again.")
+            raise JobError("The system couldn't locate Blender's window. Bring Blender to the front; on Windows, "
+                           "use the same display scaling on all monitors, then try again.")
         if not screen.holds(view):
             raise JobError("Blender is on a different screen from the one you calibrated on. Move Blender back, or "
                            "calibrate on that screen.")
@@ -556,7 +561,7 @@ class Gaze(Component):
                 tracker = None
                 try:
                     tracker = self.tracker_factory(camera, None)  # a fresh worker, so an earlier attempt can't leak rows in
-                    job.log("Opening the camera… (the first time, macOS may ask to allow it)")
+                    job.log("Opening the camera… (allow desktop camera access in system privacy settings)")
                     try:
                         tracker.start()
                         job.log("Line your head up with the outline on the screen.")
@@ -714,7 +719,7 @@ class Gaze(Component):
                 screen = screen_of(calibration)
                 view = self._viewport(client, screen)  # Blender first: no point opening the camera without it
                 tracker = self.tracker_factory(camera, calibration)
-                job.log("Opening the camera… (the first time, macOS may ask to allow it)")
+                job.log("Opening the camera… (allow desktop camera access in system privacy settings)")
                 try:
                     tracker.start()
                 except GazeError as exc:

@@ -1,3 +1,4 @@
+from .helpers import process_alive
 import json
 import os
 import signal
@@ -34,9 +35,9 @@ class ArgvTest(unittest.TestCase):
                      "--no-session-persistence"):
             self.assertIn(flag, argv)
         self.assertEqual(argv[argv.index("--model") + 1], "sonnet")
-        self.assertEqual(argv[argv.index("--mcp-config") + 1], "/p/mcp.json")
+        self.assertEqual(argv[argv.index("--mcp-config") + 1], str(Path("/p/mcp.json")))
         self.assertEqual(argv[argv.index("--allowedTools") + 1], "mcp__blender")
-        self.assertEqual(argv[argv.index("--system-prompt-file") + 1], "/p/editor.md")
+        self.assertEqual(argv[argv.index("--system-prompt-file") + 1], str(Path("/p/editor.md")))
         self.assertNotIn("--bare", argv)
 
     def test_thinking_effort(self):
@@ -87,7 +88,7 @@ class ClaudeSessionTest(unittest.TestCase):
             s.close()
         self.assertEqual((picture.text, picture.is_error), ("a wing tip", False))
         self.assertEqual(text.text, "echo: hello")
-        sent = json.loads(record.read_text())
+        sent = json.loads(record.read_text(encoding="utf-8"))
         self.assertEqual((sent["types"], sent["media_type"], sent["length"], sent["text"]),
                          (["image", "text"], "image/png", len("iVBORw0KGgo="), "What is in the ring?"))
 
@@ -140,7 +141,7 @@ class ClaudeSessionTest(unittest.TestCase):
         self.assertTrue(s.alive)
         leaving.join(5)
         self.assertFalse(leaving.is_alive())
-        self.assertEqual((s.alive, s.proc.returncode, left.read_text()), (False, 0, "left"))  # left, wasn't killed
+        self.assertEqual((s.alive, s.proc.returncode, left.read_text(encoding="utf-8")), (False, 0, "left"))  # left, wasn't killed
 
     def test_release_asks_a_process_that_will_not_leave_to_stop_and_then_kills_it(self):
         asked = Path(self.tmp.name) / "asked"
@@ -151,8 +152,9 @@ class ClaudeSessionTest(unittest.TestCase):
         leaving = s.release(wait=0.3, term_wait=0.3)
         leaving.join(5)
         self.assertLess(time.monotonic() - began, 3.0)
-        self.assertEqual((s.alive, s.proc.returncode), (False, -signal.SIGKILL))  # it ignored the first request
-        self.assertEqual(asked.read_text(), "term")
+        self.assertEqual((s.alive, s.proc.returncode), (False, (1 if sys.platform == "win32" else -signal.SIGKILL)))  # it ignored the first request
+        if sys.platform != "win32":
+            self.assertEqual(asked.read_text(encoding="utf-8"), "term")
 
     def test_release_stops_with_the_gentler_signal_when_that_is_enough(self):
         s = self.session(env={"FAKE_CLAUDE_NEVER_READS": "1"})  # ends when asked to
@@ -161,7 +163,7 @@ class ClaudeSessionTest(unittest.TestCase):
         began = time.monotonic()
         leaving.join(5)
         self.assertLess(time.monotonic() - began, 2.0)  # not the five seconds it would have been given
-        self.assertEqual(s.proc.returncode, -signal.SIGTERM)
+        self.assertEqual(s.proc.returncode, (1 if sys.platform == "win32" else -signal.SIGTERM))
 
     def test_a_describer_that_will_not_leave_does_not_outlive_the_app(self):
         # The process has a session of its own, so only the thread that asks and then kills can end it. If that were
@@ -180,13 +182,13 @@ class ClaudeSessionTest(unittest.TestCase):
             "# and the program ends here, without waiting for it\n"
         )
         began = time.monotonic()
-        done = subprocess.run([sys.executable, "-c", parent], capture_output=True, text=True, timeout=30)
+        done = subprocess.run([sys.executable, "-c", parent], capture_output=True, text=True, encoding="utf-8", timeout=30)
         self.assertEqual(done.returncode, 0, done.stderr)
         pid = int(done.stdout.split()[0])
         self.assertLess(time.monotonic() - began, 10.0)
-        with self.assertRaises(ProcessLookupError):  # the parent has ended and the process is not there
-            os.kill(pid, 0)
-        self.assertEqual(asked.read_text(), "term")  # it was asked first, ignored that, and was killed
+        self.assertFalse(process_alive(pid))
+        if sys.platform != "win32":
+            self.assertEqual(asked.read_text(encoding="utf-8"), "term")  # it was asked first, ignored that, and was killed
 
     def test_the_exit_thread_is_not_a_daemon_but_the_readers_are(self):
         s = self.session()
@@ -203,7 +205,7 @@ class ClaudeSessionTest(unittest.TestCase):
         began = time.monotonic()
         s.close()
         self.assertTrue(2.5 < time.monotonic() - began < 5.0)
-        self.assertEqual(s.proc.returncode, -signal.SIGKILL)
+        self.assertEqual(s.proc.returncode, (1 if sys.platform == "win32" else -signal.SIGKILL))
 
     def test_tools_are_reported_live_and_in_the_result(self):
         seen = []
@@ -330,7 +332,7 @@ class CodexSessionTest(unittest.TestCase):
         seen = []
         first = s.send("make it taller", on_tool=seen.append)
         second = s.send("now wider")
-        calls = [json.loads(line) for line in self.argv_log.read_text().splitlines()]
+        calls = [json.loads(line) for line in self.argv_log.read_text(encoding="utf-8").splitlines()]
         self.assertEqual(first.text, "Made the chair taller.")
         self.assertEqual(first.tools, ["execute_blender_code"])
         self.assertEqual(seen, ["execute_blender_code"])

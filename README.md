@@ -2,7 +2,7 @@
 
 GazeVoice lets you edit Blender or Unity scenes by talking, using gaze or mouse focus to identify spoken targets.
 
-- **Voice:** your speech is transcribed on your Mac and cleaned up into one clear instruction. Claude Code, Codex or a configured API provider edits the selected host through MCP.
+- **Voice:** your speech is transcribed on your computer and cleaned up into one clear instruction. Claude Code, Codex or a configured API provider edits the selected host through MCP.
 - **Focus:** each command carries what you're focused on, so edits stay scoped to it. That's your selection, or what you were looking at when you said "this" or "there" (see [Use gaze](#use-gaze)).
 
 **Status:** three stages are built:
@@ -20,18 +20,36 @@ python3 -m gazevoice            # opens http://127.0.0.1:8977
 python3 -m gazevoice --port 9000 --no-browser
 ```
 
-It needs only macOS on Apple silicon and Python 3.12 or newer. Nothing gets installed just to open it.
+The control center needs Python 3.12 or newer on macOS (Apple silicon) or Windows 10/11 (x64). Nothing gets installed just to open it. On Windows, use PowerShell:
+
+```powershell
+python -m gazevoice
+```
+
+The operating system is detected automatically. Routing shows the detected system and actual speech engine; no OS setting is required. Windows uses local faster-whisper (small, CPU int8). Apple silicon keeps Parakeet / Whisper on MLX. Intel Macs also select faster-whisper, but have not been validated.
+
+| Integration | macOS | Windows |
+|---|---|---|
+| Install Blender / ffmpeg / Unity Hub | Homebrew | WinGet (App Installer) |
+| Audio and camera capture | AVFoundation | DirectShow |
+| Default talk key | Option+Space | Ctrl+Alt+Space |
+| API keys | macOS Keychain | Windows Credential Manager |
+| Managed Python environments | venv/bin | venv/Scripts |
+
+Speech, gaze, ML-Agents and Blender MCP server keep their Install buttons even when uv is missing. After confirmation, Install sets up a shared uv in GazeVoice's own tools/uv environment, then continues automatically; no PATH change or restart is needed for uv. An existing uv on PATH is reused. Windows installers may update PATH without updating the running process: restart PowerShell and GazeVoice after installing ffmpeg or a CLI. Existing settings are retained; a saved MLX engine preference automatically maps to faster-whisper on Windows. Managed environments and camera calibration must be installed/recreated separately on each computer.
+
+See the [Windows acceptance checklist](docs/windows-acceptance.md) for end-to-end testing and current limits. The CI matrix runs the regression suite on macOS and Windows without downloading models. Real microphone, camera, Blender and Unity acceptance remains a separate step.
 
 ## Setting up, unit by unit
 
-Every unit shows its real state on this Mac. Nothing installs, records audio, opens the camera or uses your Claude/Codex plan until you press its key. Keys that need consent ask first, right on the unit.
+Every unit shows its real state on this computer. Nothing installs, records audio, opens the camera or uses your Claude/Codex plan until you press its key. Keys that need consent ask first, right on the unit.
 
-1. **Blender:** *Install Blender* (Homebrew), then *Launch*. Launch turns on online access, which the MCP add-on needs to start.
+1. **Blender:** *Install Blender* (Homebrew on macOS, WinGet on Windows), then *Launch*. Launch turns on online access, which the MCP add-on needs to start.
 2. **Blender MCP add-on:** *Install add-on* downloads Blender Lab's official add-on (v1.0.3). After installing, quit Blender and *Launch* it again.
 3. **Blender MCP server:** *Install server* downloads Blender Lab's server and installs its packages with `uv`. *Test* lists its tools and, if Blender is open, reads the scene.
-4. **GazeVoice Bridge:** *Install add-on* adds our small Blender add-on (v0.3.4). It gives Blender the hold-to-talk key and a GazeVoice tab in the sidebar, shares your selection, shows a status line in the viewport, and for gaze says what's under a point in the viewport, draws a ring and numbered labels, and shows a see-through bubble where you're looking (see [The marker](#the-marker)). If you installed an older version, the unit says *Update add-on*. Restart Blender after installing or updating.
-5. **Speech-to-text:** *Install* sets up Parakeet (or Whisper, chosen in Routing) in its own Python environment and downloads the model. *Test* transcribes a clip spoken by macOS.
-6. **Microphone:** *Test* records 3 seconds. If it hears silence, allow the app you started GazeVoice from in System Settings › Privacy & Security › Microphone.
+4. **GazeVoice Bridge:** *Install add-on* adds our small Blender add-on (v0.3.5). It gives Blender the hold-to-talk key and a GazeVoice tab in the sidebar, shares your selection, shows a status line in the viewport, and for gaze says what's under a point in the viewport, draws a ring and numbered labels, and shows a see-through bubble where you're looking (see [The marker](#the-marker)). If you installed an older version, the unit says *Update add-on*. Restart Blender after installing or updating.
+5. **Speech-to-text:** *Install* sets up Parakeet / Whisper on Apple silicon, or faster-whisper on Windows in its own Python environment and downloads the model. *Test* transcribes a clip generated locally by the operating system.
+6. **Microphone:** *Test* records 3 seconds. If it hears silence, allow desktop apps in Windows Settings > Privacy & security > Microphone, or allow the app you started GazeVoice from in macOS System Settings › Privacy & Security › Microphone.
 7. **Claude Code / Codex:** detected automatically, using whatever login they already have. GazeVoice never asks for a key for these two. *Test* and *Connect to Blender* each spend a little of your plan.
 8. **DeepSeek, Qwen or a custom API** (optional): see [Use DeepSeek, Qwen or another API](#use-deepseek-qwen-or-another-api).
 9. **Gaze** (optional, Blender and Unity): *Install gaze* sets up gaze tracking in its own Python environment and downloads about 340 MB. *Calibrate* opens its own page in your browser and *Test* asks first, and the camera turns on only when you start one. See [Use gaze](#use-gaze).
@@ -49,7 +67,7 @@ Every unit shows its real state on this Mac. Nothing installs, records audio, op
    - if **Gaze** is on Watch only or On with the camera as its source, opens the camera. It stays on until you stop voice, even if you close Blender.
 
    The first start takes a while because the model loads. Warming up the brain uses a little of your plan.
-3. In Blender, select what you mean. Then hold **⌥ Space** (Alt+Space), say it, and let go. For example:
+3. In Blender, select what you mean. Then hold **Option+Space** on macOS or **Ctrl+Alt+Space** on Windows, say it, and let go. For example:
    - "make this twice as tall"
    - "bevel the edges a little"
    - "add an array modifier with five copies"
@@ -74,14 +92,14 @@ The Unity target reuses the microphone, speech-to-text, cleanup, command queue a
 
 1. In the control center's Routing unit, choose **Unity**. The rack then shows the Unity units.
 2. Press **Set up Unity** on the Unity unit. It asks first, listing what it's about to do, then does whatever is still missing:
-   - installs Unity Hub and the Unity CLI with Homebrew;
-   - downloads the latest Unity LTS for Apple silicon (several GB);
+   - installs Unity Hub (WinGet on Windows; Homebrew plus the Unity CLI on macOS);
+   - downloads the latest Unity LTS for the detected system (Windows x64 or macOS Apple silicon) (several GB);
    - makes a new project at `~/Unity/GazeVoice`, or keeps the one you picked;
    - copies the GazeVoice package into the project's `Packages` folder;
    - opens the project in Unity.
 
    **You sign in once.** Unity's free Personal license can only be activated by signing in to Unity Hub, so GazeVoice can't do that step. Setup opens Unity Hub as soon as it's installed, so you can sign in and add the Personal license while Unity downloads. If Unity still has no license when it's time to make the project, setup stops and says so. Sign in, press **Set up Unity** again, and it carries on from where it stopped.
-3. Start voice. Then, in Unity, select what you mean, hold **⌥ Space**, say it, and let go. Your selection is the focus. Typed commands in the dashboard work too.
+3. Start voice. Then, in Unity, select what you mean, hold **Option+Space** on macOS or **Ctrl+Alt+Space** on Windows, say it, and let go. Your selection is the focus. Typed commands in the dashboard work too.
 
 The key works anywhere in the Editor, except in text fields, which type it instead. To change it, look for "GazeVoice" in Edit › Shortcuts. **Window › GazeVoice** has a Talk control and shows the status line. Switching away from Unity cancels a hold. The package listens on `127.0.0.1:9878`.
 
@@ -105,7 +123,7 @@ For animals, people and other organic shapes, the editor can build the model in 
 
 ### Unity gaze
 
-1. Update the Unity Bridge package from the dashboard (version 0.3.3), then let Unity finish compiling.
+1. Update the Unity Bridge package from the dashboard (version 0.3.4), then let Unity finish compiling.
 2. In Routing choose **Unity**, **Gaze: Watch only**, and **Gaze source: Mouse**. Start or restart voice.
 3. Move the pointer over the active **Scene** view. A transparent aqua indicator and object name show the focus. It does not select or change the object. Game view and Hierarchy are not gaze viewports.
 4. Keep the pointer over an object while holding the talk key and saying a pointing word, such as “make this twice as tall”. Watch only records the suggested object but edits your existing selection. Compare the command's gaze result with the intended target.
@@ -182,7 +200,7 @@ Unity's [ML-Agents](https://github.com/Unity-Technologies/ml-agents) teaches a g
 
 **Watch it run.** The dashboard shows a live *ML-Agents terminal* panel under Voice, with the trainer's output as it prints and a *Stop training* button. It only shows the output; you can't type into it.
 
-**Where it runs.** Training runs on this Mac, between the Unity Editor and ML-Agents' own Python process. GazeVoice and mlagents-learn send nothing anywhere. Unity's own Editor analytics, if you turned them on in Unity, may report anonymised training settings. Stopping the dashboard normally (Ctrl+C or closing the Terminal) stops training too, and saves its model first. A crash or a force-quit leaves `mlagents-learn` running: stop it from Activity Monitor.
+**Where it runs.** Training runs on this computer, between the Unity Editor and ML-Agents' own Python process. GazeVoice and mlagents-learn send nothing anywhere. Unity's own Editor analytics, if you turned them on in Unity, may report anonymised training settings. Stopping the dashboard normally (Ctrl+C or closing the Terminal) stops training too, and saves its model first. A crash or a force-quit leaves `mlagents-learn` running: stop it from Activity Monitor.
 
 **Good to know:**
 
@@ -200,7 +218,7 @@ Gaze is new. The latest real calibration (2026-11-09) measured its typical miss 
 
 ### Set it up
 
-1. **Update the Bridge.** Press *Update add-on* on the Bridge unit (or *Install add-on*, if it isn't there yet), then restart Blender. Gaze and the marker need Bridge v0.3.4, which draws the marker as a see-through bubble and puts the same bubble on pictures. If you had v0.3.3 or earlier, the unit offers *Update add-on* again: press it and restart Blender. Until you do, voice won't start, and the Voice panel says the Bridge needs updating. Press *Update add-on* whenever the unit offers it.
+1. **Update the Bridge.** Press *Update add-on* on the Bridge unit (or *Install add-on*, if it isn't there yet), then restart Blender. Gaze and the marker need Bridge v0.3.5, which draws the marker as a see-through bubble and puts the same bubble on pictures. If you had v0.3.3 or earlier, the unit offers *Update add-on* again: press it and restart Blender. Until you do, voice won't start, and the Voice panel says the Bridge needs updating. Press *Update add-on* whenever the unit offers it.
 2. **Install gaze.** Press *Install gaze* on the Gaze unit. It asks first, then sets up its own Python environment and downloads about 340 MB (MediaPipe and its face model). It needs `uv`. Seeing the camera also needs ffmpeg, which the Microphone unit installs.
 3. **Calibrate.** Press *Calibrate* on the Gaze unit. It opens its own page in your browser, and Blender doesn't need to be open. If voice is on and using the camera, turn it off first. Press *Start*, then click the circle in the middle of the screen. That is when the camera turns on, and it stays on for about a minute.
    - **A calibration made before this update must be made again.** It was made without allowing for turning your head, so it is refused: the Gaze unit says "Your saved calibration is out of date. Calibrate gaze again.", and voice starts without gaze and says the same.
@@ -226,7 +244,7 @@ Routing has three gaze settings:
   - **Watch only** records what you were looking at when you said a pointing word and compares it with your selection. Edits land exactly as they do without gaze, and no pictures are taken. The Voice panel shows how often gaze picked what you had selected, and each command there shows what gaze would have picked. So does its `record.json` in the logs folder. Switch to On once it agrees with you often enough to trust.
   - **On** passes what you looked at to the cleanup step and the editor, along with your command.
 - **Gaze source:** **Camera** is the default. **Mouse** uses the pointer over Blender's 3D viewport or Unity's active SceneView while you hold the key. It needs no install or calibration, so it's a way to try gaze first.
-- **Camera:** Auto uses the Mac's own camera, never a phone's. Pick another camera here.
+- **Camera:** On macOS, Auto uses the Mac's own camera. On Windows, Auto chooses the first webcam excluding recognized phone and virtual devices. Pick a named camera to override.
 
 Stop and start voice after you change any of them.
 
@@ -238,11 +256,12 @@ While voice is on with **Gaze** set to Watch only or On and **Gaze source** set 
 - **In the wrong place?** Then gaze needs calibrating. Press *Calibrate* again, on the screen you use Blender on, and sit where you'll work: gaze works from about the distance you calibrated at, so if you've moved further back, calibrate again from there. The page takes 25 to 45 cm, and about 30 cm is best. Beyond 45 cm the page says "Come closer"; you can press *Start anyway*, but gaze will be less exact from that far. It uses the same readings as "this" and "there", so a marker that's off means those will be off too.
 - **It only shows.** It's drawn on top of the viewport and changes nothing in your scene. It never picks anything by itself.
 - **Only for the camera.** With Gaze source on Mouse there's no marker, because the pointer already shows where you are.
-- **It needs Bridge v0.3.4.** Press *Update add-on* on the Bridge unit, then restart Blender. Until you do, voice won't start, and the Voice panel says the Bridge needs updating.
+- **It needs Bridge v0.3.5.** Press *Update add-on* on the Bridge unit, then restart Blender. Until you do, voice won't start, and the Voice panel says the Bridge needs updating.
 - **Big scenes.** Each time the marker moves, Blender has to draw the viewport again. In a slow scene, the marker waits after each redraw for as long as that redraw took before it asks for the next one. So it redraws at most about half the time.
 
 ### What to expect from gaze
 
+- **Windows display support.** Camera gaze supports a single display or multiple displays with the same scaling. With mixed display scaling, it safely uses the current selection. Windows does not infer your display's physical size, so head-turn compensation is disabled there. Calibrate again after changing displays or scaling.
 - **Rough, not a mouse.** A webcam is far less exact than a pointer. The latest real calibration (2026-11-09) was typically off by about 23% of the screen, which is several centimetres. The closer seat, the eyelids and the head-turn correction haven't been tried on a real run yet, so it may do better, but that is an expectation, not a measurement.
 - **Objects and big parts.** We expect it to tell objects apart, and big parts of a model that have a vertex group or a material to call them by. It can't pick a small detail like one vertex, an edge or a small face.
 - **Numbers when it isn't sure.** If two guesses are too close to call, or the best guess is weak, numbered labels appear on the likeliest ones in the viewport and the status line says "Which one? Say the number." A single object under your gaze is used without asking, unless it covers very little of where you looked. To answer, hold the talk key and say "two" within fifteen seconds. If you're still saying it when the time runs out, it still counts. Say nothing and the command uses your selection. With nothing selected, the command doesn't run and the status line says "Couldn't tell what you meant. Select it or say its name."
@@ -255,9 +274,9 @@ While voice is on with **Gaze** set to Watch only or On and **Gaze source** set 
 ### The camera
 
 - **When it's on.** While voice is on with **Gaze** set to Watch only or On and **Gaze source** set to Camera, even if Blender is closed. Also for the length of *Calibrate* (from when you click the circle) or *Test* (once you've confirmed). Those two won't run while voice is using the camera. With Gaze Off, or on Mouse, voice never opens it, and they can run while voice is on. *Test* draws a ring in Blender, and voice doesn't draw over it: if voice would need to ask you to pick a number while a *Test* runs, it uses your selection instead.
-- **What stays on this Mac.** Frames are processed on this Mac and aren't saved or sent. GazeVoice reads one at a time, finds where your eyes point and drops it. It keeps only the last 90 seconds of where you looked, as screen positions in memory, plus the part for any command still waiting its turn, your calibration, and the readings from your last calibration run. Those last two are numbers only, and stay on this Mac's disk. With Pictures on, it also keeps the last 20 pictures of Blender's viewport that went to the AI, in memory only, and they are gone when the dashboard stops (see [Pictures](#pictures-optional-off-by-default)).
+- **What stays on this computer.** Frames are processed on this computer and aren't saved or sent. GazeVoice reads one at a time, finds where your eyes point and drops it. It keeps only the last 90 seconds of where you looked, as screen positions in memory, plus the part for any command still waiting its turn, your calibration, and the readings from your last calibration run. Those last two are numbers only, and stay on this computer's disk. With Pictures on, it also keeps the last 20 pictures of Blender's viewport that went to the AI, in memory only, and they are gone when the dashboard stops (see [Pictures](#pictures-optional-off-by-default)).
 - **What the last calibration leaves behind.** Each calibration run saves its readings in `gaze-last-run.json`, so a run that goes wrong can be looked into without doing it again. For each frame whose readings were kept, in the order they came, it holds 12 numbers (where your irises sat in your eyes, how open your eyes were, and how your head was turned and placed), which dot that frame went with and whether it was one held back to check the result. With them go when the frame came, MediaPipe's 14 scores for your eyes (how far each looked up, down, in and out, and how much it blinked, squinted or opened wide), the 16 numbers that say how your head was turned and placed, how wide your face was in pixels, how far your face reached toward each edge of the picture, and where the outline and iris of each eye were, as shares of the picture. It also holds how many frames had no face or had your eyes shut, the size and frame rate your camera really sends, the size its frames were scaled to, and when the run was made. A run's file is about 1 MB. For each frame looked at while the head outline was on or a dot's readings were being kept (the first 4,000 at most, which is more than a run takes), it also holds one short line: when the frame came, whether it went with the head outline or which dot, whether a face was found in it (and, if so, whether your eyes were shut), and how bright the frame was. It holds no picture; how bright a frame was is a single number. Each run that gets through the dots replaces the last, whether or not the calibration was saved. A run that stops sooner (you press Esc, the page closes, or the head outline gives up) leaves the file from the run before; the time in it tells you which run it is from. Voice and *Test* never write it. Delete it whenever you like.
-- **What leaves.** What you looked at reaches the cleanup step and the editor as text with your command. That text has object and part names, how sure gaze was, a 3D point, face numbers and how far gaze may be off as a share of the viewport. It goes where your commands go, so with an API provider on either step it goes to that company's servers, as your selection does. Command records on this Mac keep what gaze found as names and numbers, and the one-line description of a picture if there was one. They never keep an image.
+- **What leaves.** What you looked at reaches the cleanup step and the editor as text with your command. That text has object and part names, how sure gaze was, a 3D point, face numbers and how far gaze may be off as a share of the viewport. It goes where your commands go, so with an API provider on either step it goes to that company's servers, as your selection does. Command records on this computer keep what gaze found as names and numbers, and the one-line description of a picture if there was one. They never keep an image.
 
 ### Pictures (optional, off by default)
 
@@ -270,11 +289,11 @@ A big part of a model with no vertex group or material has nothing to call it by
 - **How it's cleaned up.** GazeVoice never saves a picture. Claude Code gets it for one reply, and the check below looks for any copy left behind. Anthropic keeps what's sent under your account's terms. Blender makes the picture in memory, and drops one nobody reads after 30 seconds. The control center passes it straight to Claude Code, and keeps a copy in its memory for the dashboard (see the next point). Pictures never go into logs, command records or the Blender file.
 - **What the dashboard keeps.** So you can see what the AI was shown, the dashboard keeps the last 20 pictures that were sent, in its memory. Each command's line in the Voice panel shows a small picture beside what the AI said about it. Click it to see it full size, and press Esc or click again to close it. A picture is never saved to disk, and it isn't in a log, a command record or the Blender file. It's gone once 20 newer ones have been sent, when its command is more than 20 commands old, and when the dashboard stops, and the line then says the picture isn't kept any more. A command record keeps only a note that a picture was sent, with the AI's one line about it.
 
-To turn pictures on, set **Pictures** to On in Routing, then press *Check pictures get cleaned up* on the Gaze unit. It asks first and uses a little of your plan. It sends one small random picture the way a real one is sent, and waits for Claude Code to exit. Then it searches this Mac for a copy. It looks in Claude Code's folder (`~/.claude`), the temp folders, GazeVoice's folder and wider parts of `~/Library` and `~/.local`. If it finds a copy it says where, leaves the file alone (it may be Claude Code's own) and records no pass. If it can't look somewhere it has to, it records no pass either.
+To turn pictures on, set **Pictures** to On in Routing, then press *Check pictures get cleaned up* on the Gaze unit. It asks first and uses a little of your plan. It sends one small random picture the way a real one is sent, and waits for Claude Code to exit. Then it searches this computer for a copy. It looks in Claude Code's folder (`~/.claude`), the temp folders, GazeVoice's folder and wider parts of `~/Library` and `~/.local` on macOS, or Local/Roaming AppData and `~/.local` on Windows. If it finds a copy it says where, leaves the file alone (it may be Claude Code's own) and records no pass. If it can't look somewhere it has to, it records no pass either.
 
 **The limits:**
 
-- The check only finds a copy that's unchanged. It can't find one saved in another form, such as a JPEG, a resized picture or a compressed file. It also can't find one stored as text that was broken across lines or had characters changed. It can't read other users' files or places macOS keeps private. In the wider places it reads only what it's allowed to, so a copy kept in one it can't read isn't found. A pass means no plain copy turned up where it could look. It doesn't prove none exists.
+- The check only finds a copy that's unchanged. It can't find one saved in another form, such as a JPEG, a resized picture or a compressed file. It also can't find one stored as text that was broken across lines or had characters changed. It can't read other users' files or places the operating system keeps private. In the wider places it reads only what it's allowed to, so a copy kept in one it can't read isn't found. A pass means no plain copy turned up where it could look. It doesn't prove none exists.
 - A pass is for one Claude Code version. After `claude update`, pictures turn off by themselves until you check again, and the Gaze unit says so. If a check finds a copy, leave pictures off.
 
 ## Use DeepSeek, Qwen or another API
@@ -292,15 +311,17 @@ Either step can run on a model you reach with your own API key instead of Claude
 
 Good to know:
 
-- **The key goes to your Mac's Keychain** (service "GazeVoice"). The dashboard shows only its last four characters. **Remove** deletes it, and any step using that provider goes back to Auto.
+- **The key goes to your system credential store:** macOS Keychain (service GazeVoice) or Windows Credential Manager (GazeVoice/provider-id). The dashboard shows only its last four characters. **Remove** deletes it, and any step using that provider goes back to Auto.
 - **Your commands go to that provider:** with an API provider, what you say, what's selected and the scene's object names go to that company's servers. The Voice panel says which one.
 - **Errors say what to do:** a rejected key, an empty account, a model that can't call tools or a provider that can't be reached each get their own message.
 
 ## Where things live
 
+The default data root is `~/Library/Application Support/GazeVoice` on macOS and `%LOCALAPPDATA%/GazeVoice` on Windows. `GAZEVOICE_HOME` overrides it on both systems. Optional discovery overrides are `BLENDER_PATH`, `UNITY_EDITOR_PATH` and `UNITY_HUB_PATH` (Windows executable paths); restart the control center after changing environment variables.
+
 | What | Where |
 |---|---|
-| Settings, downloads, the MCP server, the speech environment | `~/Library/Application Support/GazeVoice/` (override with `GAZEVOICE_HOME`) |
+| Settings, downloads, the MCP server, the speech environment | The default data root for your system, described above (override with `GAZEVOICE_HOME`) |
 | The last good microphone test | `…/GazeVoice/state/microphone.json` (delete it to make the mic show "Installed" again) |
 | Speech models | `~/.cache/huggingface/` (or `$HF_HOME` if you set it) |
 | Spoken commands (audio.wav + record.json each) | `…/GazeVoice/logs/commands/<time>-<n>/` |
@@ -310,7 +331,7 @@ Good to know:
 | ML-Agents' Python environment, and each training run's log | `…/GazeVoice/venvs/mlagents/`, `…/GazeVoice/logs/mlagents-<run>.log` |
 | Training runs, their settings and the models | In your Unity project: `MLAgents/results/<run>/`, `MLAgents/configs/<run>.yaml`, and `Assets/GazeVoice/MLAgents/<run>/` once you use a model |
 | Gaze's face model, your calibration and the last calibration's readings (both numbers only), and the picture check | `…/GazeVoice/state/` (`face_landmarker.task`, `gaze-calibration.json`, `gaze-last-run.json`, `gaze-picture-check.json`) |
-| API keys for DeepSeek, Qwen and custom providers | macOS Keychain, service "GazeVoice" |
+| API keys for DeepSeek, Qwen and custom providers | macOS Keychain (service GazeVoice) or Windows Credential Manager (GazeVoice/provider-id) |
 
 ## Good to know
 

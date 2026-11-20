@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from .platforms import app_data
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -83,4 +84,4 @@ def default_paths() -> AppPaths:
     override = os.environ.get(HOME_ENV)
     if override:
         return AppPaths(Path(override).expanduser())
-    return AppPaths(Path.home() / "Library" / "Application Support" / "GazeVoice")
+    return AppPaths(app_data("GazeVoice"))
