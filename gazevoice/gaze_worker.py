@@ -692,21 +692,55 @@ class Session:
             print(f"Couldn't keep this run's readings: {exc}", file=sys.stderr, flush=True)
 
 
+def _pipe_chunks(fd: int):
+    """Read control input without holding a Windows CRT descriptor lock while idle.
+
+    NumPy's Windows extension changes the standard descriptors' modes during
+    import. A blocking os.read on stdin holds the same CRT lock and deadlocks
+    that import. Poll the pipe, then read only bytes already available.
+    """
+    if os.name == "nt":
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        api = ctypes.WinDLL("kernel32", use_last_error=True)
+        peek = api.PeekNamedPipe
+        peek.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p,
+                         ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        peek.restype = wintypes.BOOL
+        handle = msvcrt.get_osfhandle(fd)
+    while True:
+        size = 65536
+        if os.name == "nt":
+            available = wintypes.DWORD()
+            if not peek(handle, None, 0, None, ctypes.byref(available), None):
+                error = ctypes.get_last_error()
+                if error in (109, 232):  # broken pipe / no data after the writer closes
+                    return
+                raise ctypes.WinError(error)
+            if not available.value:
+                time.sleep(0.02)
+                continue
+            size = min(size, available.value)
+        chunk = os.read(fd, size)
+        if not chunk:
+            return
+        yield chunk
+
+
 def _read_lines(fd: int):
     """Lines from a file descriptor. Read straight from the descriptor, so that a thread still waiting on it
     when the program ends can't trip over Python's buffered stdin."""
     pending = b""
-    while True:
-        try:
-            chunk = os.read(fd, 65536)
-        except OSError:
-            return
-        if not chunk:
-            return
-        pending += chunk
-        while b"\n" in pending:
-            line, pending = pending.split(b"\n", 1)
-            yield line.decode("utf-8", errors="replace")
+    try:
+        for chunk in _pipe_chunks(fd):
+            pending += chunk
+            while b"\n" in pending:
+                line, pending = pending.split(b"\n", 1)
+                yield line.decode("utf-8", errors="replace")
+    except OSError:
+        return
 
 
 def serve(args: argparse.Namespace) -> int:

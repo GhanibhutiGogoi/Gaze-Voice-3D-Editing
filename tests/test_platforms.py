@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from types import SimpleNamespace
 import unittest
@@ -183,6 +184,52 @@ class PlatformContractTest(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == "win32", "Windows native boundary")
 class WindowsNativeTest(unittest.TestCase):
+    def test_idle_gaze_control_pipe_does_not_block_native_stdin_initialization(self):
+        # NumPy's extension takes the same CRT descriptor lock as setmode.
+        # Keep stdin open and idle: communicate() would close it and hide the bug.
+        code = (
+            "import faulthandler,msvcrt,os,sys,threading,time\n"
+            "from gazevoice.gaze_worker import _read_lines\n"
+            "faulthandler.dump_traceback_later(5,exit=True)\n"
+            "read=threading.Thread(target=lambda:list(_read_lines(0)),daemon=True)\n"
+            "read.start(); time.sleep(.15)\n"
+            "msvcrt.setmode(0,os.O_BINARY)\n"
+            "print('native import can proceed',flush=True)\n"
+            "faulthandler.cancel_dump_traceback_later()\n"
+            "os._exit(0)\n"
+        )
+        proc = platforms.spawn([sys.executable, "-u", "-c", code], stdin=subprocess.PIPE,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                               **platforms.process_options())
+        try:
+            proc.wait(timeout=10)
+            stdout, stderr = proc.communicate(timeout=3)
+            self.assertEqual(proc.returncode, 0, stderr)
+            self.assertIn("native import can proceed", stdout)
+        finally:
+            if proc.poll() is None:
+                proc.close_tree()
+            proc.communicate(timeout=3)
+
+    def test_gaze_pipe_preserves_split_unicode_commands_and_exits_on_eof(self):
+        from gazevoice.gaze_worker import _read_lines
+        read_fd, write_fd = os.pipe()
+        lines = []
+        reader = threading.Thread(target=lambda: lines.extend(_read_lines(read_fd)), daemon=True)
+        reader.start()
+        try:
+            payload = '中文 command\nsecond\n'.encode("utf-8")
+            os.write(write_fd, payload[:1])
+            time.sleep(.04)
+            os.write(write_fd, payload[1:])
+        finally:
+            os.close(write_fd)
+            reader.join(timeout=3)
+            if not reader.is_alive():
+                os.close(read_fd)
+        self.assertFalse(reader.is_alive(), "control reader did not notice EOF")
+        self.assertEqual(lines, ["中文 command", "second"])
+
     def test_camera_mapping_requires_uniform_monitor_scaling(self):
         from gazevoice import windows_desktop as desktop
         for scales, expected in (([96], True), ([144, 144], True),
