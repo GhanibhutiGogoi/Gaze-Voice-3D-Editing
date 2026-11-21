@@ -297,11 +297,11 @@ class _UnityUnit(Component):
 
 
     def _prepare_vr(self, job: Job, editor: UnityEditor, project: Path) -> None:
-        """Add the GazeVoice package, then let it build the VR scene: a terrain with the template's XR Origin rig,
+        """Add the GazeVoice package, then let it build the VR scene: a flat plane with the template's XR Origin rig,
         and OpenXR set up for a Meta Quest Pro with eye gaze."""
         add_bridge(project)
         log = self.paths.logs / "unity-vr-setup.log"
-        job.log("Building the VR scene: a terrain to work on, the template's player rig, and eye tracking…")
+        job.log("Building the VR scene: a plane to work on, the template's player rig, and eye tracking…")
         result = self.runner.run([editor.binary, "-batchmode", "-quit", "-projectPath", project,
                                   "-executeMethod", VR_SETUP, "-logFile", log], timeout=CREATE_SECONDS)
         if not result.ok:

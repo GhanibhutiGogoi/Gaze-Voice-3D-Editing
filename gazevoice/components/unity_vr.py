@@ -123,7 +123,7 @@ class UnityVR(Component):
         actions = [ActionSpec("enter_vr", "Enter VR"), test, ActionSpec("prepare", "Prepare VR scene")]
         if not status.get("vr_scene"):
             return self.state(Health.INSTALLED, "The project has no GazeVoice VR scene yet. Press Prepare VR scene: it "
-                              "adds a terrain and the template's player rig, and turns on eye gaze.", details, actions)
+                              "adds a plane to build on and the template's player rig, and turns on eye gaze.", details, actions)
         return self.state(Health.READY, "Ready. Press Enter VR (or Play in Unity), put the headset on, and hold "
                           f"{key} to talk. Edits made while playing are kept.", details, actions)
 
@@ -177,7 +177,7 @@ class UnityVR(Component):
 
     def action_prepare(self, job: Job) -> dict:
         """Build (or open) the GazeVoice VR scene and set OpenXR up for the Quest Pro, in the open project."""
-        job.log("Preparing the VR scene: a terrain, the template's player rig, and OpenXR with eye gaze…")
+        job.log("Preparing the VR scene: a plane, the template's player rig, and OpenXR with eye gaze…")
         reply = self._request({"cmd": "vr_setup"}, timeout=120.0)
         for note in reply.get("notes") or []:
             job.log(str(note))

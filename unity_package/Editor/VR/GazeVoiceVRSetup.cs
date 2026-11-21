@@ -8,9 +8,7 @@ using UnityEditor;
 using UnityEditor.SceneManagement;
 using UnityEditor.XR.Management;
 using UnityEditor.XR.Management.Metadata;
-using UnityEditorInternal;
 using UnityEngine;
-using UnityEngine.Rendering;
 using UnityEngine.SceneManagement;
 using UnityEngine.XR.Management;
 using UnityEngine.XR.OpenXR;
@@ -18,24 +16,20 @@ using UnityEngine.XR.OpenXR.Features;
 using UnityEngine.XR.OpenXR.Features.Interactions;
 using Object = UnityEngine.Object;
 
-// The Unity VR starting point: a terrain to build on and the VR template's XR Origin, with its controllers, moving,
+// The Unity VR starting point: a flat plane to build on and the VR template's XR Origin, with its controllers, moving,
 // turning and teleporting, set up for a Meta Quest Pro over Link with eye tracking. It is a scene of its own, so the rest
 // of the project is left alone. GazeVoice runs it once when it makes a Unity VR project (-executeMethod
 // GazeVoiceVRSetup.Batch), and the dashboard can run it again: an existing scene is opened, never rebuilt.
 public static class GazeVoiceVRSetup
 {
     internal const string ScenePath = "Assets/Scenes/GazeVoice VR.unity";
-    const string Folder = "Assets/GazeVoice/VR";
     const string TemplateScene = "Assets/Scenes/BasicScene.unity";
     const string TemplateFloor = "Plane";
     const string RigPrefab = "XR Origin (XR Rig)";
     const string OpenLater = "Library/GazeVoice/open-vr-scene";
     const string OpenXRLoaderType = "UnityEngine.XR.OpenXR.OpenXRLoader";
     const string OculusLoaderType = "Unity.XR.Oculus.OculusLoader";
-    const string URPTerrainMaterial = "Packages/com.unity.render-pipelines.universal/Runtime/Materials/TerrainLit.mat";
-    const float Size = 200f, Height = 30f, Ground = 0.25f;  // Ground: the spawn's height, as a share of Height
-    const float FlatRadius = 14f, HillsFrom = 45f, RimFrom = 70f;
-    const int Resolution = 257, GrassSize = 256;
+    const float FloorScale = 10f;  // a built-in plane is 10 m across, so the floor is 100 m by 100 m
     static readonly BuildTargetGroup Windows = BuildTargetGroup.Standalone;
 
     public static void Batch()
@@ -251,20 +245,13 @@ public static class GazeVoiceVRSetup
 
     static void BuildScene(List<string> notes)
     {
-        Folders(Folder);
         Folders(Path.GetDirectoryName(ScenePath).Replace('\\', '/'));
         Scene scene;
-        Component teleport = null;
+        GameObject floor = null;
         if (File.Exists(TemplateScene) && AssetDatabase.CopyAsset(TemplateScene, ScenePath))
         {
             scene = EditorSceneManager.OpenScene(ScenePath, OpenSceneMode.Single);
-            var floor = scene.GetRootGameObjects().FirstOrDefault(go => go.name == TemplateFloor);
-            if (floor != null)
-            {
-                teleport = floor.GetComponents<Component>().FirstOrDefault(item => item != null && item.GetType().Name == "TeleportationArea");
-                if (teleport != null) ComponentUtility.CopyComponent(teleport);
-                Object.DestroyImmediate(floor);
-            }
+            floor = scene.GetRootGameObjects().FirstOrDefault(go => go.name == TemplateFloor);
         }
         else
         {
@@ -279,10 +266,16 @@ public static class GazeVoiceVRSetup
             if (rig != null) PrefabUtility.InstantiatePrefab(rig, scene);
             else notes.Add("No XR Origin prefab: import the XR Interaction Toolkit's Starter Assets, then add an XR Origin.");
         }
-        var terrain = MakeTerrain();
-        SceneManager.MoveGameObjectToScene(terrain, scene);
-        terrain.transform.SetSiblingIndex(0);
-        Teleport(terrain, teleport != null, notes);
+        if (floor == null)
+        {
+            floor = GameObject.CreatePrimitive(PrimitiveType.Plane);
+            floor.name = TemplateFloor;
+            floor.transform.localScale = new Vector3(FloorScale, 1f, FloorScale);
+            GameObjectUtility.SetStaticEditorFlags(floor, StaticEditorFlags.ContributeGI | StaticEditorFlags.BatchingStatic);
+            SceneManager.MoveGameObjectToScene(floor, scene);
+            floor.transform.SetSiblingIndex(0);
+        }
+        Teleport(floor, notes);
         if (!EditorSceneManager.SaveScene(scene, ScenePath)) throw new IOException("Couldn't save " + ScenePath);
     }
 
@@ -295,31 +288,23 @@ public static class GazeVoiceVRSetup
             .FirstOrDefault(prefab => prefab != null);
     }
 
-    // The template's floor lets the controllers teleport; the terrain takes its place, so it gets the same component,
-    // which reaches the rig's teleport ray through its interaction layer. An empty collider list makes it use the
-    // terrain's own collider.
-    static void Teleport(GameObject terrain, bool copied, List<string> notes)
+    // The template's plane already lets the controllers teleport. A plane made here gets the same component, which reaches
+    // the rig's teleport ray through its interaction layer; an empty collider list makes it use the plane's own collider.
+    static void Teleport(GameObject floor, List<string> notes)
     {
-        Component area = null;
-        if (copied && ComponentUtility.PasteComponentAsNew(terrain))
-            area = terrain.GetComponents<Component>().FirstOrDefault(item => item != null && item.GetType().Name == "TeleportationArea");
-        if (area == null)
+        if (floor.GetComponents<Component>().Any(item => item != null && item.GetType().Name == "TeleportationArea")) return;
+        var type = FindType("UnityEngine.XR.Interaction.Toolkit.Locomotion.Teleportation.TeleportationArea")
+                   ?? FindType("UnityEngine.XR.Interaction.Toolkit.TeleportationArea");
+        if (type == null)
         {
-            var type = FindType("UnityEngine.XR.Interaction.Toolkit.Locomotion.Teleportation.TeleportationArea")
-                       ?? FindType("UnityEngine.XR.Interaction.Toolkit.TeleportationArea");
-            if (type == null)
-            {
-                notes.Add("The XR Interaction Toolkit has no teleport area, so the terrain can't be teleported on.");
-                return;
-            }
-            area = terrain.AddComponent(type);
-            copied = false;
+            notes.Add("The XR Interaction Toolkit has no teleport area, so the plane can't be teleported on.");
+            return;
         }
-        var serialized = new SerializedObject(area);
+        var serialized = new SerializedObject(floor.AddComponent(type));
         var colliders = serialized.FindProperty("m_Colliders");
         if (colliders != null) colliders.ClearArray();
         var bits = serialized.FindProperty("m_InteractionLayers.m_Bits");
-        if (!copied && bits != null) bits.longValue = TeleportLayer();
+        if (bits != null) bits.longValue = TeleportLayer();
         serialized.ApplyModifiedPropertiesWithoutUndo();
     }
 
@@ -329,86 +314,6 @@ public static class GazeVoiceVRSetup
         var getMask = mask?.GetMethod("GetMask", new[] { typeof(string[]) });
         var value = getMask != null ? Convert.ToInt64(getMask.Invoke(null, new object[] { new[] { "Teleport" } })) : 0;
         return value != 0 ? (uint)value : 1u << 31;  // the Starter Assets put Teleport on the last layer
-    }
-
-    static GameObject MakeTerrain()
-    {
-        var data = new TerrainData { heightmapResolution = Resolution };
-        data.size = new Vector3(Size, Height, Size);
-        data.SetHeights(0, 0, Heights());
-        data.terrainLayers = new[] { Grass() };
-        AssetDatabase.CreateAsset(data, Folder + "/Terrain.asset");
-        var go = Terrain.CreateTerrainGameObject(data);
-        go.name = "Terrain";
-        go.transform.position = new Vector3(-Size / 2, -Ground * Height, -Size / 2);  // the spawn is at the origin, on the ground
-        var terrain = go.GetComponent<Terrain>();
-        var material = TerrainMaterial();
-        if (material != null) terrain.materialTemplate = material;
-        GameObjectUtility.SetStaticEditorFlags(go, StaticEditorFlags.ContributeGI | StaticEditorFlags.BatchingStatic);
-        return go;
-    }
-
-    // Flat where the person starts, low hills around that, and a rim that rises toward the edge.
-    static float[,] Heights()
-    {
-        var heights = new float[Resolution, Resolution];
-        for (var row = 0; row < Resolution; row++)
-        for (var column = 0; column < Resolution; column++)
-        {
-            var x = column / (Resolution - 1f) * Size - Size / 2;
-            var z = row / (Resolution - 1f) * Size - Size / 2;
-            var hills = (Mathf.PerlinNoise(x * 0.018f + 31.7f, z * 0.018f + 12.3f) - 0.5f) * 0.32f
-                        + (Mathf.PerlinNoise(x * 0.07f + 5.1f, z * 0.07f + 77.9f) - 0.5f) * 0.06f;
-            var away = Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(FlatRadius, HillsFrom, Mathf.Sqrt(x * x + z * z)));
-            var rim = Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(RimFrom, Size / 2, Mathf.Max(Mathf.Abs(x), Mathf.Abs(z)))) * 0.45f;
-            heights[row, column] = Mathf.Clamp01(Ground + hills * away + rim);
-        }
-        return heights;
-    }
-
-    static TerrainLayer Grass()
-    {
-        var path = Folder + "/Grass.png";
-        var texture = new Texture2D(GrassSize, GrassSize, TextureFormat.RGB24, false);
-        var pixels = new Color[GrassSize * GrassSize];
-        for (var y = 0; y < GrassSize; y++)
-        for (var x = 0; x < GrassSize; x++)
-        {
-            var broad = Tiling(x, y, 0.035f, 3.1f);
-            var fine = Tiling(x, y, 0.21f, 17.5f);
-            var shade = 0.78f + 0.3f * broad + 0.16f * (fine - 0.5f);
-            pixels[y * GrassSize + x] = new Color(0.24f * shade, 0.42f * shade, 0.16f * shade);
-        }
-        texture.SetPixels(pixels);
-        File.WriteAllBytes(path, texture.EncodeToPNG());
-        Object.DestroyImmediate(texture);
-        AssetDatabase.ImportAsset(path, ImportAssetOptions.ForceSynchronousImport);
-        var layer = new TerrainLayer { diffuseTexture = AssetDatabase.LoadAssetAtPath<Texture2D>(path), tileSize = new Vector2(8f, 8f) };
-        AssetDatabase.CreateAsset(layer, Folder + "/Grass.terrainlayer");
-        return layer;
-    }
-
-    // Noise that repeats every GrassSize pixels, so the tiles join without a seam.
-    static float Tiling(int x, int y, float scale, float seed)
-    {
-        float Sample(float u, float v) => Mathf.PerlinNoise(u * scale + seed, v * scale + seed);
-        float s = x / (float)GrassSize, t = y / (float)GrassSize;
-        return Sample(x, y) * (1 - s) * (1 - t) + Sample(x - GrassSize, y) * s * (1 - t)
-               + Sample(x, y - GrassSize) * (1 - s) * t + Sample(x - GrassSize, y - GrassSize) * s * t;
-    }
-
-    static Material TerrainMaterial()
-    {
-        var pipeline = GraphicsSettings.currentRenderPipeline;
-        if (pipeline != null)
-        {
-            try
-            {
-                if (pipeline.GetType().GetProperty("defaultTerrainMaterial")?.GetValue(pipeline) is Material material) return material;
-            }
-            catch (Exception) { }
-        }
-        return AssetDatabase.LoadAssetAtPath<Material>(URPTerrainMaterial);
     }
 
     static void AddToBuild()

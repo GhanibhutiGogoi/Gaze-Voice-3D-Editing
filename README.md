@@ -194,7 +194,7 @@ Unity VR has **its own project**, `~/Unity/GazeVoice VR`, so your Unity project 
 3. Press **New project** on the Unity project unit, or **Set up Unity**. GazeVoice:
    - makes `~/Unity/GazeVoice VR` from that template;
    - adds the GazeVoice package;
-   - builds the scene `Assets/Scenes/GazeVoice VR.unity`. It has a terrain to build on and the template's XR Origin player, with controllers, moving, turning and teleporting;
+   - builds the scene `Assets/Scenes/GazeVoice VR.unity`. It has a flat 100 m plane to build on and the template's XR Origin player, with controllers, moving, turning and teleporting;
    - turns on OpenXR for Windows with Eye Gaze Interaction and the Quest Pro and Touch controller profiles.
 
    In a project of your own, **Prepare VR scene** on the VR headset unit does the same. It also clears broken entries out of the VR template's OpenXR settings, which otherwise stop Play with "No OpenXR loader library found".
