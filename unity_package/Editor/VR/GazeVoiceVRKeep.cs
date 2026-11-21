@@ -22,6 +22,7 @@ internal static class GazeVoiceVRKeep
     const string PendingFile = "Library/GazeVoice/vr-pending.json";
     const string EditsFolder = "Assets/GazeVoice/VR Edits";
     const string UndoName = "GazeVoice VR edits";
+    const double PollSeconds = 1;
     static readonly Regex Reference = new Regex("\\{\"instanceID\":(-?\\d+)\\}");
     static readonly Regex Placeholder = new Regex("\\{\"instanceID\":\"@(\\d+)\"\\}");
 
@@ -38,6 +39,8 @@ internal static class GazeVoiceVRKeep
     static readonly HashSet<long> Created = new HashSet<long>();
     static readonly HashSet<long> Changed = new HashSet<long>();
     static readonly Dictionary<long, Origin> Deleted = new Dictionary<long, Origin>();
+    static double polledAt;
+    static bool editing;  // Edit mode has begun: the saved scene is open again, not Play mode's copy
 
     static GazeVoiceVRKeep()
     {
@@ -45,7 +48,18 @@ internal static class GazeVoiceVRKeep
         GazeVoiceBridge.EditBegan += Began;
         GazeVoiceBridge.EditEnded += Ended;
         EditorApplication.playModeStateChanged += OnPlayMode;
+        EditorApplication.update += Poll;
+        editing = !EditorApplication.isPlayingOrWillChangePlaymode;
         if (File.Exists(PendingFile)) EditorApplication.delayCall += Restore;  // scripts reloaded after Play stopped
+    }
+
+    // Play stopped from the dashboard can still be changing mode when Edit mode's first call comes, so it is tried again.
+    static void Poll()
+    {
+        var now = EditorApplication.timeSinceStartup;
+        if (now - polledAt < PollSeconds || !editing || EditorApplication.isPlayingOrWillChangePlaymode) return;
+        polledAt = now;
+        if (File.Exists(PendingFile)) Restore();
     }
 
     internal static int Edits => Created.Count + Changed.Count + Deleted.Count;
@@ -53,6 +67,8 @@ internal static class GazeVoiceVRKeep
 
     static void OnPlayMode(PlayModeStateChange change)
     {
+        if (change == PlayModeStateChange.ExitingEditMode) editing = false;
+        else if (change == PlayModeStateChange.EnteredEditMode) editing = true;
         if (change == PlayModeStateChange.EnteredPlayMode) Clear();
         else if (change == PlayModeStateChange.ExitingPlayMode)
         {
@@ -324,7 +340,7 @@ internal static class GazeVoiceVRKeep
 
     static void Restore()
     {
-        if (!File.Exists(PendingFile) || EditorApplication.isPlayingOrWillChangePlaymode) return;
+        if (!File.Exists(PendingFile) || !editing || EditorApplication.isPlayingOrWillChangePlaymode) return;
         JObject pending;
         try { pending = JObject.Parse(File.ReadAllText(PendingFile)); }
         catch (Exception ex)

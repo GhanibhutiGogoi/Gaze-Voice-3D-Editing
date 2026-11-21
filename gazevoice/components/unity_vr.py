@@ -184,6 +184,8 @@ class UnityVR(Component):
         xr = reply.get("xr") or {}
         if xr.get("features"):
             job.log(f"OpenXR features on: {', '.join(xr['features'])}")
+        if xr.get("disabled"):
+            job.log(f"Turned off other headsets' controller profiles, so Link binds the Quest's: {', '.join(xr['disabled'])}")
         if xr.get("repaired"):
             job.log(f"Repaired {xr['repaired']} broken OpenXR settings entries.")
         job.log(f"{'Made' if reply.get('made') else 'Opened'} {reply.get('scene')}.")

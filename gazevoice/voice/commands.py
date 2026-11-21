@@ -159,6 +159,17 @@ def _gaze_detail(target: dict) -> str:
     details = []
     if piece.get("part"):
         details.append(f"part: {piece['part']}")
+    if piece.get("object"):
+        share = piece.get("object_share")
+        details.append(f"a part of {piece['object']} (whole object's instance ID {piece.get('object_uid')}"
+                       f"{f', {round(share * 100)}% of the look' if isinstance(share, (int, float)) else ''})")
+    if piece.get("path"):
+        details.append(f"path {piece['path']}")
+    if piece.get("material"):
+        material = f"material {piece['material']}"
+        if piece.get("submeshes"):
+            material += f" on submesh {piece['submesh']} of {piece['submeshes']}"
+        details.append(material)
     point = top.get("point") or []
     if len(point) == 3:
         where = "point (" + ", ".join(f"{x:.2f}" for x in point) + ")"

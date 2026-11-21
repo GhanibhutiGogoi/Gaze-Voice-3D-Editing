@@ -6,7 +6,8 @@
         "Unity.XR.Management",
         "Unity.XR.Management.Editor",
         "Unity.XR.OpenXR",
-        "Unity.XR.OpenXR.Editor"
+        "Unity.XR.OpenXR.Editor",
+        "Unity.InputSystem"
     ],
     "includePlatforms": [
         "Editor"
@@ -26,6 +27,11 @@
             "name": "com.unity.xr.openxr",
             "expression": "1.6.0",
             "define": "GAZEVOICE_OPENXR"
+        },
+        {
+            "name": "com.unity.inputsystem",
+            "expression": "1.0.0",
+            "define": "GAZEVOICE_INPUTSYSTEM"
         }
     ],
     "noEngineReferences": false

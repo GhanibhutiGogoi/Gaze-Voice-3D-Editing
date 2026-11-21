@@ -31,6 +31,15 @@ public static class GazeVoiceVRSetup
     const string OculusLoaderType = "Unity.XR.Oculus.OculusLoader";
     const float FloorScale = 10f;  // a built-in plane is 10 m across, so the floor is 100 m by 100 m
     static readonly BuildTargetGroup Windows = BuildTargetGroup.Standalone;
+    // The Quest's own controllers, by name, since older OpenXR packages lack some. With another headset's profile on too,
+    // Link can bind the controllers to that one instead: KHR Simple, for one, has no B or Y button to talk and no sticks.
+    static readonly string[] QuestControllers =
+        { "MetaQuestTouchProControllerProfile", "MetaQuestTouchPlusControllerProfile", "OculusTouchControllerProfile" };
+    static readonly string[] OtherControllers =
+    {
+        "KHRSimpleControllerProfile", "HPReverbG2ControllerProfile", "HTCViveControllerProfile", "ValveIndexControllerProfile",
+        "MicrosoftMotionControllerProfile",
+    };
 
     public static void Batch()
     {
@@ -116,17 +125,26 @@ public static class GazeVoiceVRSetup
         UnityEditor.XR.OpenXR.Features.FeatureHelpers.RefreshFeatures(Windows);
         var settings = OpenXRSettings.GetSettingsForBuildTargetGroup(Windows);
         var enabled = new List<string>();
+        var disabled = new List<string>();
         if (settings != null)
         {
             Enable<EyeGazeInteraction>(settings, enabled);
-            Enable<MetaQuestTouchProControllerProfile>(settings, enabled);
-            Enable<OculusTouchControllerProfile>(settings, enabled);
+            foreach (var feature in settings.GetFeatures())
+            {
+                var name = feature != null ? feature.GetType().Name : null;
+                var on = QuestControllers.Contains(name);
+                if (!on && !(OtherControllers.Contains(name) && feature.enabled)) continue;
+                if (!on) disabled.Add(name);
+                else enabled.Add(name);
+                feature.enabled = on;
+                EditorUtility.SetDirty(feature);
+            }
             EditorUtility.SetDirty(settings);
         }
         else notes.Add("OpenXR has no settings for Windows yet. Open Project Settings > XR Plug-in Management > OpenXR once.");
         PlayerSettings.runInBackground = true;  // the headset keeps playing while another window has the focus
         return new { loaders = manager.activeLoaders.Where(loader => loader != null).Select(loader => loader.name).ToArray(),
-            features = enabled, repaired };
+            features = enabled, disabled, repaired };
     }
 
     static void Enable<T>(OpenXRSettings settings, List<string> enabled) where T : OpenXRFeature

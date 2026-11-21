@@ -13,7 +13,7 @@ import re
 import statistics
 import threading
 import unicodedata
-from collections import deque
+from collections import Counter, deque
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Sequence
 
@@ -515,13 +515,36 @@ def _is_ground(samples: list[dict]) -> bool:
     return ground * 2 > len(samples)
 
 
+def _part_of(group: list[dict], around: list[dict]) -> dict | None:
+    """What a VR target is a part of, as a `piece`: its whole object and how much of the look that had, the path down
+    to it, and the material looked at (with its submesh, when the mesh has several). None when nothing is known."""
+    top = group[0]
+    piece: dict = {}
+    root_uid = top.get("root_uid")
+    if root_uid is not None and root_uid != top["uid"] and top.get("root"):
+        whole = sum(1 for sample in around if sample.get("root_uid") == root_uid or sample.get("uid") == root_uid)
+        piece.update(object=str(top["root"]), object_uid=root_uid, object_share=whole / len(around))
+    if top.get("path"):
+        piece["path"] = str(top["path"])
+    looks = Counter((sample.get("submesh"), str(sample["material"])) for sample in group if sample.get("material"))
+    if looks:
+        (submesh, material), count = looks.most_common(1)[0]
+        piece["material"] = material
+        submeshes = top.get("submeshes")
+        if isinstance(submesh, int) and isinstance(submeshes, int) and submeshes > 1:
+            piece.update(submesh=submesh, submeshes=submeshes, submesh_share=count / len(group))
+    return piece or None
+
+
 def ground_cast(words: list[PointingWord], samples: Sequence[dict]) -> Grounding:
     """Work out what each pointing word refers to from gaze the host has already cast into the scene (Unity VR).
 
     Each sample is `{"t", "uid", "name", "parent", "point", "normal"}`: what the eyes (or head) hit when it was taken,
-    with `uid` None for a miss. The object hit most often in a word's window is its target, scored by its share of
-    the window. "Here" and "there" on the ground (see _is_ground) are a placement point instead: the middle of the
-    points looked at there. Nothing is asked: the person can't see numbers in the headset, and the eyes are steady.
+    with `uid` None for a miss. It can also say where the part hit sits ("path", and "root" with "root_uid" for the
+    whole object) and the "material" there ("submesh" of "submeshes"). The part hit most often in a word's window is
+    its target, scored by its share of the window, and its `piece` says what it is a part of (see _part_of). "Here"
+    and "there" on the ground (see _is_ground) are a placement point instead: the middle of the points looked at
+    there. Nothing is asked: the person can't see numbers in the headset.
     """
     targets, misses, windows = [], [], []
     for word in words:
@@ -549,6 +572,7 @@ def ground_cast(words: list[PointingWord], samples: Sequence[dict]) -> Grounding
             candidates.append(Candidate(uid=group[0]["uid"], name=f"{name} (in {parent})" if parent else name,
                                         score=len(group) / len(around), faces=0, u=0.0, v=0.0,
                                         point=_middle([_vec3(s["point"]) for s in group])))
-        targets.append(Target(word.text, word.start, candidates, Fixation(0.0, 0.0, len(hits))))
+        targets.append(Target(word.text, word.start, candidates, Fixation(0.0, 0.0, len(hits)),
+                              piece=_part_of(best, around)))
     found = bool(targets) or any(miss.point is not None for miss in misses)
     return Grounding("resolved" if found else "none", targets, (), misses, windows)

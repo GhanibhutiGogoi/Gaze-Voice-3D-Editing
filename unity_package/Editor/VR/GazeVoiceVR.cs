@@ -36,8 +36,9 @@ internal static class GazeVoiceVR
     {
         public double T;
         public bool Hit, Eyes;
-        public long Id;
-        public string Name, Parent;
+        public long Id, RootId;
+        public string Name, Parent, Path, Root, Material;
+        public int Submesh, Submeshes;
         public Vector3 Point, Normal;
     }
 
@@ -57,7 +58,12 @@ internal static class GazeVoiceVR
     static List<Shape> shapes = new List<Shape>();
     static double lastSample, shapesAt = double.NegativeInfinity, eyesAt = double.NegativeInfinity;
     static double statusAt = double.NegativeInfinity, noticeAt = double.NegativeInfinity;
-    static bool held, talking;
+    static bool held, talking, swept;
+    static readonly System.Reflection.PropertyInfo FailedToStart = typeof(UnityEngine.XR.OpenXR.Features.OpenXRFeature)
+        .GetProperty("failedInitialization", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+    static readonly List<Material> Materials = new List<Material>();
+    static readonly Dictionary<Mesh, int[]> SubmeshEndsOf = new Dictionary<Mesh, int[]>();
+    const int MaxPathParts = 8;
     static string shownStatus = "", notice = "", hudLine, lastError;
     static GameObject hud, dot;
     static TextMesh hudText;
@@ -69,22 +75,60 @@ internal static class GazeVoiceVR
         GazeVoiceBridge.VrRequest = Request;
         EditorApplication.update += Tick;
         EditorApplication.playModeStateChanged += OnPlayMode;
+        AssemblyReloadEvents.beforeAssemblyReload += () => Hide(true);
+        MatchControllers();
     }
+
+#if GAZEVOICE_INPUTSYSTEM
+    static readonly string[][] TouchControllers =
+    {
+        new[] { "QuestProTouchController", "Meta Quest Pro Touch Controller OpenXR" },
+        new[] { "QuestTouchPlusController", "Meta Quest Touch Plus Controller OpenXR" },
+    };
+
+    static void MatchControllers()
+    {
+        UnityEngine.InputSystem.InputSystem.onLayoutChange += (name, change) =>
+        {
+            if (change != UnityEngine.InputSystem.InputControlLayoutChange.Removed && TouchControllers.Any(pair => pair[0] == name))
+                MatchController(name);
+        };
+        var known = new HashSet<string>(UnityEngine.InputSystem.InputSystem.ListLayouts());
+        foreach (var pair in TouchControllers)
+            if (known.Contains(pair[0])) MatchController(pair[0]);
+    }
+
+    static void MatchController(string layout)
+    {
+        var product = TouchControllers.First(pair => pair[0] == layout)[1];
+        try
+        {
+            UnityEngine.InputSystem.InputSystem.RegisterLayoutMatcher(layout, new UnityEngine.InputSystem.Layouts.InputDeviceMatcher()
+                .WithInterface("^(XRInput)").WithProduct(product).WithCapability("deviceName", product));
+        }
+        catch (Exception e) { Debug.LogWarning("GazeVoice could not claim " + product + ": " + e.Message); }
+    }
+#else
+    static void MatchControllers() { }
+#endif
 
     internal static double Now => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
 
     static void OnPlayMode(PlayModeStateChange change)
     {
+        if (change == PlayModeStateChange.EnteredPlayMode || change == PlayModeStateChange.EnteredEditMode) Strays();
         if (change != PlayModeStateChange.ExitingPlayMode) return;
         if (talking) GazeVoiceBridge.PushTalkEvent("cancel");
         talking = held = false;
         Samples.Clear();
         shapes.Clear();
+        SubmeshEndsOf.Clear();
         Hide(true);
     }
 
     static void Tick()
     {
+        if (!swept) { swept = true; Strays(); }
         if (!EditorApplication.isPlaying) return;
         try
         {
@@ -176,15 +220,19 @@ internal static class GazeVoiceVR
     // Colliders first; meshes without one are tested triangle by triangle, like the Scene view's gaze.
     static Sample Cast(Ray ray, Transform rig, double now, bool eyes)
     {
-        var sample = new Sample { T = now, Eyes = eyes };
+        var sample = new Sample { T = now, Eyes = eyes, Submesh = -1 };
         var nearest = Reach;
         GameObject best = null;
-        foreach (var hit in Physics.RaycastAll(ray, Reach, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore))
+        var triangle = -1;
+        var hits = Physics.RaycastAll(ray, Reach, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
+        foreach (var hit in hits)
         {
             var go = hit.collider.gameObject;
             if (hit.distance >= nearest || Skip(go, rig)) continue;
             nearest = hit.distance; best = go; sample.Point = hit.point; sample.Normal = hit.normal;
+            triangle = hit.collider is MeshCollider ? hit.triangleIndex : -1;
         }
+        var holder = best;
         if (now - shapesAt > ShapeSeconds) { shapes = Shapes(rig); shapesAt = now; }
         foreach (var shape in shapes)
         {
@@ -193,17 +241,97 @@ internal static class GazeVoiceVR
             if (shape.Triangles == null)
             {
                 nearest = enter; best = shape.Object; sample.Point = ray.GetPoint(enter); sample.Normal = -ray.direction;
+                triangle = -1;
                 continue;
             }
-            if (!TriangleHit(ray, shape, nearest, out float distance, out Vector3 point, out Vector3 normal)) continue;
-            nearest = distance; best = shape.Object; sample.Point = point; sample.Normal = normal;
+            if (!TriangleHit(ray, shape, nearest, out float distance, out Vector3 point, out Vector3 normal, out int index)) continue;
+            nearest = distance; best = shape.Object; sample.Point = point; sample.Normal = normal; triangle = index;
         }
+        if (best != null && best == holder && best.GetComponent<Renderer>() == null)
+            Within(ray, hits, rig, ref best, ref sample, ref triangle);
         if (best == null) return sample;
         sample.Hit = true;
         sample.Id = GazeVoiceBridge.IdOf(best);
         sample.Name = best.name;
         sample.Parent = best.transform.parent != null ? best.transform.parent.name : null;
+        Describe(best, triangle, ref sample);
         return sample;
+    }
+
+    // Where the part sits in its object, and the material on the spot looked at: a cushion is told from the sofa it is in,
+    // and one material of a mesh that has several from the rest of it.
+    static void Describe(GameObject part, int triangle, ref Sample sample)
+    {
+        var root = part.transform.root;
+        if (root != part.transform)
+        {
+            sample.Root = root.name;
+            sample.RootId = GazeVoiceBridge.IdOf(root.gameObject);
+        }
+        var names = new List<string>();
+        for (var at = part.transform; at != null && names.Count < MaxPathParts; at = at.parent) names.Add(at.name);
+        if (names.Count == MaxPathParts && root != part.transform) names[names.Count - 1] = "\u2026";
+        names.Reverse();
+        sample.Path = String.Join("/", names);
+        var renderer = part.GetComponent<Renderer>();
+        var materials = renderer != null ? renderer.sharedMaterials : null;
+        if (materials == null || materials.Length == 0) return;
+        var mesh = part.GetComponent<MeshFilter>() != null ? part.GetComponent<MeshFilter>().sharedMesh : null;
+        var submesh = mesh != null && triangle >= 0 ? SubmeshOf(mesh, triangle) : -1;
+        sample.Submeshes = mesh != null ? mesh.subMeshCount : materials.Length;
+        sample.Submesh = sample.Submeshes > 1 ? submesh : -1;
+        var material = submesh >= 0 && submesh < materials.Length ? materials[submesh] : materials.Length == 1 ? materials[0] : null;
+        sample.Material = material != null ? material.name : null;
+    }
+
+    // Triangles are numbered across the submeshes in order, the way mesh.triangles and a mesh collider's hits count them.
+    static int SubmeshOf(Mesh mesh, int triangle)
+    {
+        if (!SubmeshEndsOf.TryGetValue(mesh, out var ends))
+        {
+            ends = new int[mesh.subMeshCount];
+            var total = 0;
+            for (var i = 0; i < ends.Length; i++)
+            {
+                if (mesh.GetTopology(i) == MeshTopology.Triangles) total += (int)mesh.GetIndexCount(i) / 3;
+                ends[i] = total;
+            }
+            SubmeshEndsOf[mesh] = ends;
+        }
+        for (var i = 0; i < ends.Length; i++)
+            if (triangle < ends[i]) return i;
+        return -1;
+    }
+
+    // A collider on an empty parent, such as one box around a whole sofa, would hide its parts, so the nearest part hit wins:
+    // looking at a cushion means the cushion.
+    static void Within(Ray ray, RaycastHit[] hits, Transform rig, ref GameObject best, ref Sample sample, ref int triangle)
+    {
+        var holder = best.transform;
+        var nearest = Reach;
+        GameObject part = null;
+        Vector3 point = default, normal = default;
+        var found = -1;
+        foreach (var hit in hits)
+        {
+            var go = hit.collider.gameObject;
+            if (go == best || hit.distance >= nearest || Skip(go, rig) || !go.transform.IsChildOf(holder)) continue;
+            nearest = hit.distance; part = go; point = hit.point; normal = hit.normal;
+            found = hit.collider is MeshCollider ? hit.triangleIndex : -1;
+        }
+        foreach (var shape in shapes)
+        {
+            if (shape.Object == null || shape.Triangles == null || shape.Renderer == null || !shape.Renderer.enabled
+                || !shape.Object.activeInHierarchy || !shape.Object.transform.IsChildOf(holder)) continue;
+            if (!shape.Renderer.bounds.IntersectRay(ray, out float enter) || enter >= nearest) continue;
+            if (!TriangleHit(ray, shape, nearest, out float distance, out Vector3 at, out Vector3 facing, out int index)) continue;
+            nearest = distance; part = shape.Object; point = at; normal = facing; found = index;
+        }
+        if (part == null) return;
+        best = part;
+        triangle = found;
+        sample.Point = point;
+        sample.Normal = normal;
     }
 
     static List<Shape> Shapes(Transform rig)
@@ -236,9 +364,11 @@ internal static class GazeVoiceVR
         return result;
     }
 
-    static bool TriangleHit(Ray ray, Shape shape, float limit, out float distance, out Vector3 point, out Vector3 normal)
+    static bool TriangleHit(Ray ray, Shape shape, float limit, out float distance, out Vector3 point, out Vector3 normal,
+                            out int triangle)
     {
         distance = 0; point = normal = default;
+        triangle = -1;
         var matrix = shape.Object.transform.localToWorldMatrix;
         var inverse = matrix.inverse;
         var origin = inverse.MultiplyPoint3x4(ray.origin);
@@ -273,6 +403,7 @@ internal static class GazeVoiceVR
                                  vertices[triangles[found + 2]] - vertices[triangles[found]]);
         normal = inverse.transpose.MultiplyVector(face).normalized;
         if (Vector3.Dot(normal, ray.direction) > 0) normal = -normal;
+        triangle = found / 3;
         return true;
     }
 
@@ -289,10 +420,11 @@ internal static class GazeVoiceVR
         var status = GazeVoiceBridge.Status ?? "";
         if (status != shownStatus) { shownStatus = status; statusAt = now; }
         string line = null;
-        if (talking) line = "\u25cf Listening\u2026  let go to send";
+        var last = Samples.Count > 0 ? Samples[Samples.Count - 1] : default;
+        if (talking) line = "\u25cf Listening\u2026 let go to send." + (last.Hit ? " Aiming at " + Aimed(last) + "." : "")
+                            + (now - eyesAt < EyesFresh ? "" : " (head gaze)");
         else if (now - noticeAt < StatusSeconds) line = notice;
         else if (GazeVoiceBridge.VoiceInVr && status.Length > 0 && (now - statusAt < StatusSeconds || Busy(status))) line = status;
-        var last = Samples.Count > 0 ? Samples[Samples.Count - 1] : default;
         var point = talking && last.Hit && GazeVoiceBridge.VoiceIsOn;
         if (head == null || (line == null && !point)) { Hide(false); return; }
         Build();
@@ -314,6 +446,12 @@ internal static class GazeVoiceVR
             dot.transform.position = last.Point + last.Normal * 0.004f;
             dot.transform.localScale = Vector3.one * Mathf.Clamp(Vector3.Distance(eye.position, last.Point) * 0.012f, 0.008f, 0.4f);
         }
+    }
+
+    static string Aimed(Sample sample)
+    {
+        var part = sample.Root != null ? sample.Name + " of " + sample.Root : sample.Name;
+        return sample.Material != null && sample.Submesh >= 0 ? part + " (" + sample.Material + ")" : part;
     }
 
     static void Write(string line)
@@ -344,6 +482,7 @@ internal static class GazeVoiceVR
     {
         var shader = Shader.Find("Universal Render Pipeline/Unlit") ?? Shader.Find("Unlit/Color");
         var material = new Material(shader) { hideFlags = HideFlags.HideAndDontSave };
+        Materials.Add(material);
         if (material.HasProperty("_BaseColor")) material.SetColor("_BaseColor", color);
         if (material.HasProperty("_Color")) material.SetColor("_Color", color);
         return material;
@@ -397,17 +536,32 @@ internal static class GazeVoiceVR
             return;
         }
         foreach (var go in new[] { hud, dot })
-        {
-            if (go == null) continue;
-            foreach (var renderer in go.GetComponentsInChildren<MeshRenderer>(true))
-                if (renderer.sharedMaterial != null && renderer.sharedMaterial.hideFlags == HideFlags.HideAndDontSave)
-                    UnityEngine.Object.DestroyImmediate(renderer.sharedMaterial);
-            UnityEngine.Object.DestroyImmediate(go);
-        }
+            if (go != null) UnityEngine.Object.DestroyImmediate(go);
+        foreach (var material in Materials)  // only the ones made here: the label's font material is Unity's own
+            if (material != null) UnityEngine.Object.DestroyImmediate(material);
+        Materials.Clear();
         hud = dot = null;
         hudText = null;
         hudBack = null;
         hudLine = null;
+    }
+
+    // A reload forgets hud and dot without destroying them, so earlier ones can be left showing an old status.
+    static void Strays()
+    {
+        foreach (var go in Resources.FindObjectsOfTypeAll<GameObject>())
+        {
+            if (go == null || go == hud || go == dot || go.transform.parent != null || go.hideFlags != HideFlags.HideAndDontSave) continue;
+            if (go.name != "GazeVoice Status" && go.name != "GazeVoice Gaze") continue;
+            foreach (var renderer in go.GetComponentsInChildren<MeshRenderer>(true))
+            {
+                if (renderer.GetComponent<TextMesh>() != null) continue;
+                var material = renderer.sharedMaterial;
+                if (material != null && material.hideFlags == HideFlags.HideAndDontSave && !EditorUtility.IsPersistent(material))
+                    UnityEngine.Object.DestroyImmediate(material);
+            }
+            UnityEngine.Object.DestroyImmediate(go);
+        }
     }
 
     // --- the dashboard's questions ----------------------------------------------------------------
@@ -447,13 +601,15 @@ internal static class GazeVoiceVR
         InputDevices.GetDevicesWithCharacteristics(InputDeviceCharacteristics.Controller, Devices);
         var controllers = Devices.Select(device => device.name).Where(name => !String.IsNullOrEmpty(name)).Distinct().ToArray();
         var active = playing && XRSettings.isDeviceActive;
+        // While playing, OpenXR reports a feature the runtime couldn't start as off, though the project has it on.
+        var eyeFailed = playing && eyeFeature != null && FailedToStart != null && (bool)FailedToStart.GetValue(eyeFeature);
         var eyes = playing && Now - eyesAt < EyesFresh;
         return new
         {
             ok = true, xr = true, loaders, playing, active,
             headset = headset ?? (active ? XRSettings.loadedDeviceName : null),
             controllers, key = TalkButtons,
-            eye_feature = eyeFeature != null && eyeFeature.enabled,
+            eye_feature = eyeFeature != null && (eyeFeature.enabled || eyeFailed), eye_failed = eyeFailed,
             eye_runtime = active ? OpenXRRuntime.IsExtensionEnabled(EyeGazeExtension) : (bool?)null,
             eyes, gaze = playing ? (eyes ? "eyes" : "head") : null,
             scene = SceneManager.GetActiveScene().path,
@@ -470,6 +626,12 @@ internal static class GazeVoiceVR
             uid = sample.Hit ? (long?)sample.Id : null,
             name = sample.Hit ? sample.Name : null,
             parent = sample.Hit ? sample.Parent : null,
+            path = sample.Hit ? sample.Path : null,
+            root = sample.Hit ? sample.Root : null,
+            root_uid = sample.Hit && sample.Root != null ? (long?)sample.RootId : null,
+            material = sample.Hit ? sample.Material : null,
+            submesh = sample.Hit && sample.Submesh >= 0 ? (int?)sample.Submesh : null,
+            submeshes = sample.Hit && sample.Submeshes > 1 ? (int?)sample.Submeshes : null,
             point = sample.Hit ? new[] { sample.Point.x, sample.Point.y, sample.Point.z } : null,
             normal = sample.Hit ? new[] { sample.Normal.x, sample.Normal.y, sample.Normal.z } : null,
             eyes = sample.Eyes,

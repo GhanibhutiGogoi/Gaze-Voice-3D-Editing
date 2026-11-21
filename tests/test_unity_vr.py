@@ -17,16 +17,17 @@ from gazevoice.voice.service import NO_VR, VR_KEY, VoiceError
 from .helpers import TempCtx
 from .test_voice_service import FakeBridge, FakeSession, FakeStt, VoiceTestBase, wait_for
 
-TERRAIN, SOFA, WALL = 7, 42, 9
+TERRAIN, SOFA, WALL, CUSHION, BASE = 7, 42, 9, 43, 44
 
 
-def looking(uid, name, point, normal=(0.0, 1.0, 0.0), start=1001.0, end=1004.0, eyes=True, parent=None):
-    """Gaze samples at 45 a second, all on one thing, the way GazeVoiceVR.cs reports them."""
+def looking(uid, name, point, normal=(0.0, 1.0, 0.0), start=1001.0, end=1004.0, eyes=True, parent=None, **part):
+    """Gaze samples at 45 a second, all on one thing, the way GazeVoiceVR.cs reports them. `part` adds what the part
+    is in: path, root, root_uid, material, submesh and submeshes."""
     samples, t = [], start
     while t <= end:
         samples.append({"t": round(t, 4), "uid": uid, "name": name, "parent": parent,
                         "point": list(point) if uid is not None else None,
-                        "normal": list(normal) if uid is not None else None, "eyes": eyes})
+                        "normal": list(normal) if uid is not None else None, "eyes": eyes, **part})
         t += 1 / 45
     return samples
 
@@ -55,6 +56,31 @@ class GroundCastTest(unittest.TestCase):
         top = found.targets[0].candidates[0]
         self.assertEqual((top.uid, top.name, top.score), (SOFA, "Seat (in Sofa)", 1.0))
         self.assertEqual(top.point, [1.0, 0.5, 2.0])
+
+    def test_a_part_says_what_it_is_a_part_of(self):
+        cushion = dict(path="Sofa/Seat/Cushion_Left", root="Sofa", root_uid=SOFA, material="Sofa_Teal")
+        samples = looking(CUSHION, "Cushion_Left", (1, 0.5, 2), normal=(0, 0, 1), start=1001.9, end=1002.6,
+                          parent="Seat", **cushion)
+        samples += looking(BASE, "Base", (1, 0.3, 2), normal=(0, 0, 1), start=1002.62, end=1002.9, parent="Sofa",
+                           path="Sofa/Base", root="Sofa", root_uid=SOFA, material="Sofa_Teal")
+        target = ground_cast([word("this")], samples).targets[0]
+        self.assertEqual([c.uid for c in target.candidates], [CUSHION, BASE])
+        self.assertEqual(target.candidates[0].name, "Cushion_Left (in Seat)")
+        self.assertEqual({k: v for k, v in target.piece.items() if k != "object_share"},
+                         {"object": "Sofa", "object_uid": SOFA, "path": "Sofa/Seat/Cushion_Left", "material": "Sofa_Teal"})
+        self.assertEqual(target.piece["object_share"], 1.0)
+
+    def test_the_material_looked_at_most_names_the_submesh(self):
+        samples = looking(SOFA, "Sofa", (1, 0.5, 2), normal=(0, 0, 1), start=1001.9, end=1002.5, path="Sofa",
+                          material="Cushion_Fabric", submesh=2, submeshes=3)
+        samples += looking(SOFA, "Sofa", (1, 0.3, 2), normal=(0, 0, 1), start=1002.52, end=1002.9, path="Sofa",
+                           material="Frame_Wood", submesh=0, submeshes=3)
+        piece = ground_cast([word("this")], samples).targets[0].piece
+        self.assertEqual((piece["material"], piece["submesh"], piece["submeshes"]), ("Cushion_Fabric", 2, 3))
+        self.assertNotIn("object", piece)
+
+    def test_an_object_on_its_own_has_no_part_detail(self):
+        self.assertIsNone(ground_cast([word("that")], looking(WALL, "Wall", (0, 1.5, 3), normal=(0, 0, -1))).targets[0].piece)
 
     def test_here_on_a_wall_is_the_wall(self):
         found = ground_cast([word("here")], looking(WALL, "Wall", (0.0, 1.5, 3.0), normal=(0, 0, -1)))
@@ -95,6 +121,19 @@ class DescribeTest(unittest.TestCase):
             '(no object target)',
             "  VR gaze from where the head points (no eye tracking), so it is rough · selected: nothing · mode editor",
         ])
+
+
+    def test_the_editor_reads_which_part_of_which_object_was_looked_at(self):
+        target = {"word": "this", "at": 1.2, "fixation": {"u": 0, "v": 0, "samples": 30},
+                  "candidates": [{"uid": CUSHION, "name": "Cushion_Left (in Seat)", "score": 0.8, "faces": 0, "u": 0,
+                                  "v": 0, "point": [1, 0.5, 2]}],
+                  "piece": {"object": "Sofa", "object_uid": SOFA, "object_share": 1.0, "path": "Sofa/Seat/Cushion_Left",
+                            "material": "Sofa_Teal"}}
+        gaze = {"status": "resolved", "targets": [target], "radius": [], "host": "unity", "source": "head", "misses": []}
+        lines = editor_message("Make this red.", "make this red", {"selected": [], "gaze": gaze}).splitlines()
+        self.assertIn(f"  Unity target instance ID: {CUSHION}", lines)
+        self.assertIn(f"  a part of Sofa (whole object's instance ID {SOFA}, 100% of the look) \u00b7 path "
+                      "Sofa/Seat/Cushion_Left \u00b7 material Sofa_Teal \u00b7 point (1.00, 0.50, 2.00)", lines)
 
 
 class SettingsTest(unittest.TestCase):
@@ -271,6 +310,17 @@ class HeadsetUnitTest(unittest.TestCase):
             result = self.unit.run_action("prepare", make_job("unity_vr", "prepare"))
         self.assertEqual(request.call_args[0][0], {"cmd": "vr_setup"})
         self.assertEqual(result, {"scene": "Assets/Scenes/GazeVoice VR.unity", "made": True})
+
+    def test_prepare_says_which_other_controller_profiles_it_turned_off(self):
+        reply = {"ok": True, "scene": "Assets/Scenes/GazeVoice VR.unity", "made": False, "notes": [],
+                 "xr": {"features": ["EyeGazeInteraction", "MetaQuestTouchProControllerProfile"],
+                        "disabled": ["KHRSimpleControllerProfile", "HPReverbG2ControllerProfile"]}}
+        from .helpers import make_job
+        job = make_job("unity_vr", "prepare")
+        with patch("gazevoice.components.unity_vr.bridge_request", return_value=reply):
+            self.unit.run_action("prepare", job)
+        logged = "\n".join(job.lines)
+        self.assertIn("KHRSimpleControllerProfile, HPReverbG2ControllerProfile", logged)
 
     def test_it_waits_in_unity_mode(self):
         self.t.ctx.settings = update_settings(self.t.ctx.settings, {"voice_host": "unity"})
