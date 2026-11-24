@@ -1,8 +1,10 @@
 # GazeVoice Objective Evaluation Quickstart
 
-2026-11-23 · Unity VR + Quest Pro with real eye tracking · Team execution checklist
+2026-11-24 · Unity VR + Quest Pro with real eye tracking · Team execution checklist
 
 **Purpose: verify that the system selects the right target, makes the right edit, responds promptly, and correctly undoes and preserves changes.** This is a test plan. Collectors and validators still need implementation; existing CI does not establish headset acceptance.
+
+**Separate from the 30-minute participant trial:** the engineering runs below are performed by the team, outside participant sessions. They are not squeezed into the three-task user study.
 
 ## 1. Do these five things first
 
